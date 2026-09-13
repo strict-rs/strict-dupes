@@ -15,7 +15,7 @@ This crate owns Rust parsing and Rust-specific normalization through `syn`. Read
 - Method names are preserved as `Token` leaves in `MethodCall` normalization (method-name preservation, pinned by `method_call_fingerprint_pin`); changing that redefines fingerprints and requires the registry-migration procedure in `dupes-core/AGENTS.md`.
 - Keep behavior shared between `CodeUnitExtractor` and `SubUnitExtractor` in the stamped macros (`with_test_context_method!`, `visit_item_mod_with_test_context!`) and the `ImplNaming`/`item_fn_is_test` helpers instead of duplicating method bodies across the two extractors.
 - When adding syntax support, update both normalizer coverage and parser extraction tests if the construct affects line ranges, code-unit kind, or test-code detection.
-- Be careful with `syn` 2 shapes: `Pat::Lit` contains `ExprLit`, `Member` is not `Display`, and match guards are `Option<(If, Box<Expr>)>`.
+- Adapt `syn` 3 at this boundary: match-arm guards reside in `Pat::Guard`, reference-receiver mutability belongs to `ReceiverKind::Reference`, closures expose `inputs_begin`, and trait-impl metadata carries `(Path, For)`. Preserve the detector's existing normalized child ordering when translating these parser shapes.
 
 ## Testing
 

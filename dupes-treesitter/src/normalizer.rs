@@ -4,6 +4,11 @@
 //! using a table-driven [`NodeMapping`]. The primary entry point is
 //! [`normalize_ts_node`].
 
+use std::collections::HashMap;
+use std::mem;
+use std::str;
+use std::str::Utf8Error;
+
 use dupes_core::node::BinOpKind;
 use dupes_core::node::NodeKind;
 use dupes_core::node::NormalizationContext;
@@ -13,330 +18,516 @@ use dupes_core::node::UnOpKind;
 
 use crate::mapping::NodeMapping;
 
+/// A failed text read from the byte range reported by a native syntax node.
+#[derive(Debug, thiserror::Error)]
+pub enum NodeTextError {
+  /// The native node's byte range does not belong to the supplied input.
+  #[error("node range {range:?} is outside the supplied {} bytes", input.len())]
+  OutOfBounds {
+    /// Complete byte input supplied to normalization or extraction.
+    input: Vec<u8>,
+    /// Original native byte and point range requested by the read.
+    range: tree_sitter::Range,
+  },
+  /// The selected node bytes are not valid UTF-8 text.
+  #[error("node text at {range:?} is not UTF-8: {source}")]
+  Utf8 {
+    /// Complete byte input, including the undecodable node bytes.
+    input:  Vec<u8>,
+    /// Original native byte and point range selected for decoding.
+    range:  tree_sitter::Range,
+    /// Native UTF-8 failure relative to the selected node's byte slice.
+    source: Utf8Error,
+  },
+}
+
+/// Normalization failure with every completed child at each interrupted parent.
+#[derive(Debug, thiserror::Error)]
+pub enum NormalizationError {
+  /// Required identifier or operator text could not be read.
+  #[error(transparent)]
+  Text(#[from] NodeTextError),
+  /// A child failed after earlier children had already been normalized.
+  #[error("normalizing children of {kind} at {range:?} failed: {source}")]
+  Children {
+    /// Native grammar kind of the interrupted parent.
+    kind:      String,
+    /// Native byte and point range of that parent.
+    range:     tree_sitter::Range,
+    /// Complete normalized children produced before the failure, in order.
+    completed: Vec<NormalizedNode>,
+    /// Original failure from the interrupted child.
+    source:    Box<Self>,
+  },
+}
+
 /// Normalize a tree-sitter node into a `NormalizedNode` using the provided mapping.
 ///
 /// The mapping table drives classification of tree-sitter node kinds into
 /// the dupes-core normalized representation. Unknown named nodes are recursively
 /// normalized and wrapped in a `Block`.
-#[must_use]
-pub fn normalize_ts_node(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapping, ctx: &mut NormalizationContext) -> NormalizedNode {
+///
+/// # Errors
+///
+/// Returns unreadable identifier or operator text with its complete byte input,
+/// native range and cause, and any children completed before that failure.
+pub fn normalize_ts_node(
+  node: &tree_sitter::Node<'_>,
+  source: &[u8],
+  mapping: &NodeMapping,
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
   let kind = node.kind();
 
   // 1. Kinds that normalize to Opaque: parse errors, configured skips (a safety net when called
   //    directly), and configured opaque kinds.
   if kind == "ERROR" || kind == "MISSING" || mapping.skip_kinds.contains(kind) || mapping.opaque_kinds.contains(kind) {
-    return NormalizedNode::leaf(NodeKind::Opaque);
+    return Ok(NormalizedNode::leaf(NodeKind::Opaque));
   }
 
   // 2. Identifiers → Placeholder
   if mapping.identifier_kinds.contains(kind) {
-    let text = node_text(node, source);
-    let idx = ctx.placeholder(&text, PlaceholderKind::Variable);
-    return NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, idx));
+    let text = node_text(node, source)?;
+    let index = context.placeholder(text, PlaceholderKind::Variable);
+    return Ok(NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, index)));
   }
 
   // 3. Literals → Literal(kind)
-  if let Some(lit_kind) = mapping.literal_kinds.get(kind) {
-    return NormalizedNode::leaf(NodeKind::Literal(lit_kind.clone()));
+  if let Some(literal_kind) = mapping.literal_kinds.get(kind) {
+    return Ok(NormalizedNode::leaf(NodeKind::Literal(*literal_kind)));
   }
 
   // 4. Direct node-kind-to-NodeKind mappings
   if let Some(mapped_kind) = mapping.node_kinds.get(kind) {
-    let children = normalize_named_children(node, source, mapping, ctx);
-    return NormalizedNode::with_children(mapped_kind.clone(), children);
+    let children = normalize_named_children(node, source, mapping, context)?;
+    return Ok(NormalizedNode::with_children(mapped_kind.clone(), children));
   }
 
   // 5. Structural kinds
 
   // If/conditional
   if mapping.if_kinds.contains(kind) {
-    return normalize_if(node, source, mapping, ctx);
+    return normalize_if(node, source, mapping, context);
   }
 
   // For loop
   if mapping.for_kinds.contains(kind) {
-    return normalize_for(node, source, mapping, ctx);
+    return normalize_for(node, source, mapping, context);
   }
 
   // While loop
   if mapping.while_kinds.contains(kind) {
-    return normalize_while(node, source, mapping, ctx);
+    return normalize_while(node, source, mapping, context);
   }
 
   // Infinite loop
   if mapping.loop_kinds.contains(kind) {
-    let body = get_field_or_none(node, "body", source, mapping, ctx);
-    return NormalizedNode::with_children(NodeKind::Loop, vec![body]);
+    return normalize_fields(node, &["body"], NodeKind::Loop, source, mapping, context);
   }
 
   // Match/switch
   if mapping.match_kinds.contains(kind) {
-    return normalize_match(node, source, mapping, ctx);
+    return normalize_match(node, source, mapping, context);
   }
 
   // Call
   if mapping.call_kinds.contains(kind) {
-    return normalize_call(node, source, mapping, ctx);
+    return normalize_call(node, source, mapping, context);
   }
 
   // Return
   if mapping.return_kinds.contains(kind) {
-    return normalize_return(node, source, mapping, ctx);
+    return normalize_return(node, source, mapping, context);
   }
 
   // Block
   if mapping.block_kinds.contains(kind) {
-    return normalize_as_block(node, source, mapping, ctx);
+    return normalize_as_block(node, source, mapping, context);
   }
 
   // Assignment
   if mapping.assignment_kinds.contains(kind) {
-    return normalize_assignment(node, source, mapping, ctx);
+    return normalize_assignment(node, source, mapping, context);
   }
 
   // Function definitions (nested)
   if mapping.function_def_kinds.contains(kind) {
-    return normalize_as_block(node, source, mapping, ctx);
+    return normalize_as_block(node, source, mapping, context);
   }
 
   // 6. Binary/unary expressions — driven by mapping
   if mapping.binary_op_kinds.contains(kind) {
-    return normalize_binary_op(node, source, mapping, ctx);
+    return normalize_binary_op(node, source, mapping, context);
   }
 
   if mapping.unary_op_kinds.contains(kind) {
-    return normalize_unary_op(node, source, mapping, ctx);
+    return normalize_unary_op(node, source, mapping, context);
   }
 
   // 7. Anonymous nodes → skip (shouldn't reach here normally)
   if !node.is_named() {
-    return NormalizedNode::leaf(NodeKind::Opaque);
+    return Ok(NormalizedNode::leaf(NodeKind::Opaque));
   }
 
   // 8. Unknown named nodes → recursively normalize children, wrap in Block
-  let mut children = normalize_named_children(node, source, mapping, ctx);
+  let children = normalize_named_children(node, source, mapping, context)?;
   if children.is_empty() {
-    return NormalizedNode::leaf(NodeKind::Opaque);
+    return Ok(NormalizedNode::leaf(NodeKind::Opaque));
   }
-  if children.len() == 1 {
-    return children.swap_remove(0);
+  match <[NormalizedNode; 1]>::try_from(children) {
+    Ok([child]) => Ok(child),
+    Err(multiple_children) => Ok(NormalizedNode::with_children(NodeKind::Block, multiple_children)),
   }
-  NormalizedNode::with_children(NodeKind::Block, children)
 }
 
 /// Normalize all named children of a node, skipping those in `skip_kinds`.
-#[must_use]
 pub(crate) fn normalize_named_children(
-  node: tree_sitter::Node,
+  node: &tree_sitter::Node<'_>,
   source: &[u8],
   mapping: &NodeMapping,
-  ctx: &mut NormalizationContext,
-) -> Vec<NormalizedNode> {
-  let mut children = Vec::new();
-  let cursor = &mut node.walk();
-  for child in node.named_children(cursor) {
-    if mapping.skip_kinds.contains(child.kind()) {
-      continue;
-    }
-    children.push(normalize_ts_node(child, source, mapping, ctx));
-  }
-  children
+  context: &mut NormalizationContext,
+) -> Result<Vec<NormalizedNode>, NormalizationError> {
+  let mut cursor = node.walk();
+  let children = node
+    .named_children(&mut cursor)
+    .filter(|child| !mapping.skip_kinds.contains(child.kind()))
+    .map(Some);
+  normalize_selected_children(node, children, source, mapping, context)
 }
 
 /// Normalize a node's named children and wrap them in a `Block`.
-fn normalize_as_block(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapping, ctx: &mut NormalizationContext) -> NormalizedNode {
-  NormalizedNode::with_children(NodeKind::Block, normalize_named_children(node, source, mapping, ctx))
-}
-
-/// Get a field child by name, normalizing it, or return `NormalizedNode::none()`.
-fn get_field_or_none(
-  node: tree_sitter::Node,
-  field: &str,
+fn normalize_as_block(
+  node: &tree_sitter::Node<'_>,
   source: &[u8],
   mapping: &NodeMapping,
-  ctx: &mut NormalizationContext,
-) -> NormalizedNode {
-  node
-    .child_by_field_name(field)
-    .map_or_else(NormalizedNode::none, |child| normalize_ts_node(child, source, mapping, ctx))
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
+  Ok(NormalizedNode::with_children(
+    NodeKind::Block,
+    normalize_named_children(node, source, mapping, context)?,
+  ))
 }
 
 /// Find the text of the first anonymous child (used for operator detection).
-fn find_operator_text(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+#[allow(
+  clippy::single_call_fn,
+  reason = "Operator selection owns the checked native text read before mapping an anonymous token"
+)]
+fn find_operator_text<'source>(node: &tree_sitter::Node<'_>, source: &'source [u8]) -> Result<Option<&'source str>, NodeTextError> {
   let cursor = &mut node.walk();
   for child in node.children(cursor) {
     if !child.is_named() {
-      let text = node_text(child, source);
+      let text = node_text(&child, source)?;
       if !text.is_empty() {
-        return Some(text);
+        return Ok(Some(text));
       }
     }
   }
-  None
+  Ok(None)
 }
 
 /// Map a node's operator text through an operator table, with a fallback.
-fn lookup_operator_kind<T: Clone>(
-  node: tree_sitter::Node,
+fn lookup_operator_kind<Value: Clone>(
+  node: &tree_sitter::Node<'_>,
   source: &[u8],
-  map: &std::collections::HashMap<&'static str, T>,
-  fallback: T,
-) -> T {
-  find_operator_text(node, source)
-    .and_then(|text| map.get(text.as_str()).cloned())
-    .unwrap_or(fallback)
+  map: &HashMap<&'static str, Value>,
+  fallback: Value,
+) -> Result<Value, NodeTextError> {
+  Ok(
+    find_operator_text(node, source)?
+      .and_then(|text| map.get(text).cloned())
+      .unwrap_or(fallback),
+  )
 }
 
-/// Get the text of a tree-sitter node.
-fn node_text(node: tree_sitter::Node, source: &[u8]) -> String {
-  node.utf8_text(source).unwrap_or("").to_string()
+/// Read exactly a native node's byte range without panicking or masking decoding failures.
+pub(crate) fn node_text<'source>(node: &tree_sitter::Node<'_>, source: &'source [u8]) -> Result<&'source str, NodeTextError> {
+  let range = node.range();
+  let bytes = node_bytes(node, source)?;
+  str::from_utf8(bytes).map_err(|failure| NodeTextError::Utf8 {
+    input: source.to_vec(),
+    range,
+    source: failure,
+  })
+}
+
+/// Validate a native range before normalization or query predicates read its bytes.
+pub(crate) fn node_bytes<'source>(node: &tree_sitter::Node<'_>, source: &'source [u8]) -> Result<&'source [u8], NodeTextError> {
+  let range = node.range();
+  source
+    .get(range.start_byte..range.end_byte)
+    .ok_or_else(|| NodeTextError::OutOfBounds {
+      input: source.to_vec(),
+      range,
+    })
+}
+
+/// Preserve a completed prefix when the next child cannot be normalized.
+fn append_normalized_child(
+  parent: &tree_sitter::Node<'_>,
+  children: &mut Vec<NormalizedNode>,
+  outcome: Result<NormalizedNode, NormalizationError>,
+) -> Result<(), NormalizationError> {
+  match outcome {
+    Ok(child) => {
+      children.push(child);
+      Ok(())
+    }
+    Err(source) => Err(NormalizationError::Children {
+      kind:      parent.kind().to_owned(),
+      range:     parent.range(),
+      completed: mem::take(children),
+      source:    Box::new(source),
+    }),
+  }
+}
+
+/// Normalize selected children in order, retaining explicit absent-field sentinels.
+fn normalize_selected_children<'tree>(
+  parent: &tree_sitter::Node<'tree>,
+  selected: impl IntoIterator<Item = Option<tree_sitter::Node<'tree>>>,
+  source: &[u8],
+  mapping: &NodeMapping,
+  context: &mut NormalizationContext,
+) -> Result<Vec<NormalizedNode>, NormalizationError> {
+  let mut children = Vec::new();
+  for selected_child in selected {
+    let outcome = selected_child.map_or_else(
+      || Ok(NormalizedNode::none()),
+      |child| normalize_ts_node(&child, source, mapping, context),
+    );
+    append_normalized_child(parent, &mut children, outcome)?;
+  }
+  Ok(children)
+}
+
+/// Normalize a construct's declared fields in the order required by its semantic kind.
+fn normalize_fields(
+  node: &tree_sitter::Node<'_>,
+  fields: &[&str],
+  kind: NodeKind,
+  source: &[u8],
+  mapping: &NodeMapping,
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
+  let selected = fields.iter().map(|field| node.child_by_field_name(field));
+  let children = normalize_selected_children(node, selected, source, mapping, context)?;
+  Ok(NormalizedNode::with_children(kind, children))
 }
 
 /// Normalize an if/conditional construct.
 /// Produces: [condition, `then_branch`, `else_or_None`]
-fn normalize_if(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapping, ctx: &mut NormalizationContext) -> NormalizedNode {
-  let condition = get_field_or_none(node, "condition", source, mapping, ctx);
-  let consequence = get_field_or_none(node, "consequence", source, mapping, ctx);
-  let alternative = get_field_or_none(node, "alternative", source, mapping, ctx);
-  NormalizedNode::with_children(NodeKind::If, vec![condition, consequence, alternative])
+#[allow(
+  clippy::single_call_fn,
+  reason = "Conditional normalization owns the condition, consequence, and absent-alternative slots"
+)]
+fn normalize_if(
+  node: &tree_sitter::Node<'_>,
+  source: &[u8],
+  mapping: &NodeMapping,
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
+  normalize_fields(
+    node,
+    &["condition", "consequence", "alternative"],
+    NodeKind::If,
+    source,
+    mapping,
+    context,
+  )
 }
 
 /// Normalize a for-loop construct.
 /// Produces: [pattern, iterable, body]
-fn normalize_for(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapping, ctx: &mut NormalizationContext) -> NormalizedNode {
+#[allow(
+  clippy::single_call_fn,
+  reason = "For-loop normalization fixes the binding, iterable, and body order"
+)]
+fn normalize_for(
+  node: &tree_sitter::Node<'_>,
+  source: &[u8],
+  mapping: &NodeMapping,
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
   // Python uses "left" for pattern and "right" for iterable
-  let pattern = node
-    .child_by_field_name("left")
-    .map_or_else(NormalizedNode::none, |c| normalize_ts_node(c, source, mapping, ctx));
-  let iterable = node
-    .child_by_field_name("right")
-    .map_or_else(NormalizedNode::none, |c| normalize_ts_node(c, source, mapping, ctx));
-  let body = get_field_or_none(node, "body", source, mapping, ctx);
-  NormalizedNode::with_children(NodeKind::ForLoop, vec![pattern, iterable, body])
+  normalize_fields(node, &["left", "right", "body"], NodeKind::ForLoop, source, mapping, context)
 }
 
 /// Normalize a while-loop construct.
 /// Produces: [condition, body]
-fn normalize_while(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapping, ctx: &mut NormalizationContext) -> NormalizedNode {
-  normalize_two_fields(node, source, mapping, ctx, NodeKind::While, "condition", "body")
+#[allow(
+  clippy::single_call_fn,
+  reason = "While-loop normalization preserves the condition before its body"
+)]
+fn normalize_while(
+  node: &tree_sitter::Node<'_>,
+  source: &[u8],
+  mapping: &NodeMapping,
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
+  normalize_fields(node, &["condition", "body"], NodeKind::While, source, mapping, context)
 }
 
 /// Normalize a match/switch construct.
 /// Produces: `[subject, arm0, arm1, ...]` where each arm is
 /// `MatchArm [pattern, guard_or_None, body]` per dupes-core convention.
-fn normalize_match(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapping, ctx: &mut NormalizationContext) -> NormalizedNode {
-  let subject = get_field_or_none(node, "subject", source, mapping, ctx);
-  let mut children = vec![subject];
+#[allow(
+  clippy::single_call_fn,
+  reason = "Match normalization owns ordered arms and preserves completed arms on failure"
+)]
+fn normalize_match(
+  node: &tree_sitter::Node<'_>,
+  source: &[u8],
+  mapping: &NodeMapping,
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
+  let mut children = normalize_selected_children(node, [node.child_by_field_name("subject")], source, mapping, context)?;
 
   // Collect match arms/cases using mapping-driven kind detection
   let cursor = &mut node.walk();
   for child in node.named_children(cursor) {
     if mapping.match_arm_kinds.contains(child.kind()) {
-      let pattern = get_field_or_none(child, "pattern", source, mapping, ctx);
-      let guard = get_field_or_none(child, "guard", source, mapping, ctx);
-      let body = get_field_or_none(child, "consequence", source, mapping, ctx);
-      children.push(NormalizedNode::with_children(NodeKind::MatchArm, vec![pattern, guard, body]));
+      let outcome = normalize_fields(
+        &child,
+        &["pattern", "guard", "consequence"],
+        NodeKind::MatchArm,
+        source,
+        mapping,
+        context,
+      );
+      append_normalized_child(node, &mut children, outcome)?;
     }
   }
 
-  NormalizedNode::with_children(NodeKind::Match, children)
+  Ok(NormalizedNode::with_children(NodeKind::Match, children))
 }
 
 /// Normalize a function/method call.
 /// Produces: [func, arg0, arg1, ...]
-fn normalize_call(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapping, ctx: &mut NormalizationContext) -> NormalizedNode {
-  let func = get_field_or_none(node, "function", source, mapping, ctx);
-  let mut children = vec![func];
+#[allow(
+  clippy::single_call_fn,
+  reason = "Call normalization retains the callee and completed argument prefix on failure"
+)]
+fn normalize_call(
+  node: &tree_sitter::Node<'_>,
+  source: &[u8],
+  mapping: &NodeMapping,
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
+  let mut children = normalize_selected_children(node, [node.child_by_field_name("function")], source, mapping, context)?;
 
   // Collect arguments
-  if let Some(args) = node.child_by_field_name("arguments") {
-    let cursor = &mut args.walk();
-    for arg in args.named_children(cursor) {
-      if !mapping.skip_kinds.contains(arg.kind()) {
-        children.push(normalize_ts_node(arg, source, mapping, ctx));
+  if let Some(arguments) = node.child_by_field_name("arguments") {
+    let cursor = &mut arguments.walk();
+    for argument in arguments.named_children(cursor) {
+      if !mapping.skip_kinds.contains(argument.kind()) {
+        let outcome = normalize_ts_node(&argument, source, mapping, context);
+        append_normalized_child(node, &mut children, outcome)?;
       }
     }
   }
 
-  NormalizedNode::with_children(NodeKind::Call, children)
+  Ok(NormalizedNode::with_children(NodeKind::Call, children))
 }
 
 /// Normalize a return statement.
 /// Produces: [] or [value]
-fn normalize_return(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapping, ctx: &mut NormalizationContext) -> NormalizedNode {
-  let children = normalize_named_children(node, source, mapping, ctx);
-  NormalizedNode::with_children(NodeKind::Return, children)
+#[allow(
+  clippy::single_call_fn,
+  reason = "Return normalization distinguishes an empty return from its normalized payload"
+)]
+fn normalize_return(
+  node: &tree_sitter::Node<'_>,
+  source: &[u8],
+  mapping: &NodeMapping,
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
+  let children = normalize_named_children(node, source, mapping, context)?;
+  Ok(NormalizedNode::with_children(NodeKind::Return, children))
 }
 
 /// Normalize an assignment.
 /// Produces: [target, value]
-fn normalize_assignment(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapping, ctx: &mut NormalizationContext) -> NormalizedNode {
-  normalize_two_fields(node, source, mapping, ctx, NodeKind::Assign, "left", "right")
-}
-
-fn normalize_two_fields(
-  node: tree_sitter::Node,
+#[allow(
+  clippy::single_call_fn,
+  reason = "Assignment normalization fixes target-before-value ordering"
+)]
+fn normalize_assignment(
+  node: &tree_sitter::Node<'_>,
   source: &[u8],
   mapping: &NodeMapping,
-  ctx: &mut NormalizationContext,
-  kind: NodeKind,
-  first_field: &str,
-  second_field: &str,
-) -> NormalizedNode {
-  let first = get_field_or_none(node, first_field, source, mapping, ctx);
-  let second = get_field_or_none(node, second_field, source, mapping, ctx);
-  NormalizedNode::with_children(kind, vec![first, second])
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
+  normalize_fields(node, &["left", "right"], NodeKind::Assign, source, mapping, context)
 }
 
 /// Normalize a binary operation.
-/// Produces: BinaryOp(kind) [left, right]
+/// Produces: `BinaryOp(kind) [left, right]`.
 ///
 /// Uses `left`/`right` field names first (e.g., `binary_operator`, `boolean_operator`).
 /// Falls back to positional named children for nodes without field names
 /// (e.g., Python `comparison_operator`).
-fn normalize_binary_op(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapping, ctx: &mut NormalizationContext) -> NormalizedNode {
-  let op_kind = lookup_operator_kind(node, source, &mapping.binary_op_map, BinOpKind::Other);
+#[allow(
+  clippy::single_call_fn,
+  reason = "Binary normalization owns positional comparison folding and partial-child evidence"
+)]
+fn normalize_binary_op(
+  node: &tree_sitter::Node<'_>,
+  source: &[u8],
+  mapping: &NodeMapping,
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
+  let operator_kind = lookup_operator_kind(node, source, &mapping.binary_op_map, BinOpKind::Other)?;
 
   // Try field-based access first (binary_operator, boolean_operator)
   let left_field = node.child_by_field_name("left");
   let right_field = node.child_by_field_name("right");
 
-  let (left, right) = if let (Some(l), Some(r)) = (left_field, right_field) {
-    (
-      normalize_ts_node(l, source, mapping, ctx),
-      normalize_ts_node(r, source, mapping, ctx),
-    )
+  let children = if let (Some(left), Some(right)) = (left_field, right_field) {
+    normalize_selected_children(node, [Some(left), Some(right)], source, mapping, context)?
   } else {
     // Fall back to positional named children (e.g., Python comparison_operator
     // which uses positional children instead of left/right field names).
     // For chained comparisons (a < b < c), fold all operands into nested
     // BinaryOp nodes: BinaryOp(Lt, [a, BinaryOp(Lt, [b, c])])
     let cursor = &mut node.walk();
-    let named: Vec<_> = node.named_children(cursor).collect();
-    if named.len() <= 1 {
-      let l = named
-        .first()
-        .map_or_else(NormalizedNode::none, |c| normalize_ts_node(*c, source, mapping, ctx));
-      return NormalizedNode::with_children(NodeKind::BinaryOp(op_kind), vec![l, NormalizedNode::none()]);
-    }
-    // Normalize all operands
-    let operands: Vec<NormalizedNode> = named.iter().map(|c| normalize_ts_node(*c, source, mapping, ctx)).collect();
+    let operands = normalize_selected_children(node, node.named_children(cursor).map(Some), source, mapping, context)?;
     // Fold from right: [a, b, c] → BinaryOp(op, [a, BinaryOp(op, [b, c])])
     let mut iter = operands.into_iter().rev();
-    let mut right = iter.next().unwrap();
-    for operand in iter {
-      right = NormalizedNode::with_children(NodeKind::BinaryOp(op_kind.clone()), vec![operand, right]);
-    }
-    return right;
+    let Some(last) = iter.next() else {
+      return Ok(NormalizedNode::with_children(NodeKind::BinaryOp(operator_kind), vec![
+        NormalizedNode::none(),
+        NormalizedNode::none(),
+      ]));
+    };
+    let Some(previous) = iter.next() else {
+      return Ok(NormalizedNode::with_children(NodeKind::BinaryOp(operator_kind), vec![
+        last,
+        NormalizedNode::none(),
+      ]));
+    };
+    let combined = NormalizedNode::with_children(NodeKind::BinaryOp(operator_kind), vec![previous, last]);
+    return Ok(iter.fold(combined, |suffix, operand| {
+      NormalizedNode::with_children(NodeKind::BinaryOp(operator_kind), vec![operand, suffix])
+    }));
   };
 
-  NormalizedNode::with_children(NodeKind::BinaryOp(op_kind), vec![left, right])
+  Ok(NormalizedNode::with_children(NodeKind::BinaryOp(operator_kind), children))
 }
 
 /// Normalize a unary operation.
-/// Produces: UnaryOp(kind) [operand]
-fn normalize_unary_op(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapping, ctx: &mut NormalizationContext) -> NormalizedNode {
-  let op_kind = lookup_operator_kind(node, source, &mapping.unary_op_map, UnOpKind::Other);
+/// Produces: `UnaryOp(kind) [operand]`.
+#[allow(
+  clippy::single_call_fn,
+  reason = "Unary normalization owns operator lookup and the grammar-dependent operand selection"
+)]
+fn normalize_unary_op(
+  node: &tree_sitter::Node<'_>,
+  source: &[u8],
+  mapping: &NodeMapping,
+  context: &mut NormalizationContext,
+) -> Result<NormalizedNode, NormalizationError> {
+  let operator_kind = lookup_operator_kind(node, source, &mapping.unary_op_map, UnOpKind::Other)?;
 
   let operand_node = node
     .child_by_field_name("argument")
@@ -345,16 +536,95 @@ fn normalize_unary_op(node: tree_sitter::Node, source: &[u8], mapping: &NodeMapp
       let cursor = &mut node.walk();
       node.named_children(cursor).next()
     });
-  let operand = operand_node.map_or_else(NormalizedNode::none, |c| normalize_ts_node(c, source, mapping, ctx));
+  let children = normalize_selected_children(node, [operand_node], source, mapping, context)?;
 
-  NormalizedNode::with_children(NodeKind::UnaryOp(op_kind), vec![operand])
+  Ok(NormalizedNode::with_children(NodeKind::UnaryOp(operator_kind), children))
 }
 
 #[cfg(test)]
 mod tests {
+  use dupes_core::node::BinOpKind;
   use dupes_core::node::LiteralKind;
+  use dupes_core::node::NodeKind;
+  use dupes_core::node::NormalizationContext;
+  use dupes_core::node::NormalizedNode;
+  use dupes_core::node::PlaceholderKind;
+  use dupes_core::node::UnOpKind;
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
 
-  use super::*;
+  use super::NodeTextError;
+  use super::NormalizationError;
+  use super::normalize_named_children;
+  use super::normalize_ts_node;
+  use crate::mapping::NodeMapping;
+
+  /// Preserve parser setup failures and complete normalized expectation values.
+  #[derive(Debug, thiserror::Error)]
+  enum NormalizerTestFailure {
+    /// The fixture grammar was rejected by the parser.
+    #[error(transparent)]
+    Language(#[from] tree_sitter::LanguageError),
+    /// Required source text could not be normalized.
+    #[error(transparent)]
+    Normalization(#[from] NormalizationError),
+    /// A fallible normalization attempt lost its expected evidence or context.
+    #[error("{source}; normalization outcome: {outcome:?}; context: {context:?}; tree: {tree:?}")]
+    FailureEvidence {
+      /// Complete success or failure returned by the attempted normalization.
+      outcome: Box<Result<NormalizedNode, NormalizationError>>,
+      /// Placeholder assignments left available to the caller.
+      context: Box<NormalizationContext>,
+      /// Native tree used by the attempt.
+      tree:    tree_sitter::Tree,
+      /// Failed evidence-preservation expectation.
+      source:  TestFailure,
+    },
+    /// Parsing returned no tree for the supplied fixture.
+    #[error("the parser returned no tree for {input:?}")]
+    NoTree {
+      /// Complete source supplied to the parser.
+      input: String,
+    },
+    /// A fixture did not contain the requested syntax node.
+    #[error("fixture tree lacks {selection}: {tree:?}")]
+    MissingNode {
+      /// Native tree returned for the fixture.
+      tree:      tree_sitter::Tree,
+      /// Field or child selected by the test.
+      selection: &'static str,
+    },
+    /// A normalized tree violated the expected semantic contract.
+    #[error("{source}; actual normalized tree: {actual:?}; expected: {expected:?}")]
+    Normalized {
+      /// Complete normalized result under test.
+      actual:   Box<NormalizedNode>,
+      /// Complete expected normalized result.
+      expected: Box<NormalizedNode>,
+      /// Failed semantic expectation.
+      source:   TestFailure,
+    },
+    /// Normalized children violated their complete sequence expectation.
+    #[error("{source}; actual children: {actual:?}; expected: {expected:?}")]
+    Children {
+      /// Complete child sequence returned by normalization.
+      actual:   Vec<NormalizedNode>,
+      /// Complete expected child sequence.
+      expected: Vec<NormalizedNode>,
+      /// Failed semantic expectation.
+      source:   TestFailure,
+    },
+    /// A malformed fixture did not preserve its native or normalized error signal.
+    #[error("{source}; parse tree: {tree:?}; normalized tree: {normalized:?}")]
+    Malformed {
+      /// Native parse tree produced for the malformed source.
+      tree:       tree_sitter::Tree,
+      /// Complete normalized representation of that tree.
+      normalized: Box<NormalizedNode>,
+      /// Failed semantic expectation.
+      source:     TestFailure,
+    },
+  }
 
   /// Build a Python-flavored mapping for normalizer unit tests.
   fn test_mapping() -> NodeMapping {
@@ -393,408 +663,510 @@ mod tests {
   }
 
   /// Parse Python source and return the tree.
-  fn parse(source: &str) -> tree_sitter::Tree {
+  fn parse(source: &str) -> Result<tree_sitter::Tree, NormalizerTestFailure> {
     let mut parser = tree_sitter::Parser::new();
-    let lang = tree_sitter_python::LANGUAGE;
-    parser.set_language(&lang.into()).unwrap();
-    parser.parse(source, None).unwrap()
+    parser.set_language(&tree_sitter_python::LANGUAGE.into())?;
+    parser.parse(source, None).ok_or_else(|| NormalizerTestFailure::NoTree {
+      input: source.to_owned()
+    })
   }
 
   /// Get the first named child of the root (typically a statement).
-  fn first_stmt(tree: &tree_sitter::Tree) -> tree_sitter::Node<'_> {
+  fn first_stmt(tree: &tree_sitter::Tree) -> Result<tree_sitter::Node<'_>, NormalizerTestFailure> {
+    tree
+      .root_node()
+      .named_child(0)
+      .ok_or_else(|| NormalizerTestFailure::MissingNode {
+        tree:      tree.clone(),
+        selection: "the first named statement",
+      })
+  }
+
+  /// Select the expression inside the fixture's first expression statement.
+  fn first_expression(tree: &tree_sitter::Tree) -> Result<tree_sitter::Node<'_>, NormalizerTestFailure> {
+    first_stmt(tree)?
+      .named_child(0)
+      .ok_or_else(|| NormalizerTestFailure::MissingNode {
+        tree:      tree.clone(),
+        selection: "the first statement's expression",
+      })
+  }
+
+  /// Construct an expected variable placeholder in encounter order.
+  fn variable(index: usize) -> NormalizedNode {
+    NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, index))
+  }
+
+  /// Compare complete normalized trees and retain both sides on failure.
+  fn check_node(actual: NormalizedNode, expected: NormalizedNode) -> Result<(), NormalizerTestFailure> {
+    ensure(
+      actual == expected,
+      "normalization preserves the expected kinds and ordered children",
+    )
+    .map_err(|source| NormalizerTestFailure::Normalized {
+      actual: Box::new(actual),
+      expected: Box::new(expected),
+      source,
+    })
+  }
+
+  /// Check a fallible attempt while retaining its complete outcome and caller-owned context.
+  fn check_attempt(
+    tree: tree_sitter::Tree,
+    mut context: NormalizationContext,
+    outcome: Result<NormalizedNode, NormalizationError>,
+    check: impl FnOnce(&Result<NormalizedNode, NormalizationError>, &mut NormalizationContext) -> Result<(), TestFailure>,
+  ) -> Result<(), NormalizerTestFailure> {
+    check(&outcome, &mut context).map_err(|source| NormalizerTestFailure::FailureEvidence {
+      outcome: Box::new(outcome),
+      context: Box::new(context),
+      tree,
+      source,
+    })
+  }
+
+  /// Normalize a fixture's first statement through the real parser boundary.
+  fn check_statement(source: &str, expected: NormalizedNode) -> Result<(), NormalizerTestFailure> {
+    let tree = parse(source)?;
+    let statement = first_stmt(&tree)?;
+    let actual = normalize_ts_node(&statement, source.as_bytes(), &test_mapping(), &mut NormalizationContext::new())?;
+    check_node(actual, expected)
+  }
+
+  /// Normalize all statements with one shared identifier context.
+  fn check_statements(source: &str, mapping: &NodeMapping, expected: Vec<NormalizedNode>) -> Result<(), NormalizerTestFailure> {
+    let tree = parse(source)?;
+    let actual = normalize_named_children(&tree.root_node(), source.as_bytes(), mapping, &mut NormalizationContext::new())?;
+    ensure(actual == expected, "normalization preserves the complete ordered child sequence").map_err(|failure| {
+      NormalizerTestFailure::Children {
+        actual,
+        expected,
+        source: failure,
+      }
+    })
+  }
+
+  /// Normalize a function body without including its declaration's identifiers.
+  fn check_function_body(source: &str, expected: Vec<NormalizedNode>) -> Result<(), NormalizerTestFailure> {
+    let tree = parse(source)?;
+    let body = first_stmt(&tree)?
+      .child_by_field_name("body")
+      .ok_or_else(|| NormalizerTestFailure::MissingNode {
+        tree:      tree.clone(),
+        selection: "the function body",
+      })?;
+    let actual = normalize_ts_node(&body, source.as_bytes(), &test_mapping(), &mut NormalizationContext::new())?;
+    check_node(actual, NormalizedNode::with_children(NodeKind::Block, expected))
+  }
+
+  /// Detect an opaque subtree without depending on malformed grammar internals.
+  fn has_opaque(node: &NormalizedNode) -> bool {
+    node.kind == NodeKind::Opaque || node.children.iter().any(has_opaque)
+  }
+
+  /// Identifier and literal mapping entries drive actual normalization.
+  #[test]
+  fn node_kind_classification() -> Result<(), NormalizerTestFailure> {
+    check_statements(
+      "x\n42\n",
+      &NodeMapping::new()
+        .identifiers(&["identifier"])
+        .literals(&[("integer", LiteralKind::Int)]),
+      vec![variable(0), NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int))],
+    )
+  }
+
+  /// The first identifier starts the variable placeholder sequence.
+  #[test]
+  fn identifier_becomes_placeholder() -> Result<(), NormalizerTestFailure> {
+    check_statement("x\n", variable(0))
+  }
+
+  /// Different identifiers receive distinct indices in source order.
+  #[test]
+  fn two_identifiers_get_different_indices() -> Result<(), NormalizerTestFailure> {
+    check_statements("x\ny\n", &test_mapping(), vec![variable(0), variable(1)])
+  }
+
+  /// Repeated identifiers reuse their original indices.
+  #[test]
+  fn same_identifier_reuses_index() -> Result<(), NormalizerTestFailure> {
+    check_statements("x\nx\n", &test_mapping(), vec![variable(0), variable(0)])
+  }
+
+  /// Integer syntax normalizes to the integer literal kind.
+  #[test]
+  fn integer_literal() -> Result<(), NormalizerTestFailure> {
+    let source = "42\n";
+    let tree = parse(source)?;
+    let literal = first_stmt(&tree)?
+      .named_child(0)
+      .ok_or_else(|| NormalizerTestFailure::MissingNode {
+        tree:      tree.clone(),
+        selection: "the integer literal expression",
+      })?;
+    let actual = normalize_ts_node(&literal, source.as_bytes(), &test_mapping(), &mut NormalizationContext::new())?;
+    check_node(actual, NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)))
+  }
+
+  /// String syntax remains distinct from numeric literals.
+  #[test]
+  fn string_literal() -> Result<(), NormalizerTestFailure> {
+    check_statement("\"hello\"\n", NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Str)))
+  }
+
+  /// Literal values normalize to the same complete node within their kind.
+  #[test]
+  fn literal_values_erased() -> Result<(), NormalizerTestFailure> {
+    for source in ["42\n", "99\n"] {
+      check_statement(source, NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)))?;
+    }
+    Ok(())
+  }
+
+  /// Addition preserves both ordered operands.
+  #[test]
+  fn binary_add() -> Result<(), NormalizerTestFailure> {
+    check_statement(
+      "a + b\n",
+      NormalizedNode::with_children(NodeKind::BinaryOp(BinOpKind::Add), vec![variable(0), variable(1)]),
+    )
+  }
+
+  /// Comparison syntax uses positional operands without losing their order.
+  #[test]
+  fn binary_eq() -> Result<(), NormalizerTestFailure> {
+    check_statement(
+      "a == b\n",
+      NormalizedNode::with_children(NodeKind::BinaryOp(BinOpKind::Eq), vec![variable(0), variable(1)]),
+    )
+  }
+
+  /// Boolean conjunction retains its semantic operator kind.
+  #[test]
+  fn boolean_and() -> Result<(), NormalizerTestFailure> {
+    check_statement(
+      "a and b\n",
+      NormalizedNode::with_children(NodeKind::BinaryOp(BinOpKind::And), vec![variable(0), variable(1)]),
+    )
+  }
+
+  /// An unmapped operator retains both operands under the fallback operator kind.
+  #[test]
+  fn unknown_binary_op_falls_back_to_other() -> Result<(), NormalizerTestFailure> {
+    check_statement(
+      "a ** b\n",
+      NormalizedNode::with_children(NodeKind::BinaryOp(BinOpKind::Other), vec![variable(0), variable(1)]),
+    )
+  }
+
+  /// Logical negation retains exactly one operand.
+  #[test]
+  fn unary_not() -> Result<(), NormalizerTestFailure> {
+    check_statement(
+      "not x\n",
+      NormalizedNode::with_children(NodeKind::UnaryOp(UnOpKind::Not), vec![variable(0)]),
+    )
+  }
+
+  /// Arithmetic negation remains distinct from logical negation.
+  #[test]
+  fn unary_neg() -> Result<(), NormalizerTestFailure> {
+    check_statement(
+      "-x\n",
+      NormalizedNode::with_children(NodeKind::UnaryOp(UnOpKind::Neg), vec![variable(0)]),
+    )
+  }
+
+  /// Assignment retains the target before the assigned value.
+  #[test]
+  fn assignment_normalization() -> Result<(), NormalizerTestFailure> {
+    check_statement(
+      "x = 1\n",
+      NormalizedNode::with_children(NodeKind::Assign, vec![
+        variable(0),
+        NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)),
+      ]),
+    )
+  }
+
+  /// A return value remains present inside its containing body.
+  #[test]
+  fn return_with_value() -> Result<(), NormalizerTestFailure> {
+    check_function_body("def f():\n    return 42\n", vec![NormalizedNode::with_children(
+      NodeKind::Return,
+      vec![NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int))],
+    )])
+  }
+
+  /// A bare return has no fabricated return value.
+  #[test]
+  fn return_without_value() -> Result<(), NormalizerTestFailure> {
+    check_function_body("def f():\n    return\n", vec![NormalizedNode::leaf(NodeKind::Return)])
+  }
+
+  /// Conditions precede their bodies, and absent alternatives retain the fixed `None` slot.
+  #[test]
+  fn conditional_and_while_children_preserve_order_and_absence() -> Result<(), NormalizerTestFailure> {
+    let branch = NormalizedNode::with_children(NodeKind::Block, vec![NormalizedNode::with_children(NodeKind::Assign, vec![
+      variable(1),
+      NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)),
+    ])]);
+    for (input, kind, children) in [
+      ("if x:\n    y = 1\nelse:\n    y = 2\n", NodeKind::If, vec![
+        variable(0),
+        branch.clone(),
+        branch.clone(),
+      ]),
+      ("if x:\n    y = 1\n", NodeKind::If, vec![
+        variable(0),
+        branch.clone(),
+        NormalizedNode::none(),
+      ]),
+      ("while x:\n    y = 1\n", NodeKind::While, vec![variable(0), branch]),
+    ] {
+      check_statement(input, NormalizedNode::with_children(kind, children))?;
+    }
+    Ok(())
+  }
+
+  /// A for loop retains its binding, iterable, and body in that order.
+  #[test]
+  fn for_loop() -> Result<(), NormalizerTestFailure> {
+    check_statement(
+      "for x in items:\n    pass\n",
+      NormalizedNode::with_children(NodeKind::ForLoop, vec![
+        variable(0),
+        variable(1),
+        NormalizedNode::with_children(NodeKind::Block, vec![NormalizedNode::leaf(NodeKind::Opaque)]),
+      ]),
+    )
+  }
+
+  /// Call arguments follow the callee, skip comments, and reuse repeated identifiers.
+  #[test]
+  fn call_with_args() -> Result<(), NormalizerTestFailure> {
+    for (input, children) in [
+      ("f(a, b)\n", vec![variable(0), variable(1), variable(2)]),
+      ("f(\n    # before arguments\n    a,\n    # between arguments\n    b\n)\n", vec![
+        variable(0),
+        variable(1),
+        variable(2),
+      ]),
+      ("f(a, a)\n", vec![variable(0), variable(1), variable(1)]),
+    ] {
+      check_statement(input, NormalizedNode::with_children(NodeKind::Call, children))?;
+    }
+    Ok(())
+  }
+
+  /// An argument-free call retains only its callee.
+  #[test]
+  fn call_no_args() -> Result<(), NormalizerTestFailure> {
+    check_statement("f()\n", NormalizedNode::with_children(NodeKind::Call, vec![variable(0)]))
+  }
+
+  /// Configured comments are skipped while adjacent executable statements remain.
+  #[test]
+  fn skip_kinds_are_filtered() -> Result<(), NormalizerTestFailure> {
+    check_statements("# comment\nx = 1\n", &test_mapping(), vec![NormalizedNode::with_children(
+      NodeKind::Assign,
+      vec![variable(0), NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int))],
+    )])
+  }
+
+  /// Malformed syntax remains representable through opaque subtrees.
+  #[test]
+  fn error_node_becomes_opaque() -> Result<(), NormalizerTestFailure> {
+    let source = "((( @@@ )))\n";
+    let tree = parse(source)?;
     let root = tree.root_node();
-    let cursor = &mut root.walk();
-    root.named_children(cursor).next().unwrap()
+    let normalized = normalize_ts_node(&root, source.as_bytes(), &test_mapping(), &mut NormalizationContext::new())?;
+    ensure(
+      root.has_error() && has_opaque(&normalized),
+      "malformed syntax retains its native parse-error observation and an opaque normalized subtree",
+    )
+    .map_err(|failure| NormalizerTestFailure::Malformed {
+      tree,
+      normalized: Box::new(normalized),
+      source: failure,
+    })
   }
 
-  fn has_opaque(n: &NormalizedNode) -> bool {
-    n.kind == NodeKind::Opaque || n.children.iter().any(has_opaque)
-  }
-
+  /// A block retains all statements under one shared placeholder context.
   #[test]
-  fn node_kind_classification() {
-    let mapping = NodeMapping::new()
-      .identifiers(&["identifier"])
-      .literals(&[("integer", LiteralKind::Int)]);
-
-    assert!(mapping.identifier_kinds.contains("identifier"));
-    assert!(mapping.literal_kinds.contains_key("integer"));
+  fn block_normalization() -> Result<(), NormalizerTestFailure> {
+    check_function_body("def f():\n    x = 1\n    y = 2\n", vec![
+      NormalizedNode::with_children(NodeKind::Assign, vec![
+        variable(0),
+        NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)),
+      ]),
+      NormalizedNode::with_children(NodeKind::Assign, vec![
+        variable(1),
+        NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)),
+      ]),
+    ])
   }
 
+  /// An unknown single-child wrapper normalizes directly to its child.
   #[test]
-  fn identifier_becomes_placeholder() {
-    let src = "x\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    // expression_statement -> identifier
-    let ident = stmt.named_child(0).unwrap();
-    let node = normalize_ts_node(ident, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::Placeholder(PlaceholderKind::Variable, 0));
+  fn single_child_unwrap() -> Result<(), NormalizerTestFailure> {
+    check_statement("42\n", NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)))
   }
 
-  // jscpd:ignore-start
-
+  /// A required identifier outside the supplied bytes returns its native range.
   #[test]
-  fn two_identifiers_get_different_indices() {
-    let src = "x\ny\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let root = tree.root_node();
-    let cursor = &mut root.walk();
-    let mut stmts = root.named_children(cursor);
-
-    let x = stmts.next().unwrap().named_child(0).unwrap();
-    let y = stmts.next().unwrap().named_child(0).unwrap();
-
-    let nx = normalize_ts_node(x, src.as_bytes(), &mapping, &mut ctx);
-    let ny = normalize_ts_node(y, src.as_bytes(), &mapping, &mut ctx);
-
-    assert_eq!(nx.kind, NodeKind::Placeholder(PlaceholderKind::Variable, 0));
-    assert_eq!(ny.kind, NodeKind::Placeholder(PlaceholderKind::Variable, 1));
+  fn required_identifier_rejects_missing_bytes() -> Result<(), NormalizerTestFailure> {
+    let tree = parse("name\n")?;
+    let identifier = first_expression(&tree)?;
+    let expected_range = identifier.range();
+    let mut context = NormalizationContext::new();
+    let outcome = normalize_ts_node(&identifier, b"na", &test_mapping(), &mut context);
+    check_attempt(tree, context, outcome, |observed, _| {
+      ensure(
+        matches!(*observed, Err(NormalizationError::Text(NodeTextError::OutOfBounds { ref input, range }))
+          if input == b"na" && range == expected_range),
+        "a missing identifier range is reported with the complete bytes instead of panicking or inventing a placeholder",
+      )
+    })
   }
 
+  /// Invalid identifier and operator text preserve the native UTF-8 diagnostic.
   #[test]
-  fn same_identifier_reuses_index() {
-    let src = "x\nx\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let root = tree.root_node();
-    let cursor = &mut root.walk();
-    let mut stmts = root.named_children(cursor);
-
-    let x1 = stmts.next().unwrap().named_child(0).unwrap();
-    let x2 = stmts.next().unwrap().named_child(0).unwrap();
-
-    let n1 = normalize_ts_node(x1, src.as_bytes(), &mapping, &mut ctx);
-    let n2 = normalize_ts_node(x2, src.as_bytes(), &mapping, &mut ctx);
-
-    assert_eq!(n1.kind, n2.kind);
+  fn required_text_retains_utf8_failures() -> Result<(), NormalizerTestFailure> {
+    for (parsed, bytes, expected_bytes) in [
+      ("name\n", b"\xffame\n".as_slice(), 0..4),
+      ("a+b\n", b"a\xffb\n".as_slice(), 1..2),
+    ] {
+      let tree = parse(parsed)?;
+      let expression = first_expression(&tree)?;
+      let mut context = NormalizationContext::new();
+      let outcome = normalize_ts_node(&expression, bytes, &test_mapping(), &mut context);
+      check_attempt(tree, context, outcome, |observed, _| {
+        ensure(
+          matches!(*observed, Err(NormalizationError::Text(NodeTextError::Utf8 { ref input, range, source }))
+            if input == bytes && (range.start_byte, range.end_byte) == (expected_bytes.start, expected_bytes.end)
+              && source.valid_up_to() == 0 && source.error_len() == Some(1)),
+          "unreadable identifiers and operators retain their input, selected range, and native UTF-8 error",
+        )
+      })?;
+    }
+    Ok(())
   }
 
+  /// Failed later children preserve earlier normalized siblings and placeholder state.
   #[test]
-  fn integer_literal() {
-    let src = "42\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    let lit = stmt.named_child(0).unwrap();
-    let node = normalize_ts_node(lit, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::Literal(LiteralKind::Int));
+  fn failed_child_retains_completed_prefix_and_context() -> Result<(), NormalizerTestFailure> {
+    let tree = parse("first\nsecond\n")?;
+    let root_range = tree.root_node().range();
+    let bytes = b"first\n\xffxxxxx\n";
+    let mut context = NormalizationContext::new();
+    let outcome = normalize_ts_node(&tree.root_node(), bytes, &test_mapping(), &mut context);
+    check_attempt(tree, context, outcome, |observed, placeholders| {
+      let Err(NormalizationError::Children {
+        ref kind,
+        range,
+        ref completed,
+        source: ref child_error,
+      }) = *observed
+      else {
+        return ensure(false, "the second statement must fail after the first statement was normalized");
+      };
+      let preserved = kind == "module"
+        && range == root_range
+        && *completed == [variable(0)]
+        && matches!(**child_error, NormalizationError::Children { kind: ref child_kind, completed: ref child_completed, source: ref text_error, .. }
+          if child_kind == "expression_statement" && child_completed.is_empty()
+            && matches!(**text_error, NormalizationError::Text(NodeTextError::Utf8 { ref input, range: text_range, source })
+              if input == bytes && text_range.start_byte == 6 && text_range.end_byte == 12
+                && source.valid_up_to() == 0 && source.error_len() == Some(1)));
+      ensure(
+        preserved
+          && placeholders.placeholder("first", PlaceholderKind::Variable) == 0
+          && placeholders.placeholder("after", PlaceholderKind::Variable) == 1,
+        "the failed child retains completed siblings, the nested native failure, and the caller's established placeholders",
+      )
+    })
   }
 
+  /// Failed callees, arguments, and match subjects retain their parent and completed normalization
+  /// state.
   #[test]
-  fn string_literal() {
-    let src = "\"hello\"\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    let lit = stmt.named_child(0).unwrap();
-    let node = normalize_ts_node(lit, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::Literal(LiteralKind::Str));
+  fn failed_structural_child_retains_parent_and_completed_prefix() -> Result<(), NormalizerTestFailure> {
+    let call_tree = parse("callee(first, second)\n")?;
+    let call = first_expression(&call_tree)?;
+    let match_tree = parse("match subject:\n    case _:\n        pass\n")?;
+    let matched = first_stmt(&match_tree)?;
+    for (tree, parent, bytes, (start_byte, end_byte), expected_completed, next_index) in [
+      (&call_tree, call, b"\xffallee(first, second)\n".as_slice(), (0, 6), vec![], 1),
+      (
+        &call_tree,
+        call,
+        b"callee(\xffirst, second)\n".as_slice(),
+        (7, 12),
+        vec![variable(1)],
+        2,
+      ),
+      (
+        &call_tree,
+        call,
+        b"callee(first, \xffecond)\n".as_slice(),
+        (14, 20),
+        vec![variable(1), variable(2)],
+        3,
+      ),
+      (
+        &match_tree,
+        matched,
+        b"match \xffubject:\n    case _:\n        pass\n".as_slice(),
+        (6, 13),
+        vec![],
+        1,
+      ),
+    ] {
+      let expected_range = tree_sitter::Range {
+        start_byte,
+        end_byte,
+        start_point: tree_sitter::Point::new(0, start_byte),
+        end_point: tree_sitter::Point::new(0, end_byte),
+      };
+      let mut context = NormalizationContext::new();
+      let established_index = context.placeholder("established", PlaceholderKind::Variable);
+      let outcome = normalize_ts_node(&parent, bytes, &test_mapping(), &mut context);
+      check_attempt(tree.clone(), context, outcome, |observed, placeholders| {
+        let preserved = matches!(*observed, Err(NormalizationError::Children {
+          ref kind, range, ref completed, ref source,
+        }) if kind == parent.kind() && range == parent.range() && *completed == expected_completed
+          && matches!(**source, NormalizationError::Text(NodeTextError::Utf8 { ref input, range: text_range, source: failure })
+            if input == bytes && text_range == expected_range
+              && failure.valid_up_to() == 0 && failure.error_len() == Some(1)));
+        ensure(
+          preserved
+            && established_index == 0
+            && placeholders.placeholder("established", PlaceholderKind::Variable) == 0
+            && placeholders.placeholder("after", PlaceholderKind::Variable) == next_index,
+          "structural child failures retain their parent, completed children, native text failure, and established placeholders without \
+           normalizing later children",
+        )
+      })?;
+    }
+    Ok(())
   }
 
+  /// Opaque and skipped nodes do not require text that their mapping never consumes.
   #[test]
-  fn literal_values_erased() {
-    let mapping = test_mapping();
-
-    let tree_a = parse("42\n");
-    let tree_b = parse("99\n");
-    let mut ctx_a = NormalizationContext::new();
-    let mut ctx_b = NormalizationContext::new();
-
-    let a = first_stmt(&tree_a).named_child(0).unwrap();
-    let b = first_stmt(&tree_b).named_child(0).unwrap();
-
-    let na = normalize_ts_node(a, b"42\n", &mapping, &mut ctx_a);
-    let nb = normalize_ts_node(b, b"99\n", &mapping, &mut ctx_b);
-    assert_eq!(na, nb);
-  }
-
-  #[test]
-  fn binary_add() {
-    let src = "a + b\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    let bin = stmt.named_child(0).unwrap();
-    let node = normalize_ts_node(bin, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::BinaryOp(BinOpKind::Add));
-    assert_eq!(node.children.len(), 2);
-  }
-
-  #[test]
-  fn binary_eq() {
-    let src = "a == b\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    let bin = stmt.named_child(0).unwrap();
-    let node = normalize_ts_node(bin, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::BinaryOp(BinOpKind::Eq));
-  }
-
-  #[test]
-  fn boolean_and() {
-    let src = "a and b\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    let bin = stmt.named_child(0).unwrap();
-    let node = normalize_ts_node(bin, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::BinaryOp(BinOpKind::And));
-  }
-
-  #[test]
-  fn unknown_binary_op_falls_back_to_other() {
-    let src = "a ** b\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    let bin = stmt.named_child(0).unwrap();
-    let node = normalize_ts_node(bin, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::BinaryOp(BinOpKind::Other));
-  }
-
-  #[test]
-  fn unary_not() {
-    let src = "not x\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    let un = stmt.named_child(0).unwrap();
-    let node = normalize_ts_node(un, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::UnaryOp(UnOpKind::Not));
-    assert_eq!(node.children.len(), 1);
-  }
-
-  #[test]
-  fn unary_neg() {
-    let src = "-x\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    let un = stmt.named_child(0).unwrap();
-    let node = normalize_ts_node(un, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::UnaryOp(UnOpKind::Neg));
-  }
-
-  #[test]
-  fn assignment_normalization() {
-    let src = "x = 1\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    let node = normalize_ts_node(stmt, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::Assign);
-    assert_eq!(node.children.len(), 2);
-    assert_eq!(node.children[0].kind, NodeKind::Placeholder(PlaceholderKind::Variable, 0));
-    assert_eq!(node.children[1].kind, NodeKind::Literal(LiteralKind::Int));
-  }
-
-  #[test]
-  fn return_with_value() {
-    let src = "def f():\n    return 42\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    // function_definition -> body -> block -> return_statement
-    let func = first_stmt(&tree);
-    let body = func.child_by_field_name("body").unwrap();
-    let cursor = &mut body.walk();
-    let ret = body.named_children(cursor).next().unwrap();
-
-    let node = normalize_ts_node(ret, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::Return);
-    assert_eq!(node.children.len(), 1);
-    assert_eq!(node.children[0].kind, NodeKind::Literal(LiteralKind::Int));
-  }
-
-  #[test]
-  fn return_without_value() {
-    let src = "def f():\n    return\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let func = first_stmt(&tree);
-    let body = func.child_by_field_name("body").unwrap();
-    let cursor = &mut body.walk();
-    let ret = body.named_children(cursor).next().unwrap();
-
-    let node = normalize_ts_node(ret, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::Return);
-    assert!(node.children.is_empty());
-  }
-
-  #[test]
-  fn if_with_else() {
-    let src = "if x:\n    y = 1\nelse:\n    y = 2\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let if_node = first_stmt(&tree);
-    let node = normalize_ts_node(if_node, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::If);
-    assert_eq!(node.children.len(), 3);
-    // else branch should not be None
-    assert!(!node.children[2].is_none());
-  }
-
-  #[test]
-  fn if_without_else() {
-    let src = "if x:\n    y = 1\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let if_node = first_stmt(&tree);
-    let node = normalize_ts_node(if_node, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::If);
-    assert_eq!(node.children.len(), 3);
-    // else branch should be None
-    assert!(node.children[2].is_none());
-  }
-
-  #[test]
-  fn while_loop() {
-    let src = "while x:\n    y = 1\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let whl = first_stmt(&tree);
-    let node = normalize_ts_node(whl, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::While);
-    assert_eq!(node.children.len(), 2);
-  }
-
-  #[test]
-  fn for_loop() {
-    let src = "for x in items:\n    pass\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let for_node = first_stmt(&tree);
-    let node = normalize_ts_node(for_node, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::ForLoop);
-    assert_eq!(node.children.len(), 3);
-  }
-
-  #[test]
-  fn call_with_args() {
-    let src = "f(a, b)\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    let call = stmt.named_child(0).unwrap();
-    let node = normalize_ts_node(call, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::Call);
-    // func + 2 args = 3 children
-    assert_eq!(node.children.len(), 3);
-  }
-
-  #[test]
-  fn call_no_args() {
-    let src = "f()\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let stmt = first_stmt(&tree);
-    let call = stmt.named_child(0).unwrap();
-    let node = normalize_ts_node(call, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::Call);
-    // just the function name
-    assert_eq!(node.children.len(), 1);
-  }
-
-  #[test]
-  fn skip_kinds_are_filtered() {
-    // Comments should be skipped by normalize_named_children
-    let src = "# comment\nx = 1\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let root = tree.root_node();
-    let children = normalize_named_children(root, src.as_bytes(), &mapping, &mut ctx);
-    // Only the assignment should remain, not the comment
-    assert_eq!(children.len(), 1);
-    assert_eq!(children[0].kind, NodeKind::Assign);
-  }
-
-  #[test]
-  fn error_node_becomes_opaque() {
-    let src = "((( @@@ )))\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let root = tree.root_node();
-    assert!(root.has_error());
-    let node = normalize_ts_node(root, src.as_bytes(), &mapping, &mut ctx);
-    assert!(has_opaque(&node));
-  }
-
-  #[test]
-  fn block_normalization() {
-    let src = "def f():\n    x = 1\n    y = 2\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    let func = first_stmt(&tree);
-    let body = func.child_by_field_name("body").unwrap();
-    let node = normalize_ts_node(body, src.as_bytes(), &mapping, &mut ctx);
-    assert_eq!(node.kind, NodeKind::Block);
-    assert_eq!(node.children.len(), 2);
-  }
-
-  // jscpd:ignore-end
-
-  #[test]
-  fn single_child_unwrap() {
-    // When an unknown named node has exactly one named child,
-    // the single child should be returned directly (no wrapping Block)
-    let src = "42\n";
-    let tree = parse(src);
-    let mapping = test_mapping();
-    let mut ctx = NormalizationContext::new();
-
-    // expression_statement has one named child (integer)
-    let stmt = first_stmt(&tree);
-    let node = normalize_ts_node(stmt, src.as_bytes(), &mapping, &mut ctx);
-    // Should unwrap to the literal directly, not wrap in Block
-    assert_eq!(node.kind, NodeKind::Literal(LiteralKind::Int));
+  fn opaque_and_skipped_nodes_do_not_decode_unused_text() -> Result<(), NormalizerTestFailure> {
+    let tree = parse("name\n")?;
+    let statement = first_stmt(&tree)?;
+    for mapping in [
+      NodeMapping::new().opaque(&["expression_statement"]),
+      NodeMapping::new().skip(&["expression_statement"]),
+    ] {
+      let normalized = normalize_ts_node(&statement, b"\xff", &mapping, &mut NormalizationContext::new())?;
+      check_node(normalized, NormalizedNode::leaf(NodeKind::Opaque))?;
+    }
+    let identifier = first_expression(&tree)?;
+    let normalized = normalize_ts_node(&identifier, b"name\n\xff", &test_mapping(), &mut NormalizationContext::new())?;
+    check_node(normalized, variable(0))
   }
 }

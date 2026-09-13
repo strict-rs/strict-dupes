@@ -69,7 +69,7 @@ thiserror = { version = "2", git = "https://github.com/strict-rs/strict-thiserro
 # crate's main branch. The version requirement (kept in sync with the crate's own
 # version) keeps it off cargo-deny's wildcard ban; `Cargo.lock` records the
 # resolved commit, refreshed by `cargo update -p strict-test-support`.
-strict-test-support = { version = "0.1.0", git = "https://github.com/earthlings-dev/strict-test-support-rs.git", branch = "main"}
+strict-test-support = { version = "0.1.0", default-features = false, git = "https://github.com/earthlings-dev/strict-test-support-rs.git", branch = "main"}
 
 # Source analysis — powers the `cq` cyclomatic-complexity gate in stask.
 # `span-locations` makes `proc_macro2::Span::start().line` meaningful outside a

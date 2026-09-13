@@ -2,16 +2,23 @@
 //! `[package.metadata.dupes]` loading, and dimension/suppression toggles.
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::string::FromUtf8Error;
+use std::sync::Arc;
 
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use thiserror::Error;
+use toml::de::Error as TomlDecodeError;
 
 use crate::code_unit::DetectionDimension;
+use crate::suppression::SuppressionPolicy;
+use crate::suppression::SuppressionWarning;
 
 /// The subset of configuration relevant to language-specific parsing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnalysisConfig {
   /// Minimum number of AST nodes for a code unit to be analyzed.
   pub min_nodes: usize,
@@ -55,9 +62,11 @@ pub struct Config {
   /// Minimum number of lines in a line window.
   pub line_min_lines: usize,
   /// Active suppression/admission rule set.
-  pub suppression: crate::suppression::SuppressionPolicy,
-  /// Non-fatal warnings produced while loading configuration.
-  pub load_warnings: Vec<String>,
+  pub suppression: SuppressionPolicy,
+  /// Complete nonfatal rule-selection warnings produced while loading configuration.
+  pub load_warnings: Vec<SuppressionWarning>,
+  /// Complete file observations in the order their settings were applied.
+  pub sources: Vec<ConfigSource>,
   /// Root path to analyze.
   pub root: PathBuf,
 }
@@ -81,98 +90,201 @@ impl Default for Config {
       token_min_lines: 2,
       token_similarity_threshold: 0.9,
       line_min_lines: 5,
-      suppression: crate::suppression::SuppressionPolicy::default(),
+      suppression: SuppressionPolicy::default(),
       load_warnings: Vec::new(),
+      sources: Vec::new(),
       root: PathBuf::from("."),
     }
   }
 }
 
-/// Config as stored in dupes.toml or Cargo.toml metadata.
-#[derive(Debug, Deserialize, Default)]
+/// Config as stored in `dupes.toml` or `Cargo.toml` metadata.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(default)]
-struct FileConfig {
-  min_nodes:            Option<usize>,
-  similarity_threshold: Option<f64>,
-  exclude:              Option<Vec<String>>,
-  max_exact_duplicates: Option<usize>,
-  max_near_duplicates:  Option<usize>,
-  max_exact_percent:    Option<f64>,
-  max_near_percent:     Option<f64>,
-  min_lines:            Option<usize>,
-  exclude_tests:        Option<bool>,
-  sub_function:         Option<bool>,
-  min_sub_nodes:        Option<usize>,
-  dimensions:           Option<DimensionConfig>,
-  token:                Option<TokenConfig>,
-  line:                 Option<LineConfig>,
-  suppress:             Option<SuppressConfig>,
+pub struct FileConfig {
+  /// Optional minimum AST size.
+  pub min_nodes:            Option<usize>,
+  /// Optional AST similarity threshold.
+  pub similarity_threshold: Option<f64>,
+  /// Optional replacement source-path exclusions.
+  pub exclude:              Option<Vec<String>>,
+  /// Optional exact-group count limit.
+  pub max_exact_duplicates: Option<usize>,
+  /// Optional near-group count limit.
+  pub max_near_duplicates:  Option<usize>,
+  /// Optional exact-duplication percentage limit.
+  pub max_exact_percent:    Option<f64>,
+  /// Optional near-duplication percentage limit.
+  pub max_near_percent:     Option<f64>,
+  /// Optional minimum source span for AST units.
+  pub min_lines:            Option<usize>,
+  /// Optional exclusion of test functions and modules.
+  pub exclude_tests:        Option<bool>,
+  /// Optional activation of sub-function extraction.
+  pub sub_function:         Option<bool>,
+  /// Optional minimum AST size for extracted sub-units.
+  pub min_sub_nodes:        Option<usize>,
+  /// Optional per-dimension enablement overrides.
+  pub dimensions:           Option<DimensionConfig>,
+  /// Optional token-window detection settings.
+  pub token:                Option<TokenConfig>,
+  /// Optional line-window detection settings.
+  pub line:                 Option<LineConfig>,
+  /// Optional reportability-rule overrides.
+  pub suppress:             Option<SuppressConfig>,
 }
 
 /// Optional suppression-rule toggles from file config.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
-struct SuppressConfig {
-  disable: Option<Vec<String>>,
-  enable:  Option<Vec<String>>,
+pub struct SuppressConfig {
+  /// Rule identifiers to disable before processing explicit enables.
+  pub disable: Option<Vec<String>>,
+  /// Rule identifiers to enable after processing disables.
+  pub enable:  Option<Vec<String>>,
 }
 
 /// Optional dimension switches from file config.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
-struct DimensionConfig {
-  ast:              Option<bool>,
-  sub_ast:          Option<bool>,
-  token_normalized: Option<bool>,
-  token_raw:        Option<bool>,
-  line:             Option<bool>,
+pub struct DimensionConfig {
+  /// Enablement override for complete AST units.
+  pub ast:              Option<bool>,
+  /// Enablement override for extracted AST units.
+  pub sub_ast:          Option<bool>,
+  /// Enablement override for normalized tokens.
+  pub token_normalized: Option<bool>,
+  /// Enablement override for source-preserving tokens.
+  pub token_raw:        Option<bool>,
+  /// Enablement override for normalized source lines.
+  pub line:             Option<bool>,
 }
 
 /// Optional token settings from file config.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq)]
 #[serde(default)]
-struct TokenConfig {
-  min_tokens:           Option<usize>,
-  min_lines:            Option<usize>,
-  similarity_threshold: Option<f64>,
+pub struct TokenConfig {
+  /// Optional minimum token count per window.
+  pub min_tokens:           Option<usize>,
+  /// Optional minimum source span per token window.
+  pub min_lines:            Option<usize>,
+  /// Optional normalized-token similarity threshold.
+  pub similarity_threshold: Option<f64>,
 }
 
 /// Optional line settings from file config.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
-struct LineConfig {
-  min_lines: Option<usize>,
+pub struct LineConfig {
+  /// Optional minimum line count per window.
+  pub min_lines: Option<usize>,
 }
 
-/// Cargo.toml metadata section.
-#[derive(Debug, Deserialize)]
-struct CargoMetadata {
+/// `Cargo.toml` metadata section.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CargoMetadata {
+  /// Package declaration, absent for virtual workspaces.
   #[serde(default)]
-  package: Option<CargoPackage>,
+  pub package: Option<CargoPackage>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CargoPackage {
+/// Package-level container for Cargo metadata.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CargoPackage {
+  /// Tool-owned metadata associated with the package.
   #[serde(default)]
-  metadata: Option<CargoPackageMetadata>,
+  pub metadata: Option<CargoPackageMetadata>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CargoPackageMetadata {
+/// Package metadata containing an optional duplicate-detection policy.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CargoPackageMetadata {
+  /// Duplicate-detection settings applied before the dedicated config file.
   #[serde(default)]
-  dupes: Option<FileConfig>,
+  pub dupes: Option<FileConfig>,
+}
+
+/// The typed document decoded from a configuration source.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigDocument {
+  /// Cargo package metadata, including an absent package or tool section.
+  Cargo(Box<CargoMetadata>),
+  /// Overrides from the dedicated `dupes.toml` document.
+  Dedicated(Box<FileConfig>),
+}
+
+/// A configuration file observation retained with the resolved settings.
+#[derive(Debug, Clone)]
+pub enum ConfigSource {
+  /// A complete document was read and decoded.
+  Read {
+    /// Exact path passed to the reader.
+    path:     PathBuf,
+    /// Complete original document before deserialization.
+    contents: String,
+    /// The file-format model used to resolve this layer's settings.
+    document: ConfigDocument,
+  },
+  /// An optional file was absent and supplied no overrides.
+  Absent {
+    /// Exact optional configuration path.
+    path:   PathBuf,
+    /// Shared native absence observation, preserved when configurations clone.
+    source: Arc<io::Error>,
+  },
+}
+
+/// A configuration file could not be read or decoded.
+#[derive(Debug, Error)]
+pub enum ConfigFileError {
+  /// Reading failed for a reason other than optional-file absence.
+  #[error("failed to read configuration {}: {source}", path.display())]
+  Read {
+    /// Exact file path passed to the reader.
+    path:   PathBuf,
+    /// Native filesystem failure.
+    source: io::Error,
+  },
+  /// A complete byte buffer was read but was not valid UTF-8.
+  #[error("configuration {} is not UTF-8: {source}", path.display())]
+  Utf8 {
+    /// Configuration path that supplied the bytes.
+    path:   PathBuf,
+    /// Native decoding failure with its complete input bytes.
+    source: FromUtf8Error,
+  },
+  /// TOML deserialization rejected the complete document.
+  #[error("failed to decode configuration {}: {source}", path.display())]
+  Decode {
+    /// Configuration path that supplied the document.
+    path:     PathBuf,
+    /// Complete text supplied to the TOML decoder.
+    contents: String,
+    /// Native typed TOML failure.
+    source:   Box<TomlDecodeError>,
+  },
+}
+
+/// Configuration loading stopped after retaining every completed lower layer.
+#[derive(Debug, Error)]
+#[error("{source}")]
+pub struct ConfigLoadError {
+  /// Settings and source observations resolved before the failing file.
+  pub config: Box<Config>,
+  /// The file operation that could not complete.
+  pub source: ConfigFileError,
 }
 
 /// Overwrite `slot` when an override value is present.
-pub(crate) fn override_with<T>(slot: &mut T, value: Option<T>) {
-  if let Some(value) = value {
-    *slot = value;
+pub(crate) fn override_with<Value>(slot: &mut Value, supplied: Option<Value>) {
+  if let Some(replacement) = supplied {
+    *slot = replacement;
   }
 }
 
 /// Overwrite an optional `slot` only when an override value is present.
-pub(crate) fn override_option<T>(slot: &mut Option<T>, value: Option<T>) {
-  override_with(slot, value.map(Some));
+pub(crate) fn override_option<Value>(slot: &mut Option<Value>, supplied: Option<Value>) {
+  override_with(slot, supplied.map(Some));
 }
 
 impl Config {
@@ -187,44 +299,88 @@ impl Config {
 
   /// Load config with the following precedence:
   /// 1. CLI overrides (applied by the caller after this method)
-  /// 2. dupes.toml in the project root
-  /// 3. `[package.metadata.dupes]` in Cargo.toml
+  /// 2. `dupes.toml` in the project root
+  /// 3. `[package.metadata.dupes]` in `Cargo.toml`
   /// 4. Defaults
-  #[must_use]
-  pub fn load(root: &Path) -> Self {
+  ///
+  /// # Errors
+  ///
+  /// Returns the native read or decoding failure together with every
+  /// configuration layer resolved before it. Only absent files use defaults.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "Configuration loading owns the shared file-precedence contract for both CLI adapters."
+  )]
+  pub fn load(root: &Path) -> Result<Self, ConfigLoadError> {
     let mut config = Self {
       root: root.to_path_buf(),
       ..Default::default()
     };
 
-    // Try Cargo.toml metadata first (lowest priority file config)
-    if let Some(dupes) = load_cargo_metadata_config(&root.join("Cargo.toml")) {
-      config.apply_file_config(&dupes);
-    }
-
-    // Try dupes.toml (higher priority)
-    if let Some(file_config) = read_toml_file(&root.join("dupes.toml")) {
-      config.apply_file_config(&file_config);
-    }
-
-    config
+    let cargo = read_toml_file(root.join("Cargo.toml"), |contents| {
+      toml::from_str(contents).map(ConfigDocument::Cargo)
+    })
+    .map_err(|source| ConfigLoadError {
+      config: Box::new(config.clone()),
+      source,
+    })?;
+    config.apply_source(cargo);
+    let dedicated = read_toml_file(root.join("dupes.toml"), |contents| {
+      toml::from_str(contents).map(ConfigDocument::Dedicated)
+    })
+    .map_err(|source| ConfigLoadError {
+      config: Box::new(config.clone()),
+      source,
+    })?;
+    config.apply_source(dedicated);
+    Ok(config)
   }
 
-  fn apply_file_config(&mut self, fc: &FileConfig) {
-    override_with(&mut self.min_nodes, fc.min_nodes);
-    override_with(&mut self.similarity_threshold, fc.similarity_threshold);
-    if let Some(ref v) = fc.exclude {
-      self.exclude.clone_from(v);
+  /// Apply a decoded file's optional settings and retain its complete observation.
+  fn apply_source(&mut self, source: ConfigSource) {
+    let settings = match source {
+      ConfigSource::Read {
+        document: ConfigDocument::Cargo(ref cargo),
+        ..
+      } => cargo
+        .package
+        .as_ref()
+        .and_then(|package| package.metadata.as_ref())
+        .and_then(|metadata| metadata.dupes.as_ref()),
+      ConfigSource::Read {
+        document: ConfigDocument::Dedicated(ref dedicated),
+        ..
+      } => Some(dedicated.as_ref()),
+      ConfigSource::Absent {
+        ..
+      } => None,
+    };
+    if let Some(overrides) = settings {
+      self.apply_file_config(overrides);
     }
-    override_option(&mut self.max_exact_duplicates, fc.max_exact_duplicates);
-    override_option(&mut self.max_near_duplicates, fc.max_near_duplicates);
-    override_option(&mut self.max_exact_percent, fc.max_exact_percent);
-    override_option(&mut self.max_near_percent, fc.max_near_percent);
-    override_with(&mut self.min_lines, fc.min_lines);
-    override_with(&mut self.exclude_tests, fc.exclude_tests);
-    override_with(&mut self.sub_function, fc.sub_function);
-    override_with(&mut self.min_sub_nodes, fc.min_sub_nodes);
-    if let Some(dimensions) = &fc.dimensions {
+    self.sources.push(source);
+  }
+
+  /// Apply only explicitly declared settings, preserving earlier layer values otherwise.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "Applying optional overrides is the precedence boundary between a retained source document and resolved run configuration."
+  )]
+  fn apply_file_config(&mut self, file_config: &FileConfig) {
+    override_with(&mut self.min_nodes, file_config.min_nodes);
+    override_with(&mut self.similarity_threshold, file_config.similarity_threshold);
+    if let Some(ref exclusions) = file_config.exclude {
+      self.exclude.clone_from(exclusions);
+    }
+    override_option(&mut self.max_exact_duplicates, file_config.max_exact_duplicates);
+    override_option(&mut self.max_near_duplicates, file_config.max_near_duplicates);
+    override_option(&mut self.max_exact_percent, file_config.max_exact_percent);
+    override_option(&mut self.max_near_percent, file_config.max_near_percent);
+    override_with(&mut self.min_lines, file_config.min_lines);
+    override_with(&mut self.exclude_tests, file_config.exclude_tests);
+    override_with(&mut self.sub_function, file_config.sub_function);
+    override_with(&mut self.min_sub_nodes, file_config.min_sub_nodes);
+    if let Some(dimensions) = file_config.dimensions {
       let toggles = [
         (DetectionDimension::Ast, dimensions.ast),
         (DetectionDimension::SubAst, dimensions.sub_ast),
@@ -232,23 +388,24 @@ impl Config {
         (DetectionDimension::TokenRaw, dimensions.token_raw),
         (DetectionDimension::Line, dimensions.line),
       ];
-      for (dimension, toggle) in toggles {
-        if let Some(enabled) = toggle {
-          self.set_dimension(dimension, enabled);
-        }
+      for (dimension, enabled) in toggles
+        .into_iter()
+        .filter_map(|(dimension, toggle)| toggle.map(|enabled| (dimension, enabled)))
+      {
+        self.set_dimension(dimension, enabled);
       }
     }
-    if let Some(token) = &fc.token {
+    if let Some(token) = file_config.token {
       override_with(&mut self.token_min_tokens, token.min_tokens);
       override_with(&mut self.token_min_lines, token.min_lines);
       override_with(&mut self.token_similarity_threshold, token.similarity_threshold);
     }
-    if let Some(line) = &fc.line
-      && let Some(v) = line.min_lines
+    if let Some(line) = file_config.line
+      && let Some(min_lines) = line.min_lines
     {
-      self.line_min_lines = v;
+      self.line_min_lines = min_lines;
     }
-    if let Some(suppress) = &fc.suppress {
+    if let Some(ref suppress) = file_config.suppress {
       let warnings = self.suppression.apply_toggles(
         suppress.disable.as_deref().unwrap_or_default(),
         suppress.enable.as_deref().unwrap_or_default(),
@@ -259,7 +416,7 @@ impl Config {
 
   /// Disable a duplicate-detection dimension.
   pub fn disable_dimension(&mut self, dimension: DetectionDimension) {
-    self.enabled_dimensions.remove(&dimension);
+    self.enabled_dimensions.retain(|candidate| *candidate != dimension);
   }
 
   /// Enable only the provided duplicate-detection dimensions.
@@ -276,231 +433,592 @@ impl Config {
   /// Set a duplicate-detection dimension on or off.
   fn set_dimension(&mut self, dimension: DetectionDimension, enabled: bool) {
     if enabled {
-      self.enabled_dimensions.insert(dimension);
+      self.enabled_dimensions.extend([dimension]);
     } else {
-      self.enabled_dimensions.remove(&dimension);
+      self.disable_dimension(dimension);
     }
   }
 }
 
-fn load_cargo_metadata_config(path: &Path) -> Option<FileConfig> {
-  let cargo = read_toml_file::<CargoMetadata>(path)?;
-  cargo.package?.metadata?.dupes
-}
-
-fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Option<T> {
-  if !path.exists() {
-    return None;
+/// Read an optional TOML configuration document.
+fn read_toml_file(
+  path: PathBuf,
+  decode: impl FnOnce(&str) -> Result<ConfigDocument, TomlDecodeError>,
+) -> Result<ConfigSource, ConfigFileError> {
+  let bytes = match fs::read(&path) {
+    Ok(bytes) => bytes,
+    Err(source) if source.kind() == io::ErrorKind::NotFound => {
+      return Ok(ConfigSource::Absent {
+        path,
+        source: Arc::new(source),
+      });
+    }
+    Err(source) => {
+      return Err(ConfigFileError::Read {
+        path,
+        source,
+      });
+    }
+  };
+  let contents = String::from_utf8(bytes).map_err(|source| ConfigFileError::Utf8 {
+    path: path.clone(),
+    source,
+  })?;
+  match decode(&contents) {
+    Ok(document) => Ok(ConfigSource::Read {
+      path,
+      contents,
+      document,
+    }),
+    Err(source) => Err(ConfigFileError::Decode {
+      path,
+      contents,
+      source: Box::new(source),
+    }),
   }
-  let content = std::fs::read_to_string(path).ok()?;
-  toml::from_str(&content).ok()
 }
 
 #[cfg(test)]
 mod tests {
+  use std::cmp::Ordering;
+  use std::collections::BTreeSet;
   use std::fs;
+  use std::io;
+  use std::path::PathBuf;
 
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
+  use strict_test_support::ensure_eq;
   use tempfile::TempDir;
+  use thiserror::Error;
 
-  use super::*;
+  use super::CargoMetadata;
+  use super::CargoPackage;
+  use super::CargoPackageMetadata;
+  use super::Config;
+  use super::ConfigDocument;
+  use super::ConfigFileError;
+  use super::ConfigLoadError;
+  use super::ConfigSource;
+  use super::FileConfig;
+  use crate::code_unit::DetectionDimension;
+  use crate::suppression::RuleId;
+  use crate::suppression::SuppressionWarning;
 
-  fn load_with_dupes_toml(contents: &str) -> Config {
-    let tmp = TempDir::new().unwrap();
-    write_config(&tmp, "dupes.toml", contents);
-    Config::load(tmp.path())
+  /// Native fixture failures and policy expectation failures.
+  #[derive(Debug, Error)]
+  enum ConfigTestFailure {
+    /// Temporary configuration directory allocation failed.
+    #[error("cannot allocate a configuration fixture workspace")]
+    Workspace(#[from] io::Error),
+    /// A configuration document could not be written.
+    #[error("cannot write configuration fixture at {}", path.display())]
+    Fixture {
+      /// Native destination path of the document.
+      path:   PathBuf,
+      /// Original filesystem failure.
+      source: io::Error,
+    },
+    /// Configuration loading retained a native failure and completed layers.
+    #[error(transparent)]
+    Load(#[from] ConfigLoadError),
+    /// A loading outcome did not satisfy the expected preservation contract.
+    #[error("configuration outcome expectation failed: {source}")]
+    LoadExpectation {
+      /// Complete successful or failed configuration load.
+      outcome: Box<Result<Config, ConfigLoadError>>,
+      /// Assertion explaining the violated contract.
+      source:  TestFailure,
+    },
+    /// The loaded policy violated its expected behavior.
+    #[error(transparent)]
+    Expectation(#[from] TestFailure),
   }
 
-  fn write_config(tmp: &TempDir, file_name: &str, contents: &str) {
-    fs::write(tmp.path().join(file_name), contents).unwrap();
+  /// Load a dedicated configuration file through the production file loader.
+  fn load_with_dupes_toml(contents: &str) -> Result<Config, ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    write_config(&workspace, "dupes.toml", contents)?;
+    Ok(Config::load(workspace.path())?)
   }
 
-  #[test]
-  fn suppress_table_toggles_rules_with_dupes_toml_winning() {
-    use crate::suppression::RuleId;
-    let tmp = TempDir::new().unwrap();
+  /// Materialize one configuration layer at the filename used by the loader.
+  fn write_config(workspace: &TempDir, file_name: &str, contents: &str) -> Result<(), ConfigTestFailure> {
+    let path = workspace.path().join(file_name);
+    fs::write(&path, contents).map_err(|source| ConfigTestFailure::Fixture {
+      path,
+      source,
+    })
+  }
+
+  /// Materialize package metadata beneath a valid Cargo package declaration.
+  fn write_package_config(workspace: &TempDir, metadata: &str) -> Result<(), ConfigTestFailure> {
     write_config(
-      &tmp,
+      workspace,
       "Cargo.toml",
-      r#"
-            [package]
-            name = "test"
-            version = "0.1.0"
-            edition = "2021"
+      &[
+        "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        metadata,
+      ]
+      .concat(),
+    )
+  }
 
+  /// Dedicated dimension and window settings override only the declared parts of Cargo metadata.
+  #[test]
+  fn dimension_and_window_layers_preserve_omitted_settings() -> Result<(), ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    write_package_config(
+      &workspace,
+      "\
+[package.metadata.dupes.dimensions]
+ast = false
+sub_ast = false
+token_normalized = false
+token_raw = false
+line = false
+[package.metadata.dupes.token]
+min_tokens = 32
+min_lines = 4
+similarity_threshold = 0.625
+[package.metadata.dupes.line]
+min_lines = 9
+",
+    )?;
+    for (document, dimensions, token_lines, line_lines) in [
+      ("", BTreeSet::new(), 4, 9),
+      (
+        "\
+[dimensions]
+ast = true
+token_normalized = true
+sub_ast = false
+[token]
+min_lines = 2
+[line]
+min_lines = 3
+",
+        BTreeSet::from([DetectionDimension::Ast, DetectionDimension::TokenNormalized]),
+        2,
+        3,
+      ),
+    ] {
+      write_config(&workspace, "dupes.toml", document)?;
+      let outcome = Config::load(workspace.path());
+      ensure(
+        matches!(outcome, Ok(ref config)
+          if config.enabled_dimensions == dimensions
+            && config.token_min_tokens == 32 && config.token_min_lines == token_lines
+            && config.token_similarity_threshold.total_cmp(&0.625) == Ordering::Equal
+            && config.line_min_lines == line_lines
+            && matches!(config.sources.as_slice(), [ConfigSource::Read { document: ConfigDocument::Cargo(_), .. },
+              ConfigSource::Read { contents, document: ConfigDocument::Dedicated(_), .. }] if contents == document)),
+        "explicit toggles can disable or re-enable dimensions while omitted dimensions and window settings retain their earlier values",
+      )
+      .map_err(|source| ConfigTestFailure::LoadExpectation {
+        outcome: Box::new(outcome),
+        source,
+      })?;
+    }
+    Ok(())
+  }
+
+  /// Dedicated rule toggles override Cargo metadata while preserving unrelated selections.
+  #[test]
+  fn suppress_table_toggles_rules_with_dupes_toml_winning() -> Result<(), ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    write_package_config(
+      &workspace,
+      r#"
             [package.metadata.dupes.suppress]
             disable = ["line.chain-tail", "token.low-signal"]
             "#,
-    );
+    )?;
     write_config(
-      &tmp,
+      &workspace,
       "dupes.toml",
       r#"
             [suppress]
             enable = ["line.chain-tail"]
             disable = ["sub.value-plumbing"]
             "#,
-    );
-    let config = Config::load(tmp.path());
-    assert!(config.suppression.is_enabled(RuleId::LineChainTail));
-    assert!(!config.suppression.is_enabled(RuleId::TokenLowSignal));
-    assert!(!config.suppression.is_enabled(RuleId::SubValuePlumbing));
-    assert!(config.load_warnings.is_empty());
+    )?;
+    let config = Config::load(workspace.path())?;
+    ensure(
+      [
+        config.suppression.is_enabled(RuleId::LineChainTail),
+        config.suppression.is_enabled(RuleId::TokenLowSignal),
+        config.suppression.is_enabled(RuleId::SubValuePlumbing),
+      ] == [true, false, false],
+      "dedicated-file rule overrides win while retaining unrelated Cargo rule settings",
+    )?;
+    ensure(config.load_warnings.is_empty(), "recognized rule overrides produce no warnings")?;
+    Ok(())
   }
 
+  /// Unknown rules remain nonfatal while retaining the complete rejected request.
   #[test]
-  fn unknown_suppress_rule_ids_warn_without_failing() {
+  fn unknown_suppress_rule_ids_warn_without_failing() -> Result<(), ConfigTestFailure> {
     let config = load_with_dupes_toml(
       r#"
             [suppress]
             disable = ["no.such-rule"]
+            enable = ["no.such-rule"]
             "#,
-    );
-    assert_eq!(config.load_warnings, vec!["unknown suppression rule id: no.such-rule"]);
+    )?;
+    ensure(
+      config.load_warnings
+        == [
+          SuppressionWarning::UnknownDisabledRule {
+            id: "no.such-rule".to_owned(),
+          },
+          SuppressionWarning::UnknownEnabledRule {
+            id: "no.such-rule".to_owned(),
+          },
+        ],
+      "retain both unknown suppression requests without rejecting the configuration",
+    )
+    .map_err(|source| ConfigTestFailure::LoadExpectation {
+      outcome: Box::new(Ok(config)),
+      source,
+    })
   }
 
+  /// Defaults establish the documented detector sizes, thresholds, and source policy.
   #[test]
-  fn default_config() {
+  fn default_config() -> Result<(), TestFailure> {
     let config = Config::default();
-    assert_eq!(config.min_nodes, 10);
-    assert!((config.similarity_threshold - 0.8).abs() < f64::EPSILON);
-    assert_eq!(config.line_min_lines, 5);
-    assert!(config.exclude.is_empty());
-    assert!(!config.sub_function);
+    ensure(
+      (config.min_nodes, config.line_min_lines, config.exclude, config.sub_function) == (10, 5, Vec::<String>::new(), false)
+        && config.similarity_threshold.total_cmp(&0.8) == Ordering::Equal,
+      "preserve the default detector sizes, similarity threshold, and source-selection policy",
+    )
   }
 
+  /// The dedicated document supplies detector settings and path exclusions.
   #[test]
-  fn load_from_dupes_toml() {
+  fn load_from_dupes_toml() -> Result<(), ConfigTestFailure> {
     let config = load_with_dupes_toml(
       r#"
             min_nodes = 20
             similarity_threshold = 0.9
             exclude = ["tests"]
             "#,
-    );
-    assert_eq!(config.min_nodes, 20);
-    assert!((config.similarity_threshold - 0.9).abs() < f64::EPSILON);
-    assert_eq!(config.exclude, vec!["tests".to_string()]);
+    )?;
+    ensure(
+      (config.min_nodes, &config.exclude) == (20, &vec!["tests".to_owned()])
+        && config.similarity_threshold.total_cmp(&0.9) == Ordering::Equal,
+      "load detector settings and path exclusions from the dedicated configuration file",
+    )?;
+    Ok(())
   }
 
+  /// Cargo package metadata supplies settings when the dedicated file is absent.
   #[test]
-  fn load_from_cargo_toml_metadata() {
-    let tmp = TempDir::new().unwrap();
-    write_config(
-      &tmp,
-      "Cargo.toml",
-      r#"
-            [package]
-            name = "test"
-            version = "0.1.0"
-            edition = "2021"
-
+  fn load_from_cargo_toml_metadata() -> Result<(), ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    write_package_config(
+      &workspace,
+      "
             [package.metadata.dupes]
             min_nodes = 15
             similarity_threshold = 0.75
-            "#,
-    );
-    let config = Config::load(tmp.path());
-    assert_eq!(config.min_nodes, 15);
-    assert!((config.similarity_threshold - 0.75).abs() < f64::EPSILON);
+            ",
+    )?;
+    let config = Config::load(workspace.path())?;
+    ensure(
+      config.min_nodes == 15 && config.similarity_threshold.total_cmp(&0.75) == Ordering::Equal,
+      "load package metadata when the dedicated configuration file is absent",
+    )?;
+    Ok(())
   }
 
+  /// Dedicated settings take precedence over the same Cargo metadata fields.
   #[test]
-  fn dupes_toml_overrides_cargo_toml() {
-    let tmp = TempDir::new().unwrap();
-    write_config(
-      &tmp,
-      "Cargo.toml",
-      r#"
-            [package]
-            name = "test"
-            version = "0.1.0"
-            edition = "2021"
-
+  fn dupes_toml_overrides_cargo_toml() -> Result<(), ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    write_package_config(
+      &workspace,
+      "
             [package.metadata.dupes]
             min_nodes = 15
-            "#,
-    );
-    write_config(
-      &tmp,
-      "dupes.toml",
-      r"
-            min_nodes = 25
             ",
-    );
-    let config = Config::load(tmp.path());
-    assert_eq!(config.min_nodes, 25);
+    )?;
+    write_config(&workspace, "dupes.toml", "min_nodes = 25\n")?;
+    let config = Config::load(workspace.path())?;
+    ensure_eq(
+      &config.min_nodes,
+      &25,
+      "dedicated configuration replaces the same Cargo metadata setting",
+    )?;
+    Ok(())
   }
 
+  /// Absent optional files preserve defaults and both native absence observations.
   #[test]
-  fn load_no_config_files() {
-    let tmp = TempDir::new().unwrap();
-    let config = Config::load(tmp.path());
-    assert_eq!(config.min_nodes, 10); // default
+  fn load_no_config_files() -> Result<(), ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    let config = Config::load(workspace.path())?;
+    ensure_eq(
+      &config.min_nodes,
+      &10,
+      "absence of both configuration files retains the default AST size",
+    )?;
+    let paths = [workspace.path().join("Cargo.toml"), workspace.path().join("dupes.toml")];
+    ensure(
+      config.sources.len() == paths.len()
+        && config.sources.iter().zip(paths).all(|(observation, expected_path)| {
+          matches!(*observation, ConfigSource::Absent { ref path, ref source }
+            if *path == expected_path && source.kind() == io::ErrorKind::NotFound)
+        }),
+      "default configuration retains both native absence observations in precedence order",
+    )
+    .map_err(|source| ConfigTestFailure::LoadExpectation {
+      outcome: Box::new(Ok(config)),
+      source,
+    })
   }
 
+  /// Resolving precedence retains every complete input document and parsed file model.
   #[test]
-  fn config_with_thresholds() {
-    let config = load_with_dupes_toml(
-      r"
-            max_exact_duplicates = 0
-            max_near_duplicates = 5
-            ",
-    );
-    assert_eq!(config.max_exact_duplicates, Some(0));
-    assert_eq!(config.max_near_duplicates, Some(5));
+  fn loaded_sources_preserve_documents_before_precedence_resolution() -> Result<(), ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    let cargo_contents = "[package.metadata.dupes]\nmin_nodes = 15\n";
+    let dedicated_contents = "min_nodes = 25\n";
+    write_config(&workspace, "Cargo.toml", cargo_contents)?;
+    write_config(&workspace, "dupes.toml", dedicated_contents)?;
+    let config = Config::load(workspace.path())?;
+    let expected = [
+      (
+        workspace.path().join("Cargo.toml"),
+        cargo_contents,
+        ConfigDocument::Cargo(Box::new(CargoMetadata {
+          package: Some(CargoPackage {
+            metadata: Some(CargoPackageMetadata {
+              dupes: Some(FileConfig {
+                min_nodes: Some(15),
+                ..Default::default()
+              }),
+            }),
+          }),
+        })),
+      ),
+      (
+        workspace.path().join("dupes.toml"),
+        dedicated_contents,
+        ConfigDocument::Dedicated(Box::new(FileConfig {
+          min_nodes: Some(25),
+          ..Default::default()
+        })),
+      ),
+    ];
+    ensure(
+      config.min_nodes == 25
+        && config.sources.len() == expected.len()
+        && config
+          .sources
+          .iter()
+          .zip(expected)
+          .all(|(observed, (expected_path, expected_contents, expected_document))| {
+            matches!(*observed, ConfigSource::Read { ref path, ref contents, ref document }
+            if *path == expected_path && contents == expected_contents && *document == expected_document)
+          }),
+      "resolved settings retain both complete file-format models, paths, and source documents in application order",
+    )
+    .map_err(|source| ConfigTestFailure::LoadExpectation {
+      outcome: Box::new(Ok(config)),
+      source,
+    })
   }
 
+  /// A virtual workspace is a successful Cargo document with no package overrides.
   #[test]
-  fn config_with_exclude_tests() {
-    let config = load_with_dupes_toml(
-      r"
-            exclude_tests = true
-            ",
-    );
-    assert!(config.exclude_tests);
+  fn cargo_without_package_retains_its_successful_document_observation() -> Result<(), ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    let contents = "[workspace]\nmembers = []\n";
+    write_config(&workspace, "Cargo.toml", contents)?;
+    let config = Config::load(workspace.path())?;
+    let expected_path = workspace.path().join("Cargo.toml");
+    ensure(
+      config.min_nodes == Config::default().min_nodes
+        && config.sources.iter().any(|observation| {
+          matches!(*observation, ConfigSource::Read {
+            ref path, contents: ref observed_contents, document: ConfigDocument::Cargo(ref cargo),
+          } if *path == expected_path && observed_contents == contents && **cargo == CargoMetadata { package: None })
+        }),
+      "a Cargo document without package settings is observed successfully and supplies no overrides",
+    )
+    .map_err(|source| ConfigTestFailure::LoadExpectation {
+      outcome: Box::new(Ok(config)),
+      source,
+    })
   }
 
+  /// A failed higher-precedence document preserves lower-layer settings, warnings, and input.
   #[test]
-  fn config_with_min_lines() {
-    let config = load_with_dupes_toml(
-      r"
-            min_lines = 5
-            ",
-    );
-    assert_eq!(config.min_lines, 5);
+  fn malformed_dedicated_config_preserves_completed_cargo_layer() -> Result<(), ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    let cargo_contents = "[package.metadata.dupes]\nmin_nodes = 37\n[package.metadata.dupes.suppress]\ndisable = [\"no.such-rule\"]\n";
+    let dedicated_contents = "min_nodes = [\n";
+    write_config(&workspace, "Cargo.toml", cargo_contents)?;
+    write_config(&workspace, "dupes.toml", dedicated_contents)?;
+    let cargo_path = workspace.path().join("Cargo.toml");
+    let dedicated_path = workspace.path().join("dupes.toml");
+    let outcome = Config::load(workspace.path());
+    ensure(
+      matches!(outcome, Err(ConfigLoadError {
+        ref config,
+        source: ConfigFileError::Decode { path: ref failed_path, contents: ref failed_contents, .. },
+      }) if *failed_path == dedicated_path
+        && failed_contents == dedicated_contents
+        && config.min_nodes == 37
+        && config.load_warnings == [SuppressionWarning::UnknownDisabledRule { id: "no.such-rule".to_owned() }]
+        && config.sources.len() == 1
+        && config.sources.iter().all(|observation| {
+          matches!(*observation, ConfigSource::Read {
+            ref path, ref contents, document: ConfigDocument::Cargo(ref cargo),
+          } if *path == cargo_path && contents == cargo_contents
+            && cargo.package.as_ref().and_then(|package| package.metadata.as_ref())
+              .and_then(|metadata| metadata.dupes.as_ref()).is_some_and(|settings| settings.min_nodes == Some(37)))
+        })),
+      "a higher-precedence decoding failure preserves the native cause, rejected document, and completed Cargo layer",
+    )
+    .map_err(|source| ConfigTestFailure::LoadExpectation {
+      outcome: Box::new(outcome),
+      source,
+    })
   }
 
+  /// Invalid Cargo metadata stops loading before higher-precedence settings are applied.
   #[test]
-  fn config_with_percentage_thresholds() {
-    let config = load_with_dupes_toml(
-      r"
-            max_exact_percent = 5.0
-            max_near_percent = 10.5
-            ",
-    );
-    assert_eq!(config.max_exact_percent, Some(5.0));
-    assert_eq!(config.max_near_percent, Some(10.5));
+  fn malformed_cargo_config_stops_before_dedicated_overrides() -> Result<(), ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    let contents = "[package\n";
+    write_config(&workspace, "Cargo.toml", contents)?;
+    write_config(&workspace, "dupes.toml", "min_nodes = 37\n")?;
+    let path = workspace.path().join("Cargo.toml");
+    let outcome = Config::load(workspace.path());
+    ensure(
+      matches!(outcome, Err(ConfigLoadError {
+        ref config,
+        source: ConfigFileError::Decode { path: ref observed_path, contents: ref observed_contents, .. },
+      }) if *observed_path == path && observed_contents == contents
+        && config.min_nodes == Config::default().min_nodes && config.sources.is_empty()),
+      "invalid Cargo configuration returns its complete decoding failure before applying later layers",
+    )
+    .map_err(|source| ConfigTestFailure::LoadExpectation {
+      outcome: Box::new(outcome),
+      source,
+    })
   }
 
+  /// Failed UTF-8 decoding retains the complete file bytes and native cause.
   #[test]
-  fn config_with_token_min_lines() {
-    let config = load_with_dupes_toml(
-      r"
-            [token]
-            min_tokens = 25
-            min_lines = 3
-            ",
-    );
-    assert_eq!(config.token_min_tokens, 25);
-    assert_eq!(config.token_min_lines, 3);
+  fn invalid_utf8_configuration_preserves_all_input_bytes() -> Result<(), ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    let path = workspace.path().join("Cargo.toml");
+    let bytes = [0xFF_u8, 0xFE_u8, b'a'];
+    fs::write(&path, bytes).map_err(|source| ConfigTestFailure::Fixture {
+      path: path.clone(),
+      source,
+    })?;
+    let outcome = Config::load(workspace.path());
+    ensure(
+      matches!(outcome, Err(ConfigLoadError {
+        ref config,
+        source: ConfigFileError::Utf8 { path: ref observed_path, ref source },
+      }) if *observed_path == path && source.as_bytes() == bytes && config.sources.is_empty()),
+      "invalid configuration text retains its native UTF-8 failure, exact path, and complete bytes",
+    )
+    .map_err(|source| ConfigTestFailure::LoadExpectation {
+      outcome: Box::new(outcome),
+      source,
+    })
   }
 
+  /// An occupied configuration path remains a native read failure rather than optional absence.
   #[test]
-  fn enable_only_dimensions_replaces_default_dimensions() {
+  fn configuration_read_failure_is_not_optional_absence() -> Result<(), ConfigTestFailure> {
+    let workspace = TempDir::new()?;
+    let path = workspace.path().join("Cargo.toml");
+    fs::create_dir_all(&path).map_err(|source| ConfigTestFailure::Fixture {
+      path: path.clone(),
+      source,
+    })?;
+    let outcome = Config::load(workspace.path());
+    ensure(
+      matches!(outcome, Err(ConfigLoadError {
+        ref config,
+        source: ConfigFileError::Read { path: ref observed_path, ref source },
+      }) if *observed_path == path && source.kind() != io::ErrorKind::NotFound && config.sources.is_empty()),
+      "an occupied configuration path returns its native read failure instead of default settings",
+    )
+    .map_err(|source| ConfigTestFailure::LoadExpectation {
+      outcome: Box::new(outcome),
+      source,
+    })
+  }
+
+  /// Exact and near group-count limits remain independent configuration fields.
+  #[test]
+  fn config_with_thresholds() -> Result<(), ConfigTestFailure> {
+    let config = load_with_dupes_toml("max_exact_duplicates = 0\nmax_near_duplicates = 5\n")?;
+    ensure(
+      (config.max_exact_duplicates, config.max_near_duplicates) == (Some(0), Some(5)),
+      "load exact and near group-count limits independently",
+    )?;
+    Ok(())
+  }
+
+  /// The file's test-code exclusion setting reaches the resolved configuration.
+  #[test]
+  fn config_with_exclude_tests() -> Result<(), ConfigTestFailure> {
+    let config = load_with_dupes_toml("exclude_tests = true\n")?;
+    ensure(config.exclude_tests, "load the explicit test-code exclusion")?;
+    Ok(())
+  }
+
+  /// The AST source-span floor is loaded from the dedicated document.
+  #[test]
+  fn config_with_min_lines() -> Result<(), ConfigTestFailure> {
+    let config = load_with_dupes_toml("min_lines = 5\n")?;
+    ensure_eq(&config.min_lines, &5, "load the AST source-span floor")?;
+    Ok(())
+  }
+
+  /// Exact and near percentage limits preserve their configured values.
+  #[test]
+  fn config_with_percentage_thresholds() -> Result<(), ConfigTestFailure> {
+    let config = load_with_dupes_toml("max_exact_percent = 5.0\nmax_near_percent = 10.5\n")?;
+    ensure(
+      config
+        .max_exact_percent
+        .zip(config.max_near_percent)
+        .is_some_and(|(exact, near)| exact.total_cmp(&5.0) == Ordering::Equal && near.total_cmp(&10.5) == Ordering::Equal),
+      "preserve both configured percentage limits",
+    )?;
+    Ok(())
+  }
+
+  /// Token windows receive both the token-count and source-span floors.
+  #[test]
+  fn config_with_token_min_lines() -> Result<(), ConfigTestFailure> {
+    let config = load_with_dupes_toml("[token]\nmin_tokens = 25\nmin_lines = 3\n")?;
+    ensure(
+      (config.token_min_tokens, config.token_min_lines) == (25, 3),
+      "load both token-count and source-span floors",
+    )?;
+    Ok(())
+  }
+
+  /// Explicit dimension selection replaces the default enabled set.
+  #[test]
+  fn enable_only_dimensions_replaces_default_dimensions() -> Result<(), TestFailure> {
     let mut config = Config::default();
     config.enable_only_dimensions([DetectionDimension::Line]);
-    assert!(config.dimension_enabled(DetectionDimension::Line));
-    assert!(!config.dimension_enabled(DetectionDimension::Ast));
-    assert!(!config.dimension_enabled(DetectionDimension::TokenNormalized));
+    ensure(
+      config.enabled_dimensions.iter().copied().eq([DetectionDimension::Line]),
+      "enabling only line detection replaces every default dimension",
+    )
   }
 }

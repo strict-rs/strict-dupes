@@ -68,6 +68,7 @@ pub struct NodeMapping {
   pub node_kinds:         HashMap<&'static str, NodeKind>,
 }
 
+/// Define builders that extend a collection of grammar node kinds.
 macro_rules! set_builder {
     ($(
         $(#[$meta:meta])*
@@ -84,6 +85,7 @@ macro_rules! set_builder {
     };
 }
 
+/// Define builders that assign semantic meanings to grammar node kinds.
 macro_rules! map_builder {
     ($(
         $(#[$meta:meta])*
@@ -103,6 +105,10 @@ macro_rules! map_builder {
 impl NodeMapping {
   /// Create an empty mapping. Use the builder methods to populate it.
   #[must_use]
+  #[allow(
+    clippy::single_call_fn,
+    reason = "Empty mapping construction is the language-neutral baseline for every grammar builder"
+  )]
   pub fn new() -> Self {
     Self {
       identifier_kinds:   HashSet::new(),
@@ -182,12 +188,14 @@ impl NodeMapping {
   }
 }
 
+/// Accumulate grammar kinds while retaining previous builder inputs.
 fn extend_set(set: &mut HashSet<&'static str>, values: &[&'static str]) {
   set.extend(values.iter().copied());
 }
 
-fn extend_map<T: Clone>(map: &mut HashMap<&'static str, T>, values: &[(&'static str, T)]) {
-  map.extend(values.iter().map(|(key, value)| (*key, value.clone())));
+/// Assign mappings, replacing earlier values for a repeated grammar kind.
+fn extend_map<Value: Clone>(map: &mut HashMap<&'static str, Value>, values: &[(&'static str, Value)]) {
+  map.extend(values.iter().cloned());
 }
 
 impl Default for NodeMapping {
@@ -198,48 +206,113 @@ impl Default for NodeMapping {
 
 #[cfg(test)]
 mod tests {
-  use super::*;
+  use std::collections::HashMap;
+  use std::collections::HashSet;
 
+  use dupes_core::node::BinOpKind;
+  use dupes_core::node::LiteralKind;
+  use dupes_core::node::NodeKind;
+  use dupes_core::node::UnOpKind;
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
+
+  use super::NodeMapping;
+
+  /// Empty construction supplies no implicit language-specific classification.
   #[test]
-  fn empty_mapping() {
-    let m = NodeMapping::new();
-    assert!(m.identifier_kinds.is_empty());
-    assert!(m.literal_kinds.is_empty());
-    assert!(m.binary_op_map.is_empty());
+  fn empty_mapping() -> Result<(), TestFailure> {
+    for mapping in [NodeMapping::new(), NodeMapping::default()] {
+      ensure(
+        mapping.identifier_kinds.is_empty()
+          && mapping.literal_kinds.is_empty()
+          && mapping.binary_op_map.is_empty()
+          && mapping.unary_op_map.is_empty()
+          && mapping.skip_kinds.is_empty()
+          && mapping.opaque_kinds.is_empty()
+          && mapping.block_kinds.is_empty()
+          && mapping.call_kinds.is_empty()
+          && mapping.return_kinds.is_empty()
+          && mapping.if_kinds.is_empty()
+          && mapping.loop_kinds.is_empty()
+          && mapping.for_kinds.is_empty()
+          && mapping.while_kinds.is_empty()
+          && mapping.match_kinds.is_empty()
+          && mapping.assignment_kinds.is_empty()
+          && mapping.function_def_kinds.is_empty()
+          && mapping.binary_op_kinds.is_empty()
+          && mapping.unary_op_kinds.is_empty()
+          && mapping.match_arm_kinds.is_empty()
+          && mapping.node_kinds.is_empty(),
+        "empty mappings do not classify any grammar nodes",
+      )?;
+    }
+    Ok(())
   }
 
-  // jscpd:ignore-start
-
+  /// Every builder populates only its declared semantic category.
   #[test]
-  fn builder_api() {
-    let m = NodeMapping::new()
+  fn builder_api() -> Result<(), TestFailure> {
+    let mapping = NodeMapping::new()
       .identifiers(&["identifier", "name"])
       .literals(&[("integer", LiteralKind::Int), ("string", LiteralKind::Str)])
       .binary_ops(&[("+", BinOpKind::Add), ("-", BinOpKind::Sub)])
+      .unary_ops(&[("not", UnOpKind::Not)])
       .skip(&["comment"])
+      .opaque(&["ERROR"])
       .blocks(&["block"])
       .calls(&["call"])
       .returns(&["return_statement"])
       .ifs(&["if_statement"])
+      .loops(&["loop_statement"])
       .for_loops(&["for_statement"])
       .while_loops(&["while_statement"])
+      .matches(&["match_statement"])
       .assignments(&["assignment"])
-      .function_defs(&["function_definition"]);
+      .function_defs(&["function_definition"])
+      .binary_op_kinds(&["binary_operator"])
+      .unary_op_kinds(&["unary_operator"])
+      .match_arms(&["case_clause"])
+      .node_kinds(&[("break_statement", NodeKind::Break)]);
 
-    assert!(m.identifier_kinds.contains("identifier"));
-    assert!(m.identifier_kinds.contains("name"));
-    assert_eq!(m.literal_kinds.get("integer"), Some(&LiteralKind::Int));
-    assert_eq!(m.binary_op_map.get("+"), Some(&BinOpKind::Add));
-    assert!(m.skip_kinds.contains("comment"));
-    assert!(m.block_kinds.contains("block"));
-    assert!(m.call_kinds.contains("call"));
-    assert!(m.return_kinds.contains("return_statement"));
-    assert!(m.if_kinds.contains("if_statement"));
-    assert!(m.for_kinds.contains("for_statement"));
-    assert!(m.while_kinds.contains("while_statement"));
-    assert!(m.assignment_kinds.contains("assignment"));
-    assert!(m.function_def_kinds.contains("function_definition"));
+    ensure(
+      mapping.identifier_kinds == HashSet::from(["identifier", "name"])
+        && mapping.literal_kinds == HashMap::from([("integer", LiteralKind::Int), ("string", LiteralKind::Str)])
+        && mapping.binary_op_map == HashMap::from([("+", BinOpKind::Add), ("-", BinOpKind::Sub)])
+        && mapping.unary_op_map == HashMap::from([("not", UnOpKind::Not)])
+        && mapping.skip_kinds == HashSet::from(["comment"])
+        && mapping.opaque_kinds == HashSet::from(["ERROR"])
+        && mapping.block_kinds == HashSet::from(["block"])
+        && mapping.call_kinds == HashSet::from(["call"])
+        && mapping.return_kinds == HashSet::from(["return_statement"])
+        && mapping.if_kinds == HashSet::from(["if_statement"])
+        && mapping.loop_kinds == HashSet::from(["loop_statement"])
+        && mapping.for_kinds == HashSet::from(["for_statement"])
+        && mapping.while_kinds == HashSet::from(["while_statement"])
+        && mapping.match_kinds == HashSet::from(["match_statement"])
+        && mapping.assignment_kinds == HashSet::from(["assignment"])
+        && mapping.function_def_kinds == HashSet::from(["function_definition"])
+        && mapping.binary_op_kinds == HashSet::from(["binary_operator"])
+        && mapping.unary_op_kinds == HashSet::from(["unary_operator"])
+        && mapping.match_arm_kinds == HashSet::from(["case_clause"])
+        && mapping.node_kinds == HashMap::from([("break_statement", NodeKind::Break)]),
+      "builders preserve the complete requested mapping without unrelated kinds",
+    )
   }
 
-  // jscpd:ignore-end
+  /// Incremental configuration accumulates kinds and replaces repeated mappings.
+  #[test]
+  fn repeated_builders_preserve_existing_kinds_and_replace_mapped_values() -> Result<(), TestFailure> {
+    let mapping = NodeMapping::new()
+      .identifiers(&["identifier"])
+      .identifiers(&["name", "identifier"])
+      .identifiers(&[])
+      .literals(&[("integer", LiteralKind::Int), ("string", LiteralKind::Str)])
+      .literals(&[("integer", LiteralKind::Float)])
+      .literals(&[]);
+    ensure(
+      mapping.identifier_kinds == HashSet::from(["identifier", "name"])
+        && mapping.literal_kinds == HashMap::from([("integer", LiteralKind::Float), ("string", LiteralKind::Str)]),
+      "repeated builders retain distinct entries, deduplicate kinds, and replace mapped values",
+    )
+  }
 }

@@ -20,8 +20,10 @@ dupes-python = { workspace = true }
 dupes-rust = { workspace = true }
 clap = { workspace = true }
 walkdir = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
+strict-test-support = { workspace = true }
 assert_cmd = { workspace = true }
 dupes-cli-test-support = { path = "../dupes-cli-test-support" }
 predicates = { workspace = true }

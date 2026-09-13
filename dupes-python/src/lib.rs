@@ -15,13 +15,15 @@ use dupes_core::node::LiteralKind;
 use dupes_core::node::NodeKind;
 use dupes_core::node::UnOpKind;
 use dupes_treesitter::TreeSitterAnalyzer;
+use dupes_treesitter::analyzer::TreeSitterParseError;
+use dupes_treesitter::extractor::KindResolver;
 use dupes_treesitter::mapping::NodeMapping;
 
 /// Tree-sitter query for extracting Python functions, lambdas, and classes.
 ///
 /// Matches `function_definition` at any depth (top-level functions and class
 /// methods), `lambda` expressions, and `class_definition` bodies.
-const PYTHON_QUERY: &str = r"
+const PYTHON_QUERY: &str = "
 (function_definition
     name: (identifier) @name
     parameters: (parameters) @parameters
@@ -39,6 +41,16 @@ const PYTHON_QUERY: &str = r"
 ) @definition
 ";
 
+/// Native failure while compiling the Python analyzer's extraction query.
+#[derive(Debug, thiserror::Error)]
+#[error("could not initialize the Python extraction query: {source}")]
+pub struct PythonAnalyzerError {
+  /// Complete built-in query supplied to tree-sitter.
+  pub query:  &'static str,
+  /// Original tree-sitter query-compilation failure.
+  pub source: tree_sitter::QueryError,
+}
+
 /// Python language analyzer backed by tree-sitter.
 ///
 /// Detects duplicate and near-duplicate code in Python source files (`.py`, `.pyi`).
@@ -47,60 +59,61 @@ const PYTHON_QUERY: &str = r"
 /// prefix (pytest conventions).
 #[derive(Debug)]
 pub struct PythonAnalyzer {
+  /// The generic bridge configured with Python's grammar and extraction rules.
   inner: TreeSitterAnalyzer,
 }
 
 impl PythonAnalyzer {
   /// Create a new `PythonAnalyzer`.
   ///
-  /// # Panics
+  /// # Errors
   ///
-  /// Panics if the built-in tree-sitter query is invalid (should never happen).
-  #[must_use]
-  pub fn new() -> Self {
-    let inner = TreeSitterAnalyzer::new(tree_sitter_python::LANGUAGE.into(), &["py", "pyi"], PYTHON_QUERY, python_mapping())
-      .expect("built-in Python query should be valid")
-      .with_kind_resolver(|node_kind| match node_kind {
-        "lambda" => CodeUnitKind::Closure,
-        "class_definition" => CodeUnitKind::Class,
-        _ => CodeUnitKind::Function,
-      })
-      .with_test_detector(|name, node| name.starts_with("test_") || (node.kind() == "class_definition" && name.starts_with("Test")));
+  /// Returns the native tree-sitter failure and complete query if query
+  /// compilation fails for the selected Python grammar.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "The fallible constructor owns Python grammar, query, and callback initialization for frontend consumers."
+  )]
+  pub fn new() -> Result<Self, PythonAnalyzerError> {
+    let kind_resolver: KindResolver = |node_kind| match node_kind {
+      "lambda" => CodeUnitKind::Closure,
+      "class_definition" => CodeUnitKind::Class,
+      _ => CodeUnitKind::Function,
+    };
+    let test_detector: fn(&str, tree_sitter::Node<'_>) -> bool =
+      |name, node| name.starts_with("test_") || (node.kind() == "class_definition" && name.starts_with("Test"));
+    let inner: TreeSitterAnalyzer =
+      TreeSitterAnalyzer::new(tree_sitter_python::LANGUAGE.into(), &["py", "pyi"], PYTHON_QUERY, python_mapping())
+        .map_err(|source| PythonAnalyzerError {
+          query: PYTHON_QUERY,
+          source,
+        })?
+        .with_kind_resolver(kind_resolver)
+        .with_test_detector(test_detector);
 
-    Self {
+    Ok(Self {
       inner,
-    }
-  }
-}
-
-impl Default for PythonAnalyzer {
-  fn default() -> Self {
-    Self::new()
+    })
   }
 }
 
 impl LanguageAnalyzer for PythonAnalyzer {
+  type Error = TreeSitterParseError;
+
   fn file_extensions(&self) -> &[&str] {
     self.inner.file_extensions()
   }
 
-  fn parse_file(
-    &self,
-    path: &Path,
-    source: &str,
-    config: &AnalysisConfig,
-  ) -> Result<Vec<CodeUnit>, Box<dyn std::error::Error + Send + Sync>> {
+  fn parse_file(&self, path: &Path, source: &str, config: AnalysisConfig) -> Result<Vec<CodeUnit>, Self::Error> {
     self.inner.parse_file(path, source, config)
   }
 }
-
-// jscpd:ignore-start
 
 /// Build the Python-specific [`NodeMapping`].
 ///
 /// # Covered constructs
 ///
-/// - Identifiers, literals (int, float, str, bool, None)
+/// - Identifiers, literals (`int`, `float`, `str`, `bool`, `None`)
 /// - Binary operators (+, -, *, /, //, **, %, ==, !=, <, >, <=, >=, and, or, in, not in, is, is
 ///   not, bitwise, augmented assignment)
 /// - Unary operators (not, -, ~)
@@ -110,20 +123,24 @@ impl LanguageAnalyzer for PythonAnalyzer {
 /// - Access: attribute (field access), subscript (index)
 /// - Async: await, yield
 ///
-/// # Not yet covered (intentional omissions for initial implementation)
+/// # Normalization limits
 ///
 /// - `with_statement` / `try_statement` / `raise_statement` / `assert_statement` — fall through to
 ///   generic recursion (structure is preserved, semantic kind is lost)
-/// - `conditional_expression` (ternary `x if cond else y`) — falls through to Block
+/// - `conditional_expression` (ternary `x if cond else y`) — falls through to `Block`
 /// - List/dict/set comprehensions — children are recursively normalized
 /// - `global_statement` / `nonlocal_statement` — fall through
 /// - f-string interpolations — the `string` node is treated as `Literal(Str)`, so interpolated
 ///   expressions inside f-strings are not captured
-/// - `pass_statement` / `ellipsis` — become Opaque leaves (acceptable no-ops)
+/// - `pass_statement` / `ellipsis` — become `Opaque` leaves
 /// - Decorator-based test detection (e.g., `@pytest.fixture`) — only name-based `test_`/`Test`
 ///   prefix
 /// - Lambda test detection — lambdas inside test functions are not tagged as test code
 #[must_use]
+#[allow(
+  clippy::single_call_fn,
+  reason = "Python syntax mapping is the language-owned extension table consumed by the generic tree-sitter bridge."
+)]
 pub fn python_mapping() -> NodeMapping {
   NodeMapping::new()
     .identifiers(&["identifier"])
@@ -214,25 +231,34 @@ pub fn python_mapping() -> NodeMapping {
     ])
 }
 
-// jscpd:ignore-end
-
 #[cfg(test)]
 mod tests {
-  use super::*;
+  use dupes_core::analyzer::LanguageAnalyzer as _;
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
 
-  #[test]
-  fn new_does_not_panic() {
-    let _ = PythonAnalyzer::new();
+  use super::PythonAnalyzer;
+  use super::PythonAnalyzerError;
+
+  /// Native construction failures and extension-contract assertion failures.
+  #[derive(Debug, thiserror::Error)]
+  enum AnalyzerTestFailure {
+    /// The built-in extraction query could not be compiled.
+    #[error(transparent)]
+    Initialization(#[from] PythonAnalyzerError),
+    /// The analyzer did not expose its expected file extensions.
+    #[error(transparent)]
+    Expectation(#[from] TestFailure),
   }
 
+  /// Fallible construction preserves support for Python modules and stubs.
   #[test]
-  fn default_does_not_panic() {
-    let _ = PythonAnalyzer::default();
-  }
-
-  #[test]
-  fn file_extensions() {
-    let analyzer = PythonAnalyzer::new();
-    assert_eq!(analyzer.file_extensions(), &["py", "pyi"]);
+  fn file_extensions() -> Result<(), AnalyzerTestFailure> {
+    let analyzer = PythonAnalyzer::new()?;
+    ensure(
+      analyzer.file_extensions() == ["py", "pyi"],
+      "new analyzer supports Python modules and stubs",
+    )?;
+    Ok(())
   }
 }

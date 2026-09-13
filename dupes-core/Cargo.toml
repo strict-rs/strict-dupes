@@ -30,3 +30,4 @@ ignore = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+strict-test-support = { workspace = true }

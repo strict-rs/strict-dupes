@@ -1,10 +1,12 @@
 //! Shared code-unit vocabulary: detection dimensions, unit kinds, and the
 //! normalized [`CodeUnit`] record every analyzer produces.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use crate::fingerprint::Fingerprint;
 use crate::node::NormalizedNode;
+use crate::suppression::RuleId;
 
 /// A duplicate-detection dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
@@ -26,14 +28,18 @@ pub enum DetectionDimension {
 impl DetectionDimension {
   /// All supported detection dimensions.
   #[must_use]
+  #[allow(
+    clippy::single_call_fn,
+    reason = "The dimension registry is the canonical enumeration used by configuration and external consumers"
+  )]
   pub const fn all() -> &'static [Self] {
     &[Self::Ast, Self::SubAst, Self::TokenNormalized, Self::TokenRaw, Self::Line]
   }
 }
 
-impl std::fmt::Display for DetectionDimension {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
+impl fmt::Display for DetectionDimension {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match *self {
       Self::Ast => write!(f, "ast"),
       Self::SubAst => write!(f, "sub_ast"),
       Self::TokenNormalized => write!(f, "token_normalized"),
@@ -44,7 +50,7 @@ impl std::fmt::Display for DetectionDimension {
 }
 
 /// The kind of code unit extracted from source.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub enum CodeUnitKind {
   /// A free function.
   Function,
@@ -75,9 +81,9 @@ pub enum CodeUnitKind {
   LineWindow,
 }
 
-impl std::fmt::Display for CodeUnitKind {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
+impl fmt::Display for CodeUnitKind {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match *self {
       Self::Function => write!(f, "function"),
       Self::Method => write!(f, "method"),
       Self::Closure => write!(f, "closure"),
@@ -96,7 +102,7 @@ impl std::fmt::Display for CodeUnitKind {
 }
 
 /// A unit of code extracted and normalized for duplication analysis.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeUnit {
   /// Structural kind of the unit.
   pub kind:         CodeUnitKind,
@@ -123,7 +129,7 @@ pub struct CodeUnit {
   /// Whether this code unit was identified as test code by the language analyzer.
   pub is_test:      bool,
   /// Suppression rule that tagged this unit as a low-signal candidate.
-  pub suppressed:   Option<crate::suppression::RuleId>,
+  pub suppressed:   Option<RuleId>,
   /// For if-branch sub-units, the fingerprint of the owning if-chain unit.
   pub parent_chain: Option<Fingerprint>,
 }

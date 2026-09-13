@@ -68,7 +68,7 @@ Admission rules are named carve-outs that turn an otherwise-suppressed window in
 
 ### `line.declaration-stanza`
 
-Blank lines are hard concept boundaries for line windows, with one structural exception: adjacent blank-separated segments coalesce when the gap is exactly one blank line and both sides are declaration-stanza segments. A declaration-stanza segment has the structural anatomy of a declaration block, evaluated in order: a comment/attribute prelude, at most one type-header row (`struct X {` and friends), uniform stanza rows, and at most one trailing lone `}`. Prelude-only segments (comment banners, bare attributes) and lone braces never qualify; `use`/`mod` rows and brace-only lines are never stanza rows.
+Blank lines are hard concept boundaries for line windows, with one structural exception: adjacent blank-separated segments coalesce when the gap is exactly one blank line, both sides are declaration-stanza segments, and the first segment has not closed its declaration with a lone `}`. A declaration-stanza segment has the structural anatomy of a declaration block, evaluated in order: a comment/attribute prelude, at most one type-header row (`struct X {` and friends), uniform stanza rows, and at most one trailing lone `}`. Prelude-only segments (comment banners, bare attributes) and lone braces never qualify; `use`/`mod` rows and brace-only lines are never stanza rows. Documentation and attributes remain stanza rows when their text contains words such as `for`, `return`, or `fn`; executable rows still prevent coalescing.
 
 Windows over a coalesced block are admitted when every line is stanza-shaped (doc comment, attribute, or structured `key: value` row), at least two lines are structured rows, and the window carries at least four unique terms. Windows containing the type header or the closing brace are not stanza-shaped and fall through to base classification, so coalescing adjacent blocks can never stitch windows across two types.
 
@@ -88,7 +88,7 @@ Token windows are anchored: each blank-line-separated segment yields exactly one
 
 That stability holds only if segmentation itself is stable, which makes quote lexing load-bearing. The tokenizer selects a quote profile by file extension: the default pairs `"`, `'`, and `` ` `` naively; **Rust sources lex `'` as a quoted token only for char-literal shapes that close on the same line (`'X'`, `'\n'`, `'\u{10FFFF}'`) and treat every other tick — lifetimes, loop labels, prose apostrophes in comments — as punctuation.** Without the Rust profile, one unpaired apostrophe opens a phantom multi-line "string" running to the next apostrophe anywhere in the file, bridging blank lines and silently removing whole spans — easily an entire test module — from token segmentation, with the blindness re-dealt by every edit that changes tick parity. Pinned by `lifetime_ticks_do_not_blind_token_windows` and `comment_apostrophes_do_not_bridge_token_segments`.
 
-Known naive remainders, accepted and documented rather than silently relied on: Rust raw strings (`r#"…"#`) pair at the first interior `"`; Python triple quotes lex as an empty string plus a quote-to-quote span (approximately right for apostrophe-free docstrings); comments are tokenized like code, so a doc-comment-led window can pair on comment shape alone (normalized comment words are uniform `IDENT`s — see the registered `structural-only match` entries).
+Known naive remainders, accepted and documented rather than silently relied on: Rust raw strings (`r#"…"#`) pair at the first interior `"`; Python triple quotes lex as an empty string plus a quote-to-quote span (approximately right for apostrophe-free docstrings); comments are tokenized like code, so a doc-comment-led window can pair on comment shape alone (normalized comment words are uniform `IDENT`s).
 
 ## Valid Suppressions
 
@@ -188,6 +188,8 @@ When consecutive `if` statements form a chain, the chain is emitted as one unit 
 
 These shapes carry over the pre-registry detector's semantics: suppress import/module blocks, detached chain tails, doc/attr signature prefixes (line windows keep implementation-side prefixes whose lookahead opens a `{` body and suppress declaration-side prefixes terminating in `;`), type-declaration scaffolding token windows, cut match-table prefixes, and the scoring fall-throughs. Do not suppress implementation-side signature parity, complete callback-bearing chains in token windows, complete match tables, or windows with real body content.
 
+`token.declaration-scaffold` recognizes private fields, `pub` fields, and restricted visibility such as `pub(crate)` or `pub(in crate::module)`. Its classification view omits `//` line-comment contents, including trailing field comments, so documentation words such as `for` or `fn` neither establish a type header nor count as executable behavior. Declaration recognition precedes signature-prefix classification so comment text cannot redirect a field table to the function-signature rule. Original comment tokens, window boundaries, and fingerprints remain unchanged in both token dimensions; disabling the rule exposes the same candidates. Executable code surrounding a declaration, computed field types, and incomplete visibility prefixes remain eligible. This refinement does not change block-comment or quoted-token lexing.
+
 ### Group Coverage (`group.covered-by-ast`) and Containment (`group.overlap-contained`)
 
 A token/line group fully covered by one AST/sub-AST group is tagged rather than shown twice; the covering group is annotated (`also seen as: N <dimension> <kind> group(s)` under `--show-suppressed`). A window group contained (≥0.8) within a wider same-dimension group is tagged in favor of the widest representative — this is what keeps overlapping admitted stanza windows from multiplying in the visible report.
@@ -202,7 +204,7 @@ Deferred analogue: Python attribute-name preservation (see Future Work).
 
 ## Intentional And Visible
 
-Two self-corpus classes are deliberately reported and must never be hidden by a global suppression rule (registering them is per-project judgment; both classes are registered in this repository's registry with reasons recording the rationale, and the detector must keep reporting them on corpora that do not register them):
+Two self-corpus classes are deliberately reported and must never be hidden by a global suppression rule. Registering them is per-project judgment, and the detector must keep reporting them on corpora that do not register them:
 
 - **The sentinel-returns group** (`return NormalizedNode::leaf(NodeKind::Opaque)` at the distinct exits of `normalize_ts_node`): its normalized shape is the protected two-child-return class (`return Some(x)`), so any rule hiding it would corrupt this contract, and sentinel returns at distinct pipeline exits cannot be consolidated into one site.
 - **The NodeMapping builder-chain parity groups** (`python_mapping()` in `dupes-python/src/lib.rs`, the test mappings in `dupes-treesitter/src/normalizer.rs`, `dupes-treesitter/tests/python_integration.rs`, and the `mapping.rs` builder test): each layer deliberately restates the chain so its expectations stay independent of the others.
@@ -246,8 +248,8 @@ Before adding a new rule, require all of the following:
 - Window classifiers and the stanza coalescer: `dupes-core/src/text_units.rs` tests (segment anatomy positives/negatives, block coalescing, brace/import rejections, builder steps, admission carve-outs).
 - Pipeline semantics: `dupes-core/src/lib.rs` tests (partition policy, mixed-group visibility, chain coverage release-on-no-match, liveness across both populations, ignore interplay with suppressed groups).
 - Emission: `dupes-rust/src/parser.rs` tests prove every top-level unit and closure is emitted (no extraction gates), with dual chain emission linking branches to their owning chains.
-- End-to-end pins: `cargo-dupes/tests/detector_coverage.rs` over the frozen `tests/fixtures/detector_coverage/` project — stats totals, per-dimension visible groups, named membership, and the exact `suppressed_by_rule` map; every numeric value is a measured actual.
-- Self-corpus gate: `cargo-dupes/tests/self_corpus.rs` (`consolidated_sites_stay_consolidated`).
+- End-to-end pins: `cargo-dupes/tests/detector_coverage/tests.rs` over the frozen `tests/fixtures/detector_coverage/` project — stats totals, per-dimension visible groups, named membership, and the exact `suppressed_by_rule` map; every numeric value is a measured actual.
+- Self-corpus gate: `cargo-dupes/tests/self_corpus/tests.rs` (`consolidated_sites_stay_consolidated`).
 
 ## Required Tests For Detector Changes
 
@@ -280,4 +282,4 @@ Use a visible self-corpus report (`--sub-function --show-suppressed -v` with the
 - Near-duplicate extension for the line/token_raw dimensions (deferred, no demonstrated loss; smallest slice if pursued: near-matching over merged line concept groups).
 - Python attribute-name preservation, the analogue of method-name preservation (deferred; Python emits `Call` + `FieldAccess`, so the false-positive class does not currently reproduce there).
 - Python quote profile: triple-quoted strings and a same-line rule for `'…'` literals (deferred; the naive pairing is approximately right for common Python and changing it churns Python window fingerprints without a demonstrated loss).
-- Comment-aware token windows: skipping or down-weighting comment tokens would stop doc-comment-led windows from pairing on comment shape (currently adjudicated per finding as `structural-only match` registry entries).
+- Comment-aware token windows: skipping or down-weighting comment tokens would stop doc-comment-led windows from pairing on comment shape.

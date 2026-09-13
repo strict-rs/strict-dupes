@@ -16,3 +16,5 @@ assert_cmd = { workspace = true }
 predicates = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+strict-test-support = { workspace = true }
+thiserror = { workspace = true }

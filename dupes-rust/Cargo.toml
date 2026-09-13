@@ -18,7 +18,9 @@ workspace = true
 dupes-core = { workspace = true }
 syn = { workspace = true }
 proc-macro2 = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+strict-test-support = { workspace = true }

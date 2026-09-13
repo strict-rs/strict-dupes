@@ -17,7 +17,9 @@ workspace = true
 [dependencies]
 dupes-core = { workspace = true }
 tree-sitter = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
+strict-test-support = { workspace = true }
 tempfile = { workspace = true }
 tree-sitter-python = { workspace = true }

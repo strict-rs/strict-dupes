@@ -3,9 +3,10 @@
 //! re-indexing, and node counting.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 
 /// Kinds of literals — preserves type but erases value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LiteralKind {
   /// Integer literal.
   Int,
@@ -43,7 +44,7 @@ pub enum PlaceholderKind {
 }
 
 /// Binary operators.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOpKind {
   /// `+`
   Add,
@@ -122,7 +123,7 @@ pub enum BinOpKind {
 }
 
 /// Unary operators.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnOpKind {
   /// `*` dereference.
   Deref,
@@ -310,10 +311,9 @@ pub enum NodeKind {
   None,
 }
 
-/// A normalized AST node. Uses a data-driven `{ kind, children }` representation
-/// instead of a large enum with differently-shaped variants. This allows generic
-/// traversal algorithms (`count_nodes`, reindex, `count_matching`, extract) to work
-/// without exhaustive matching on every variant.
+/// A normalized AST node with a kind payload and ordered children.
+///
+/// The shared representation supports generic counting, extraction, and traversal.
 ///
 /// ## Child ordering conventions
 ///
@@ -362,11 +362,19 @@ impl NormalizedNode {
 
   /// Create a None sentinel node.
   #[must_use]
+  #[allow(
+    clippy::single_call_fn,
+    reason = "Language normalizers share this constructor to preserve absent-child positions in the normalized tree"
+  )]
   pub const fn none() -> Self {
     Self::leaf(NodeKind::None)
   }
 
   /// Convert an Option<NormalizedNode> to a node, using None sentinel for absent values.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "Optional AST children share this sentinel conversion across external language normalizers"
+  )]
   pub fn opt(node: Option<Self>) -> Self {
     node.unwrap_or_else(Self::none)
   }
@@ -379,34 +387,42 @@ impl NormalizedNode {
 }
 
 /// Tracks identifier-to-placeholder mappings during normalization.
+#[derive(Debug)]
 pub struct NormalizationContext {
-  /// Maps (`identifier_string`, kind) -> placeholder index
-  mappings: HashMap<(String, PlaceholderKind), usize>,
-  /// Per-kind counters
-  counters: HashMap<PlaceholderKind, usize>,
+  /// Original identifiers and their assigned indices, partitioned by kind.
+  mappings: PlaceholderMappings<String>,
+}
+
+/// Original identities and assigned indices for each independent placeholder kind.
+type PlaceholderMappings<Identity> = HashMap<PlaceholderKind, HashMap<Identity, usize>>;
+
+/// Reuse an identity's index or assign the next index from its kind's existing population.
+fn placeholder_index<Identity: Eq + Hash>(
+  mappings: &mut PlaceholderMappings<Identity>,
+  kind: PlaceholderKind,
+  identity: Identity,
+) -> usize {
+  let identities = mappings.entry(kind).or_default();
+  let next = identities.len();
+  *identities.entry(identity).or_insert(next)
 }
 
 impl NormalizationContext {
   /// Create an empty context with no assigned placeholders.
   #[must_use]
+  #[allow(
+    clippy::single_call_fn,
+    reason = "Each external language normalizer starts its own placeholder context through this constructor"
+  )]
   pub fn new() -> Self {
     Self {
-      mappings: HashMap::new(),
-      counters: HashMap::new(),
+      mappings: HashMap::new()
     }
   }
 
   /// Get or assign a placeholder index for the given identifier and kind.
   pub fn placeholder(&mut self, name: &str, kind: PlaceholderKind) -> usize {
-    let key = (name.to_string(), kind);
-    if let Some(&idx) = self.mappings.get(&key) {
-      return idx;
-    }
-    let counter = self.counters.entry(kind).or_insert(0);
-    let idx = *counter;
-    *counter += 1;
-    self.mappings.insert(key, idx);
-    idx
+    placeholder_index(&mut self.mappings, kind, name.to_owned())
   }
 }
 
@@ -418,70 +434,31 @@ impl Default for NormalizationContext {
 
 // -- Placeholder re-indexing --------------------------------------------------
 
-/// Collects all placeholder occurrences in depth-first order, building
-/// a mapping from (kind, `old_index`) -> `new_sequential_index`.
-fn collect_placeholder_order(
-  node: &NormalizedNode,
-  order: &mut Vec<(PlaceholderKind, usize)>,
-  seen: &mut std::collections::HashSet<(PlaceholderKind, usize)>,
-) {
-  match &node.kind {
-    NodeKind::Placeholder(kind, idx) | NodeKind::PatPlaceholder(kind, idx) | NodeKind::TypePlaceholder(kind, idx)
-      if seen.insert((*kind, *idx)) =>
-    {
-      order.push((*kind, *idx));
-    }
-    _ => {}
+/// Assign each placeholder its per-kind index at its first depth-first occurrence.
+fn apply_reindex(node: &mut NormalizedNode, mapping: &mut PlaceholderMappings<usize>) {
+  if let NodeKind::Placeholder(kind, ref mut index)
+  | NodeKind::PatPlaceholder(kind, ref mut index)
+  | NodeKind::TypePlaceholder(kind, ref mut index) = node.kind
+  {
+    *index = placeholder_index(mapping, kind, *index);
   }
-  for child in &node.children {
-    collect_placeholder_order(child, order, seen);
+  for child in &mut node.children {
+    apply_reindex(child, mapping);
   }
 }
 
-/// Applies the reindex mapping to a node, returning a new node with remapped indices.
-fn apply_reindex(node: &NormalizedNode, mapping: &HashMap<(PlaceholderKind, usize), usize>) -> NormalizedNode {
-  let kind = match &node.kind {
-    NodeKind::Placeholder(kind, idx) => remap_placeholder(NodeKind::Placeholder, mapping, *kind, *idx),
-    NodeKind::PatPlaceholder(kind, idx) => remap_placeholder(NodeKind::PatPlaceholder, mapping, *kind, *idx),
-    NodeKind::TypePlaceholder(kind, idx) => remap_placeholder(NodeKind::TypePlaceholder, mapping, *kind, *idx),
-    other => other.clone(),
-  };
-  let children = node.children.iter().map(|c| apply_reindex(c, mapping)).collect();
-  NormalizedNode {
-    kind,
-    children,
-  }
-}
-
-/// Rebuild a placeholder variant with its index remapped through `mapping`.
-fn remap_placeholder(
-  make: impl FnOnce(PlaceholderKind, usize) -> NodeKind,
-  mapping: &HashMap<(PlaceholderKind, usize), usize>,
-  kind: PlaceholderKind,
-  idx: usize,
-) -> NodeKind {
-  make(kind, mapping.get(&(kind, idx)).copied().unwrap_or(idx))
-}
-
-/// Re-index all placeholders in a sub-tree so that indices start from 0
-/// per kind, assigned by first-occurrence depth-first order.
-/// This allows comparing sub-trees extracted from different function contexts.
+/// Re-index placeholders from zero in per-kind, depth-first first-occurrence order.
+///
+/// This makes subtrees from different function contexts directly comparable.
 #[must_use]
+#[allow(
+  clippy::single_call_fn,
+  reason = "Subtree canonicalization is shared by the core extractor and external language analyzers"
+)]
 pub fn reindex_placeholders(node: &NormalizedNode) -> NormalizedNode {
-  let mut order = Vec::new();
-  let mut seen = std::collections::HashSet::new();
-  collect_placeholder_order(node, &mut order, &mut seen);
-
-  // Build mapping: (kind, old_index) -> new sequential index per kind
-  let mut counters: HashMap<PlaceholderKind, usize> = HashMap::new();
-  let mut mapping: HashMap<(PlaceholderKind, usize), usize> = HashMap::new();
-  for (kind, old_idx) in order {
-    let counter = counters.entry(kind).or_insert(0);
-    mapping.insert((kind, old_idx), *counter);
-    *counter += 1;
-  }
-
-  apply_reindex(node, &mapping)
+  let mut reindexed = node.clone();
+  apply_reindex(&mut reindexed, &mut HashMap::new());
+  reindexed
 }
 
 /// Count the number of nodes in a normalized tree.
@@ -490,45 +467,134 @@ pub fn count_nodes(node: &NormalizedNode) -> usize {
   if node.is_none() {
     return 0;
   }
-  1 + node.children.iter().map(count_nodes).sum::<usize>()
+  node.children.iter().map(count_nodes).fold(1, usize::saturating_add)
 }
 
 #[cfg(test)]
 mod tests {
-  use super::*;
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
+  use strict_test_support::ensure_eq;
 
-  // jscpd:ignore-start
+  use super::BinOpKind;
+  use super::LiteralKind;
+  use super::NodeKind;
+  use super::NormalizationContext;
+  use super::NormalizedNode;
+  use super::PlaceholderKind;
+  use super::count_nodes;
+  use super::reindex_placeholders;
 
-  #[test]
-  fn reindex_remaps_from_zero() {
-    let node = NormalizedNode::with_children(NodeKind::BinaryOp(BinOpKind::Add), vec![
-      NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 5)),
-      NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 8)),
-    ]);
-    let reindexed = reindex_placeholders(&node);
-    let expected = NormalizedNode::with_children(NodeKind::BinaryOp(BinOpKind::Add), vec![
-      NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 0)),
-      NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 1)),
-    ]);
-    assert_eq!(reindexed, expected);
+  /// Complete trees at a rejected canonicalization expectation.
+  #[derive(Debug, thiserror::Error)]
+  #[error("reindexing {input:?} produced {actual:?}, expected {expected:?}: {source}")]
+  struct ReindexFailure {
+    /// Original tree supplied to canonicalization.
+    input:    Box<NormalizedNode>,
+    /// Expected complete canonical tree.
+    expected: Box<NormalizedNode>,
+    /// Actual complete canonical tree.
+    actual:   Box<NormalizedNode>,
+    /// Native assertion failure.
+    source:   TestFailure,
+  }
+
+  /// Compare the complete canonical tree while retaining its original input.
+  fn check_reindexing(input: NormalizedNode, expected: NormalizedNode) -> Result<(), ReindexFailure> {
+    let actual = reindex_placeholders(&input);
+    ensure(actual == expected, "canonicalization preserves the expected tree and identities").map_err(|source| ReindexFailure {
+      input: Box::new(input),
+      expected: Box::new(expected),
+      actual: Box::new(actual),
+      source,
+    })
+  }
+
+  /// Both original and canonical trees at a rejected equivalence check.
+  #[derive(Debug, thiserror::Error)]
+  #[error("subtrees {inputs:?} canonicalized to {canonical:?}: {source}")]
+  struct EquivalentSubtreesFailure {
+    /// The two independently numbered source trees.
+    inputs:    Box<[NormalizedNode; 2]>,
+    /// The corresponding canonical trees in the same order.
+    canonical: Box<[NormalizedNode; 2]>,
+    /// Native distinct-input or equivalent-output assertion failure.
+    source:    TestFailure,
+  }
+
+  /// Complete assignment requests, context, and results at a failed expectation.
+  #[derive(Debug, thiserror::Error)]
+  #[error("requests {requests:?} produced {actual:?}, expected {expected:?}, in {context:?}: {source}")]
+  struct ContextFailure<const COUNT: usize> {
+    /// Ordered original names and their placeholder kinds.
+    requests: Box<[(&'static str, PlaceholderKind); COUNT]>,
+    /// Expected index for each request.
+    expected: Box<[usize; COUNT]>,
+    /// Actual index returned for each request.
+    actual:   Box<[usize; COUNT]>,
+    /// The context holding every assignment made by the operation.
+    context:  Box<NormalizationContext>,
+    /// Native assertion failure.
+    source:   TestFailure,
+  }
+
+  /// Execute one complete assignment sequence and compare every returned index.
+  fn check_context<const COUNT: usize>(
+    requests: [(&'static str, PlaceholderKind); COUNT],
+    expected: [usize; COUNT],
+  ) -> Result<(), ContextFailure<COUNT>> {
+    let mut context = NormalizationContext::default();
+    let actual = requests.map(|(name, kind)| context.placeholder(name, kind));
+    ensure(actual == expected, "placeholder assignments match the complete request sequence").map_err(|source| ContextFailure {
+      requests: Box::new(requests),
+      expected: Box::new(expected),
+      actual: Box::new(actual),
+      context: Box::new(context),
+      source,
+    })
+  }
+
+  /// Complete source tree and its rejected node-count expectation.
+  #[derive(Debug, thiserror::Error)]
+  #[error("counting {input:?} produced {actual}, expected {expected}: {source}")]
+  struct CountFailure {
+    /// Original tree whose non-sentinel nodes were counted.
+    input:    Box<NormalizedNode>,
+    /// Expected number of syntax nodes.
+    expected: usize,
+    /// Actual number of syntax nodes.
+    actual:   usize,
+    /// Native assertion failure.
+    source:   TestFailure,
+  }
+
+  /// Count a complete tree without discarding it if the expectation fails.
+  fn check_count(input: NormalizedNode, expected: usize) -> Result<(), CountFailure> {
+    let actual = count_nodes(&input);
+    ensure_eq(&actual, &expected, "only present syntax nodes contribute to the count").map_err(|source| CountFailure {
+      input: Box::new(input),
+      expected,
+      actual,
+      source,
+    })
   }
 
   #[test]
-  fn reindex_preserves_same_placeholder_identity() {
-    let node = NormalizedNode::with_children(NodeKind::BinaryOp(BinOpKind::Add), vec![
-      NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 3)),
-      NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 3)),
-    ]);
-    let reindexed = reindex_placeholders(&node);
-    let expected = NormalizedNode::with_children(NodeKind::BinaryOp(BinOpKind::Add), vec![
-      NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 0)),
-      NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 0)),
-    ]);
-    assert_eq!(reindexed, expected);
+  fn reindex_preserves_first_occurrence_order_and_repeated_identity() -> Result<(), ReindexFailure> {
+    for sequences in [[[5, 8], [0, 1]], [[8, 5], [0, 1]], [[3, 3], [0, 0]]] {
+      let [input, expected] = sequences.map(|indices| {
+        NormalizedNode::with_children(
+          NodeKind::BinaryOp(BinOpKind::Add),
+          Vec::from(indices.map(|index| NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, index)))),
+        )
+      });
+      check_reindexing(input, expected)?;
+    }
+    Ok(())
   }
 
   #[test]
-  fn reindex_makes_equivalent_subtrees_equal() {
+  fn reindex_makes_equivalent_subtrees_equal() -> Result<(), EquivalentSubtreesFailure> {
     let subtree1 = NormalizedNode::with_children(NodeKind::Block, vec![
       NormalizedNode::with_children(NodeKind::LetBinding, vec![
         NormalizedNode::leaf(NodeKind::PatPlaceholder(PlaceholderKind::Variable, 2)),
@@ -554,14 +620,22 @@ mod tests {
       NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 7)),
     ]);
 
-    assert_ne!(subtree1, subtree2);
-    assert_eq!(reindex_placeholders(&subtree1), reindex_placeholders(&subtree2));
+    let first = reindex_placeholders(&subtree1);
+    let second = reindex_placeholders(&subtree2);
+    ensure(
+      subtree1 != subtree2,
+      "the source subtrees begin with different placeholder identities",
+    )
+    .and_then(|()| ensure(first == second, "canonicalization equates structurally equivalent subtrees"))
+    .map_err(|source| EquivalentSubtreesFailure {
+      inputs: Box::new([subtree1, subtree2]),
+      canonical: Box::new([first, second]),
+      source,
+    })
   }
 
-  // jscpd:ignore-end
-
   #[test]
-  fn reindex_handles_multiple_placeholder_kinds() {
+  fn reindex_handles_multiple_placeholder_kinds() -> Result<(), ReindexFailure> {
     let node = NormalizedNode::with_children(NodeKind::Call, vec![
       NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Function, 3)),
       NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 5)),
@@ -570,7 +644,6 @@ mod tests {
         NormalizedNode::leaf(NodeKind::TypePlaceholder(PlaceholderKind::Type, 2)),
       ]),
     ]);
-    let reindexed = reindex_placeholders(&node);
     let expected = NormalizedNode::with_children(NodeKind::Call, vec![
       NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Function, 0)),
       NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 0)),
@@ -579,71 +652,73 @@ mod tests {
         NormalizedNode::leaf(NodeKind::TypePlaceholder(PlaceholderKind::Type, 0)),
       ]),
     ]);
-    assert_eq!(reindexed, expected);
+    check_reindexing(node, expected)
   }
 
   #[test]
-  fn count_nodes_skips_none_sentinels() {
+  fn count_nodes_skips_none_sentinels() -> Result<(), CountFailure> {
     let node = NormalizedNode::with_children(NodeKind::If, vec![
       NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 0)),
       NormalizedNode::with_children(NodeKind::Block, vec![]),
       NormalizedNode::none(),
     ]);
     // If(1) + Placeholder(1) + Block(1) = 3 (None is not counted)
-    assert_eq!(count_nodes(&node), 3);
+    check_count(node, 3)
   }
 
   // -- NormalizationContext tests --
 
   #[test]
-  fn context_assigns_sequential_indices() {
-    let mut ctx = NormalizationContext::new();
-    assert_eq!(ctx.placeholder("x", PlaceholderKind::Variable), 0);
-    assert_eq!(ctx.placeholder("y", PlaceholderKind::Variable), 1);
-    assert_eq!(ctx.placeholder("z", PlaceholderKind::Variable), 2);
+  fn context_assigns_sequential_indices_per_kind() -> Result<(), ContextFailure<3>> {
+    for (requests, expected) in [
+      (
+        [
+          ("x", PlaceholderKind::Variable),
+          ("y", PlaceholderKind::Variable),
+          ("z", PlaceholderKind::Variable),
+        ],
+        [0, 1, 2],
+      ),
+      (
+        [
+          ("foo", PlaceholderKind::Variable),
+          ("foo", PlaceholderKind::Function),
+          ("foo", PlaceholderKind::Type),
+        ],
+        [0, 0, 0],
+      ),
+    ] {
+      check_context(requests, expected)?;
+    }
+    Ok(())
   }
 
   #[test]
-  fn context_returns_same_index_for_same_name() {
-    let mut ctx = NormalizationContext::new();
-    let first = ctx.placeholder("x", PlaceholderKind::Variable);
-    let second = ctx.placeholder("x", PlaceholderKind::Variable);
-    assert_eq!(first, second);
-    assert_eq!(first, 0);
+  fn context_returns_same_index_for_same_name() -> Result<(), ContextFailure<2>> {
+    check_context([("x", PlaceholderKind::Variable), ("x", PlaceholderKind::Variable)], [0, 0])
   }
 
   #[test]
-  fn context_per_kind_counters_are_independent() {
-    let mut ctx = NormalizationContext::new();
-    let var_idx = ctx.placeholder("foo", PlaceholderKind::Variable);
-    let fn_idx = ctx.placeholder("foo", PlaceholderKind::Function);
-    let type_idx = ctx.placeholder("foo", PlaceholderKind::Type);
-    // Each kind starts from 0 independently
-    assert_eq!(var_idx, 0);
-    assert_eq!(fn_idx, 0);
-    assert_eq!(type_idx, 0);
-  }
-
-  #[test]
-  fn context_same_name_different_kind_are_distinct() {
-    let mut ctx = NormalizationContext::new();
-    ctx.placeholder("x", PlaceholderKind::Variable);
-    ctx.placeholder("x", PlaceholderKind::Function);
-    // Second variable should get index 1, not 0
-    let y_var = ctx.placeholder("y", PlaceholderKind::Variable);
-    assert_eq!(y_var, 1);
-    let y_fn = ctx.placeholder("y", PlaceholderKind::Function);
-    assert_eq!(y_fn, 1);
+  fn context_same_name_different_kind_are_distinct() -> Result<(), ContextFailure<4>> {
+    check_context(
+      [
+        ("x", PlaceholderKind::Variable),
+        ("x", PlaceholderKind::Function),
+        ("y", PlaceholderKind::Variable),
+        ("y", PlaceholderKind::Function),
+      ],
+      [0, 0, 1, 1],
+    )
   }
 
   // -- count_nodes tests --
 
   #[test]
-  fn count_nodes_basic() {
+  fn count_nodes_basic() -> Result<(), CountFailure> {
     let node = NormalizedNode::with_children(NodeKind::BinaryOp(BinOpKind::Add), vec![
       NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, 0)),
       NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)),
     ]);
-    assert_eq!(count_nodes(&node), 3);
+    check_count(node, 3)
   }
 }

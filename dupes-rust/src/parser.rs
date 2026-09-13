@@ -1,8 +1,11 @@
 //! Rust `CodeUnit` extraction through `syn`: top-level and sub-function
 //! extractors, impl-aware naming, and test-code tagging.
 
+use std::collections::HashMap;
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::path::PathBuf;
+use std::ptr::from_ref;
 
 pub use dupes_core::code_unit::CodeUnit;
 pub use dupes_core::code_unit::CodeUnitKind;
@@ -10,12 +13,52 @@ use dupes_core::fingerprint::Fingerprint;
 use dupes_core::node::NodeKind;
 use dupes_core::node::NormalizationContext;
 use dupes_core::node::NormalizedNode;
-use syn::spanned::Spanned;
+use dupes_core::node::reindex_placeholders;
+use dupes_core::source::SourceFile;
+use dupes_core::source::SourceReadError;
+use proc_macro2::TokenTree;
+use syn::spanned::Spanned as _;
+use syn::visit;
 use syn::visit::Visit;
 
 use crate::normalizer;
 
+/// A rejected Rust source together with its native parser diagnostic.
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to parse {}: {source}", input.path.display())]
+pub struct RustParseError {
+  /// Complete rejected source and its identity, including text outside the diagnostic span.
+  pub input:  SourceFile,
+  /// Original `syn` diagnostic and its source spans.
+  #[source]
+  pub source: syn::Error,
+}
+
+/// A file-read or parse failure retaining the native cause and available input.
+#[derive(Debug, thiserror::Error)]
+pub enum RustFileError {
+  /// The shared source reader could not produce valid UTF-8 text.
+  #[error(transparent)]
+  Read(#[from] SourceReadError),
+  /// The decoded file was rejected by the Rust parser.
+  #[error(transparent)]
+  Parse(#[from] RustParseError),
+}
+
+/// A successfully read and parsed file with its complete source and extracted units.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ParsedRustFile {
+  /// Complete native source read used for extraction.
+  pub file:  SourceFile,
+  /// Every admitted code unit, including units tagged as tests.
+  pub units: Vec<CodeUnit>,
+}
+
 /// Check if attributes contain `#[test]`.
+#[allow(
+  clippy::single_call_fn,
+  reason = "Free-function classification shares the exact test attribute predicate with its parser tests"
+)]
 fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
   attrs.iter().any(|attr| attr.path().is_ident("test"))
 }
@@ -26,6 +69,7 @@ fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
 /// is stated once.
 macro_rules! with_test_context_method {
   () => {
+    /// Visit one scope with its test context, restoring the enclosing context afterward.
     fn with_test_context(&mut self, is_test: bool, visit: impl FnOnce(&mut Self)) {
       let previous_test = self.in_test_context;
       self.in_test_context = is_test;
@@ -36,19 +80,30 @@ macro_rules! with_test_context_method {
 }
 
 /// Extracts nested code units with precise spans.
+#[derive(Debug)]
 struct SubUnitExtractor {
+  /// Native source-file identity retained by each extracted unit.
   file:            PathBuf,
+  /// Minimum normalized body size admitted as a sub-unit.
   min_node_count:  usize,
+  /// Complete admitted sub-units in source visitation order.
   units:           Vec<CodeUnit>,
+  /// Function or method enclosing the current sub-unit.
   current_parent:  Option<String>,
+  /// Whether the current source scope is test code.
   in_test_context: bool,
   /// `if` statements represented by an if-chain unit, mapped to that chain
   /// unit's content fingerprint; their branch units are emitted linked via
   /// `parent_chain` so the pipeline can treat them as chain-covered.
-  chained_ifs:     std::collections::HashMap<usize, Fingerprint>,
+  chained_ifs:     HashMap<*const syn::ExprIf, Fingerprint>,
 }
 
 impl SubUnitExtractor {
+  /// Prepare extraction for one source file and normalized body-size floor.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "Sub-unit construction establishes the source identity and empty enclosing-context state"
+  )]
   fn new(file: PathBuf, min_node_count: usize) -> Self {
     Self {
       file,
@@ -56,73 +111,79 @@ impl SubUnitExtractor {
       units: Vec::new(),
       current_parent: None,
       in_test_context: false,
-      chained_ifs: std::collections::HashMap::new(),
+      chained_ifs: HashMap::new(),
     }
   }
 
   with_test_context_method!();
 
+  /// Visit a function body while retaining and restoring its enclosing source identity.
   fn with_parent(&mut self, parent: String, is_test: bool, visit: impl FnOnce(&mut Self)) {
     let previous_parent = self.current_parent.replace(parent);
     self.with_test_context(is_test, visit);
     self.current_parent = previous_parent;
   }
 
+  /// Normalize an expression and append its complete admitted sub-unit.
   fn add_expr_unit(
     &mut self,
     kind: CodeUnitKind,
     description: String,
     expr: &syn::Expr,
-    line_start: usize,
-    line_end: usize,
+    lines: RangeInclusive<usize>,
     parent_chain: Option<Fingerprint>,
-  ) -> bool {
+  ) {
     let mut ctx = NormalizationContext::new();
-    let body = dupes_core::node::reindex_placeholders(&normalizer::normalize_expr(expr, &mut ctx));
-    self.add_normalized_unit(kind, description, body, line_start, line_end, parent_chain)
+    let body = reindex_placeholders(&normalizer::normalize_expr(expr, &mut ctx));
+    self
+      .units
+      .extend(self.normalized_unit(kind, description, body, lines, parent_chain));
   }
 
-  fn add_block_unit(&mut self, kind: CodeUnitKind, description: String, block: &syn::Block, parent_chain: Option<Fingerprint>) -> bool {
+  /// Normalize a block and append its complete admitted sub-unit with brace-delimited lines.
+  fn add_block_unit(&mut self, kind: CodeUnitKind, description: String, block: &syn::Block, parent_chain: Option<Fingerprint>) {
     let mut ctx = NormalizationContext::new();
-    let body = dupes_core::node::reindex_placeholders(&normalizer::normalize_block(block, &mut ctx));
+    let body = reindex_placeholders(&normalizer::normalize_block(block, &mut ctx));
     let line_start = block.brace_token.span.open().start().line;
     let line_end = block.brace_token.span.close().end().line;
-    self.add_normalized_unit(kind, description, body, line_start, line_end, parent_chain)
+    self
+      .units
+      .extend(self.normalized_unit(kind, description, body, line_start..=line_end, parent_chain));
   }
 
+  /// Record the body of one supported loop construct.
   fn add_loop_body(&mut self, description: &str, block: &syn::Block) {
-    self.add_block_unit(CodeUnitKind::LoopBody, description.to_string(), block, None);
+    self.add_block_unit(CodeUnitKind::LoopBody, description.to_owned(), block, None);
   }
 
-  fn add_normalized_unit(
-    &mut self,
+  /// Construct the complete sub-unit when its normalized body reaches the configured floor.
+  fn normalized_unit(
+    &self,
     kind: CodeUnitKind,
     description: String,
     body: NormalizedNode,
-    line_start: usize,
-    line_end: usize,
+    lines: RangeInclusive<usize>,
     parent_chain: Option<Fingerprint>,
-  ) -> bool {
+  ) -> Option<CodeUnit> {
     let node_count = normalizer::count_nodes(&body);
     if node_count < self.min_node_count {
-      return false;
+      return None;
     }
-    self.units.push(CodeUnit {
+    Some(CodeUnit {
       suppressed: None,
       parent_chain,
       kind,
       name: description,
       file: self.file.clone(),
-      line_start,
-      line_end,
+      line_start: *lines.start(),
+      line_end: *lines.end(),
       signature: NormalizedNode::leaf(NodeKind::Opaque),
       fingerprint: Fingerprint::from_node(&body),
       node_count,
       body,
       parent_name: self.current_parent.clone(),
       is_test: self.in_test_context,
-    });
-    true
+    })
   }
 
   /// Extract runs of two or more consecutive `if` statements as one
@@ -131,7 +192,7 @@ impl SubUnitExtractor {
   fn collect_if_chains(&mut self, block: &syn::Block) {
     let mut run: Vec<&syn::Expr> = Vec::new();
     for stmt in &block.stmts {
-      if let syn::Stmt::Expr(expr @ syn::Expr::If(_), _) = stmt {
+      if let syn::Stmt::Expr(ref expr @ syn::Expr::If(_), _) = *stmt {
         run.push(expr);
       } else {
         self.flush_if_chain(&run);
@@ -141,6 +202,7 @@ impl SubUnitExtractor {
     self.flush_if_chain(&run);
   }
 
+  /// Emit one admitted chain and link its constituent `if` nodes by native pointer identity.
   fn flush_if_chain(&mut self, run: &[&syn::Expr]) {
     if run.len() < 2 {
       return;
@@ -150,30 +212,31 @@ impl SubUnitExtractor {
       NodeKind::Block,
       run.iter().map(|expr| normalizer::normalize_expr(expr, &mut ctx)).collect(),
     );
-    let body = dupes_core::node::reindex_placeholders(&chain);
-    let chain_fp = Fingerprint::from_node(&body);
+    let body = reindex_placeholders(&chain);
     let line_start = run.first().map_or(1, |expr| expr.span().start().line);
     let line_end = run.last().map_or(line_start, |expr| expr.span().end().line);
     // Branches link to the chain only when the chain itself became a
     // unit; a sub-threshold chain leaves its branches unlinked, which
     // matches their pre-chain behavior because they fall under the same
     // node threshold.
-    if self.add_normalized_unit(
+    let Some(unit) = self.normalized_unit(
       CodeUnitKind::IfChain,
       format!("if chain ({} branches)", run.len()),
       body,
-      line_start,
-      line_end,
+      line_start..=line_end,
       None,
-    ) {
-      for expr in run {
-        if let syn::Expr::If(expr_if) = expr {
-          self
-            .chained_ifs
-            .insert(std::ptr::from_ref::<syn::ExprIf>(expr_if) as usize, chain_fp);
-        }
+    ) else {
+      return;
+    };
+    let chain_fp = unit.fingerprint;
+    self.units.push(unit);
+    self.chained_ifs.extend(run.iter().filter_map(|expr| {
+      if let syn::Expr::If(ref expr_if) = **expr {
+        Some((from_ref(expr_if), chain_fp))
+      } else {
+        None
       }
-    }
+    }));
   }
 }
 
@@ -194,7 +257,7 @@ macro_rules! visit_item_mod_with_test_context {
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
       let is_test = self.in_test_context || has_cfg_test_attr(&node.attrs);
       self.with_test_context(is_test, |visitor| {
-        syn::visit::visit_item_mod(visitor, node);
+        visit::visit_item_mod(visitor, node);
       });
     }
   };
@@ -210,7 +273,7 @@ impl<'ast> Visit<'ast> for SubUnitExtractor {
 
   fn visit_block(&mut self, node: &'ast syn::Block) {
     self.collect_if_chains(node);
-    syn::visit::visit_block(self, node);
+    visit::visit_block(self, node);
   }
 
   visit_item_mod_with_test_context!();
@@ -219,41 +282,29 @@ impl<'ast> Visit<'ast> for SubUnitExtractor {
     let naming = ImplNaming::of(node);
     let is_test = self.in_test_context || has_cfg_test_attr(&node.attrs);
     self.with_test_context(is_test, |visitor| {
-      for item in &node.items {
-        if let syn::ImplItem::Fn(method) = item {
-          let full_name = naming.method_name(method);
-          let in_test_context = visitor.in_test_context;
-          visitor.with_parent(full_name, in_test_context, |visitor| {
-            visitor.visit_block(&method.block);
-          });
-        }
+      for method in impl_methods(node) {
+        let full_name = naming.method_name(method);
+        let in_test_context = visitor.in_test_context;
+        visitor.with_parent(full_name, in_test_context, |scope| scope.visit_block(&method.block));
       }
     });
   }
 
   fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
-    let owning_chain = self
-      .chained_ifs
-      .get(&(std::ptr::from_ref::<syn::ExprIf>(node) as usize))
-      .copied();
-    self.add_block_unit(
-      CodeUnitKind::IfBranch,
-      "if-then branch".to_string(),
-      &node.then_branch,
-      owning_chain,
-    );
-    if let Some((_, else_expr)) = &node.else_branch {
+    let owning_chain = self.chained_ifs.get(&from_ref(node)).copied();
+    self.add_block_unit(CodeUnitKind::IfBranch, "if-then branch".to_owned(), &node.then_branch, owning_chain);
+    if let Some(branch) = node.else_branch.as_ref() {
+      let else_expr = &branch.1;
       let span = else_expr.span();
       self.add_expr_unit(
         CodeUnitKind::IfBranch,
-        "if-else branch".to_string(),
+        "if-else branch".to_owned(),
         else_expr,
-        span.start().line,
-        span.end().line,
+        span.start().line..=span.end().line,
         owning_chain,
       );
     }
-    syn::visit::visit_expr_if(self, node);
+    visit::visit_expr_if(self, node);
   }
 
   fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
@@ -261,33 +312,38 @@ impl<'ast> Visit<'ast> for SubUnitExtractor {
       let span = arm.body.span();
       self.add_expr_unit(
         CodeUnitKind::MatchArm,
-        format!("match arm {}", idx + 1),
+        format!("match arm {}", idx.saturating_add(1)),
         &arm.body,
-        span.start().line,
-        span.end().line,
+        span.start().line..=span.end().line,
         None,
       );
     }
-    syn::visit::visit_expr_match(self, node);
+    visit::visit_expr_match(self, node);
   }
 
-  visit_loop_body!(visit_expr_loop, syn::ExprLoop, "loop body", syn::visit::visit_expr_loop);
-  visit_loop_body!(visit_expr_while, syn::ExprWhile, "while body", syn::visit::visit_expr_while);
-  visit_loop_body!(visit_expr_for_loop, syn::ExprForLoop, "for body", syn::visit::visit_expr_for_loop);
+  visit_loop_body!(visit_expr_loop, syn::ExprLoop, "loop body", visit::visit_expr_loop);
+  visit_loop_body!(visit_expr_while, syn::ExprWhile, "while body", visit::visit_expr_while);
+  visit_loop_body!(visit_expr_for_loop, syn::ExprForLoop, "for body", visit::visit_expr_for_loop);
 
   fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
-    if let syn::Expr::Block(block) = &*node.body {
-      self.add_block_unit(CodeUnitKind::Block, "closure body".to_string(), &block.block, None);
+    if let syn::Expr::Block(ref block) = *node.body {
+      self.add_block_unit(CodeUnitKind::Block, "closure body".to_owned(), &block.block, None);
     }
-    syn::visit::visit_expr_closure(self, node);
+    visit::visit_expr_closure(self, node);
   }
 }
 
 /// Check if attributes contain `#[cfg(test)]`.
 fn has_cfg_test_attr(attrs: &[syn::Attribute]) -> bool {
-  attrs
-    .iter()
-    .any(|attr| attr.path().is_ident("cfg") && attr.parse_args::<syn::Ident>().is_ok_and(|ident| ident == "test"))
+  attrs.iter().any(|attr| {
+    if let syn::Meta::List(ref list) = attr.meta {
+      list.path.is_ident("cfg")
+        && matches!(*list.tokens.clone().into_iter().collect::<Vec<_>>().as_slice(),
+        [TokenTree::Ident(ref ident)] if ident == "test")
+    } else {
+      false
+    }
+  })
 }
 
 /// True when a free `fn` is test code: marked `#[test]`, gated by
@@ -297,16 +353,26 @@ fn item_fn_is_test(in_test_context: bool, node: &syn::ItemFn) -> bool {
 }
 
 /// Extracts code units from a syn file by visiting the AST.
+#[derive(Debug)]
 struct CodeUnitExtractor {
+  /// Native file identity retained by each unit.
   file:            PathBuf,
+  /// Minimum combined signature and body size.
   min_node_count:  usize,
+  /// Minimum inclusive source-line span.
   min_line_count:  usize,
+  /// Complete admitted units in source visitation order.
   units:           Vec<CodeUnit>,
   /// Track if we're inside test code (`#[cfg(test)]` module/impl).
   in_test_context: bool,
 }
 
 impl CodeUnitExtractor {
+  /// Prepare top-level extraction with source identity and both admission floors.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "Top-level extraction starts with explicit source and admission constraints and no inherited test context"
+  )]
   const fn new(file: PathBuf, min_node_count: usize, min_line_count: usize) -> Self {
     Self {
       file,
@@ -317,22 +383,23 @@ impl CodeUnitExtractor {
     }
   }
 
-  #[allow(clippy::too_many_arguments)]
+  /// Admit a normalized function-like unit while preserving its signature/body pairing.
   fn add_unit(
     &mut self,
     kind: CodeUnitKind,
     name: String,
-    line_start: usize,
-    line_end: usize,
-    sig: NormalizedNode,
-    body: NormalizedNode,
+    lines: RangeInclusive<usize>,
+    normalized: (NormalizedNode, NormalizedNode),
     is_test: bool,
   ) {
-    let node_count = normalizer::count_nodes(&sig) + normalizer::count_nodes(&body);
+    let (sig, body) = normalized;
+    let node_count = normalizer::count_nodes(&sig).saturating_add(normalizer::count_nodes(&body));
     if node_count < self.min_node_count {
       return;
     }
-    let line_count = line_end.saturating_sub(line_start) + 1;
+    let line_start = *lines.start();
+    let line_end = *lines.end();
+    let line_count = line_end.saturating_sub(line_start).saturating_add(1);
     if self.min_line_count > 0 && line_count < self.min_line_count {
       return;
     }
@@ -365,11 +432,11 @@ impl<'ast> Visit<'ast> for CodeUnitExtractor {
     let line_start = node.sig.ident.span().start().line;
     let line_end = node.block.brace_token.span.close().end().line;
     let (sig, body) = normalizer::normalize_item_fn(node);
-    self.add_unit(CodeUnitKind::Function, name, line_start, line_end, sig, body, is_test);
+    self.add_unit(CodeUnitKind::Function, name, line_start..=line_end, (sig, body), is_test);
 
     // Continue visiting nested items (propagate test context)
     self.with_test_context(is_test, |visitor| {
-      syn::visit::visit_item_fn(visitor, node);
+      visit::visit_item_fn(visitor, node);
     });
   }
 
@@ -378,42 +445,38 @@ impl<'ast> Visit<'ast> for CodeUnitExtractor {
   fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
     let is_test = self.in_test_context || has_cfg_test_attr(&node.attrs);
     let naming = ImplNaming::of(node);
+    let kind = if naming.trait_name.is_some() {
+      CodeUnitKind::TraitImplBlock
+    } else {
+      CodeUnitKind::Method
+    };
 
     self.with_test_context(is_test, |visitor| {
-      for item in &node.items {
-        if let syn::ImplItem::Fn(method) = item {
-          let full_name = naming.method_name(method);
+      for method in impl_methods(node) {
+        let full_name = naming.method_name(method);
 
-          let line_start = method.sig.ident.span().start().line;
-          let line_end = method.block.brace_token.span.close().end().line;
+        let line_start = method.sig.ident.span().start().line;
+        let line_end = method.block.brace_token.span.close().end().line;
 
-          let (sig, body) = normalizer::normalize_fn_like(&method.sig, &method.block);
-          let kind = if naming.is_trait_impl {
-            CodeUnitKind::TraitImplBlock
-          } else {
-            CodeUnitKind::Method
-          };
-
-          let in_test_context = visitor.in_test_context;
-          visitor.add_unit(kind, full_name, line_start, line_end, sig, body, in_test_context);
-        }
+        let (sig, body) = normalizer::normalize_fn_like(&method.sig, &method.block);
+        let in_test_context = visitor.in_test_context;
+        visitor.add_unit(kind, full_name, line_start..=line_end, (sig, body), in_test_context);
       }
     });
   }
 
   fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
-    let line_start = node.or1_token.span.start().line;
-    let line_end = match &*node.body {
-      syn::Expr::Block(eb) => eb.block.brace_token.span.close().end().line,
-      other => {
-        let end = other.span().end().line;
-        if end > 0 { end } else { line_start }
-      }
+    let line_start = node.inputs_begin.span.start().line;
+    let line_end = if let syn::Expr::Block(ref block) = *node.body {
+      block.block.brace_token.span.close().end().line
+    } else {
+      let end = node.body.span().end().line;
+      if end > 0 { end } else { line_start }
     };
 
     let normalized = normalizer::normalize_closure_expr(node);
     let node_count = normalizer::count_nodes(&normalized);
-    let line_count = line_end.saturating_sub(line_start) + 1;
+    let line_count = line_end.saturating_sub(line_start).saturating_add(1);
     if node_count >= self.min_node_count && (self.min_line_count == 0 || line_count >= self.min_line_count) {
       let name = format!("closure at {}:{}", self.file.display(), line_start);
       let fingerprint = Fingerprint::from_node(&normalized);
@@ -425,7 +488,7 @@ impl<'ast> Visit<'ast> for CodeUnitExtractor {
         file: self.file.clone(),
         line_start,
         line_end,
-        signature: NormalizedNode::leaf(dupes_core::node::NodeKind::Opaque),
+        signature: NormalizedNode::leaf(NodeKind::Opaque),
         body: normalized,
         fingerprint,
         node_count,
@@ -435,36 +498,59 @@ impl<'ast> Visit<'ast> for CodeUnitExtractor {
     }
 
     // Continue visiting nested closures
-    syn::visit::visit_expr_closure(self, node);
+    visit::visit_expr_closure(self, node);
   }
+}
+
+/// Visit only implementation methods, sharing the native variant selection between extractors.
+fn impl_methods(implementation: &syn::ItemImpl) -> impl Iterator<Item = &syn::ImplItemFn> {
+  implementation.items.iter().filter_map(|member| {
+    if let syn::ImplItem::Fn(ref method) = *member {
+      Some(method)
+    } else {
+      None
+    }
+  })
 }
 
 /// Join a path's segment identifiers with `::`.
 fn path_name(path: &syn::Path) -> String {
-  path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::")
+  path
+    .segments
+    .iter()
+    .map(|segment| segment.ident.to_string())
+    .collect::<Vec<_>>()
+    .join("::")
 }
 
 /// Get a simple string representation of a type for naming.
+#[allow(
+  clippy::single_call_fn,
+  reason = "Impl naming preserves native type-path names and the established label for non-path types"
+)]
 fn quote_type(ty: &syn::Type) -> String {
-  match ty {
-    syn::Type::Path(tp) => path_name(&tp.path),
-    _ => "Unknown".to_string(),
+  if let syn::Type::Path(ref tp) = *ty {
+    path_name(&tp.path)
+  } else {
+    "Unknown".to_owned()
   }
 }
 
 /// Method naming for one `impl` block, shared by both extractors.
+#[derive(Debug)]
 struct ImplNaming {
-  type_name:     String,
-  trait_name:    String,
-  is_trait_impl: bool,
+  /// Normalized display identity of the implementation's self type.
+  type_name:  String,
+  /// Trait identity for a trait implementation, absent for an inherent implementation.
+  trait_name: Option<String>,
 }
 
 impl ImplNaming {
+  /// Derive naming inputs from the native implementation header.
   fn of(node: &syn::ItemImpl) -> Self {
     Self {
-      type_name:     quote_type(&node.self_ty),
-      trait_name:    node.trait_.as_ref().map(|(_, path, _)| path_name(path)).unwrap_or_default(),
-      is_trait_impl: node.trait_.is_some(),
+      type_name:  quote_type(&node.self_ty),
+      trait_name: node.trait_.as_ref().map(|implementation| path_name(&implementation.0)),
     }
   }
 
@@ -472,12 +558,10 @@ impl ImplNaming {
   fn method_name(&self, method: &syn::ImplItemFn) -> String {
     let method_name = method.sig.ident.to_string();
     let type_name = &self.type_name;
-    if self.is_trait_impl {
-      let trait_name = &self.trait_name;
-      format!("<{type_name} as {trait_name}>::{method_name}")
-    } else {
-      format!("{type_name}::{method_name}")
-    }
+    self.trait_name.as_ref().map_or_else(
+      || format!("{type_name}::{method_name}"),
+      |trait_name| format!("<{type_name} as {trait_name}>::{method_name}"),
+    )
   }
 }
 
@@ -487,7 +571,11 @@ impl ImplNaming {
 /// `path` is used for diagnostics and naming only.
 /// Test code is always included but tagged with `is_test: true`;
 /// filtering is handled by the caller.
-pub fn parse_source(path: &Path, source: &str, min_node_count: usize, min_line_count: usize) -> Result<Vec<CodeUnit>, String> {
+///
+/// # Errors
+///
+/// Returns the complete source and native diagnostic when `syn` rejects the input.
+pub fn parse_source(path: &Path, source: &str, min_node_count: usize, min_line_count: usize) -> Result<Vec<CodeUnit>, RustParseError> {
   let file = parse_syn_file(path, source)?;
 
   let mut extractor = CodeUnitExtractor::new(path.to_path_buf(), min_node_count, min_line_count);
@@ -497,7 +585,15 @@ pub fn parse_source(path: &Path, source: &str, min_node_count: usize, min_line_c
 }
 
 /// Parse Rust source code and extract nested sub-function units.
-pub fn parse_sub_units(path: &Path, source: &str, min_node_count: usize) -> Result<Vec<CodeUnit>, String> {
+///
+/// # Errors
+///
+/// Returns the complete source and native diagnostic when `syn` rejects the input.
+#[allow(
+  clippy::single_call_fn,
+  reason = "The source parser owns sub-unit extraction and retains the native diagnostic before analyzer adaptation"
+)]
+pub fn parse_sub_units(path: &Path, source: &str, min_node_count: usize) -> Result<Vec<CodeUnit>, RustParseError> {
   let file = parse_syn_file(path, source)?;
 
   let mut extractor = SubUnitExtractor::new(path.to_path_buf(), min_node_count);
@@ -506,58 +602,196 @@ pub fn parse_sub_units(path: &Path, source: &str, min_node_count: usize) -> Resu
   Ok(extractor.units)
 }
 
-/// Parse Rust source through syn, tagging errors with the originating path.
-fn parse_syn_file(path: &Path, source: &str) -> Result<syn::File, String> {
-  syn::parse_file(source).map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
+/// Parse Rust source while retaining the source identity, contents, and native diagnostic on
+/// failure.
+fn parse_syn_file(path: &Path, contents: &str) -> Result<syn::File, RustParseError> {
+  syn::parse_file(contents).map_err(|source| RustParseError {
+    input: SourceFile {
+      path:     path.to_path_buf(),
+      contents: contents.to_owned(),
+    },
+    source,
+  })
 }
 
 /// Parse a single Rust file and extract code units.
 ///
 /// This is a lower-level convenience function. Prefer using [`crate::RustAnalyzer`]
 /// with [`dupes_core::analyze`] for the full pipeline.
-pub fn parse_file(path: &Path, min_node_count: usize, min_line_count: usize) -> Result<Vec<CodeUnit>, String> {
-  let content = std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-
-  parse_source(path, &content, min_node_count, min_line_count)
+///
+/// # Errors
+///
+/// Returns the native read, UTF-8 decoding, or Rust parse failure with its available input.
+#[allow(
+  clippy::single_call_fn,
+  reason = "One-file parsing retains the successful source read alongside extracted units or its native failure"
+)]
+pub fn parse_file(path: &Path, min_node_count: usize, min_line_count: usize) -> Result<ParsedRustFile, RustFileError> {
+  let file = SourceFile::read(path)?;
+  let units = parse_source(path, &file.contents, min_node_count, min_line_count)?;
+  Ok(ParsedRustFile {
+    file,
+    units,
+  })
 }
 
-/// Parse multiple files and collect all code units, skipping files that fail to parse.
+/// Parse every requested file, retaining each success or failure in request order.
 ///
 /// This is a lower-level convenience function. Prefer using [`crate::RustAnalyzer`]
 /// with [`dupes_core::analyze`] for the full pipeline.
 #[must_use]
-pub fn parse_files(paths: &[PathBuf], min_node_count: usize, min_line_count: usize) -> (Vec<CodeUnit>, Vec<String>) {
-  let mut units = Vec::new();
-  let mut warnings = Vec::new();
-
-  for path in paths {
-    match parse_file(path, min_node_count, min_line_count) {
-      Ok(file_units) => units.extend(file_units),
-      Err(warning) => warnings.push(warning),
-    }
-  }
-
-  (units, warnings)
+#[allow(
+  clippy::single_call_fn,
+  reason = "The file-batch API owns ordered collection of every requested file's complete read and parse outcome."
+)]
+pub fn parse_files(paths: &[PathBuf], min_node_count: usize, min_line_count: usize) -> Vec<Result<ParsedRustFile, RustFileError>> {
+  paths
+    .iter()
+    .map(|path| parse_file(path, min_node_count, min_line_count))
+    .collect()
 }
 
 #[cfg(test)]
 mod tests {
   use std::fs;
+  use std::io;
+  use std::path::Path;
 
+  use dupes_core::code_unit::CodeUnit;
+  use dupes_core::code_unit::CodeUnitKind;
+  use dupes_core::source::SourceFile;
+  use dupes_core::source::SourceReadError;
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
   use tempfile::TempDir;
 
-  use super::*;
+  use super::ParsedRustFile;
+  use super::RustFileError;
+  use super::RustParseError;
+  use super::parse_file;
+  use super::parse_files;
+  use super::parse_source;
+  use super::parse_sub_units;
 
-  fn write_and_parse(code: &str, min_nodes: usize) -> Vec<CodeUnit> {
-    parse_source(Path::new("test.rs"), code, min_nodes, 0).unwrap()
+  /// Native setup failures or a complete parser outcome that failed an expectation.
+  #[derive(Debug, thiserror::Error)]
+  enum ParserTestFailure {
+    /// A fixture could not be created or written.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    /// Source intended to be valid was rejected by the native parser.
+    #[error(transparent)]
+    Parse(#[from] RustParseError),
+    /// An assertion failed with all extracted units retained.
+    #[error("parsed units did not satisfy the expected contract: {source}; input: {input:?}; units: {units:?}")]
+    Units {
+      /// Complete in-memory source supplied under the fixture's parser identity.
+      input:  Box<SourceFile>,
+      /// Complete units produced by the parser.
+      units:  Vec<CodeUnit>,
+      /// Failed behavioral expectation.
+      source: Box<TestFailure>,
+    },
+    /// Declaration extraction did not preserve its expected identities and test contexts.
+    #[error("declaration identity expectation failed: {source}; input: {input:?}; expected: {expected:?}; units: {units:?}")]
+    Identities {
+      /// Complete original source and parser path.
+      input:    Box<SourceFile>,
+      /// Independently specified kind, name, and test context for every admitted declaration.
+      expected: Vec<(CodeUnitKind, String, bool)>,
+      /// Complete units produced by parsing.
+      units:    Vec<CodeUnit>,
+      /// Native assertion failure.
+      source:   Box<TestFailure>,
+    },
+    /// Function fingerprints did not preserve the declared equivalence relationship.
+    #[error("function fingerprint expectation failed: {source}; input: {input:?}; expected equal: {equal}; units: {units:?}")]
+    Fingerprints {
+      /// Complete original source and parser path.
+      input:  Box<SourceFile>,
+      /// Whether the two function bodies should share a normalized fingerprint.
+      equal:  bool,
+      /// Complete parser output, including both normalized signatures and bodies.
+      units:  Vec<CodeUnit>,
+      /// Native assertion failure.
+      source: TestFailure,
+    },
+    /// An assertion failed with every attempted file outcome retained.
+    #[error("file parsing did not satisfy the expected contract: {source}; outcomes: {outcomes:?}")]
+    Files {
+      /// Ordered successful and failed file operations.
+      outcomes: Vec<Result<ParsedRustFile, RustFileError>>,
+      /// Failed behavioral expectation.
+      source:   TestFailure,
+    },
   }
 
-  // jscpd:ignore-start
+  /// Parse an in-memory fixture with one stable source identity.
+  fn parse_test_source(code: &str, min_nodes: usize) -> Result<Vec<CodeUnit>, RustParseError> {
+    parse_source(Path::new("test.rs"), code, min_nodes, 0)
+  }
+
+  /// Keep the complete in-memory input and all units when a contract assertion fails.
+  fn check_units(
+    code: &str,
+    units: Vec<CodeUnit>,
+    check: impl FnOnce(&[CodeUnit]) -> Result<(), TestFailure>,
+  ) -> Result<(), ParserTestFailure> {
+    check(&units).map_err(|source| ParserTestFailure::Units {
+      input: Box::new(SourceFile {
+        path:     Path::new("test.rs").to_path_buf(),
+        contents: code.to_owned(),
+      }),
+      units,
+      source: Box::new(source),
+    })
+  }
+
+  /// Exercise the nested-source parser with the same retained input as its behavioral assertion.
+  fn check_sub_units(code: &str, check: impl FnOnce(&[CodeUnit]) -> Result<(), TestFailure>) -> Result<(), ParserTestFailure> {
+    check_units(code, parse_sub_units(Path::new("test.rs"), code, 1)?, check)
+  }
+
+  /// Require the complete ordered declaration identities while leaving suppression to the pipeline.
+  fn check_declarations(code: &str, expected: &[(CodeUnitKind, &str, bool)]) -> Result<(), ParserTestFailure> {
+    let input = SourceFile {
+      path:     Path::new("test.rs").to_path_buf(),
+      contents: code.to_owned(),
+    };
+    let units = parse_source(&input.path, &input.contents, 1, 0)?;
+    ensure(
+      units
+        .iter()
+        .map(|unit| (unit.kind, unit.name.as_str(), unit.is_test))
+        .eq(expected.iter().copied())
+        && units.iter().all(|unit| unit.suppressed.is_none() && unit.file == input.path),
+      "declaration extraction preserves source order, complete names, kinds, test contexts, and file identity before pipeline tagging",
+    )
+    .map_err(|source| ParserTestFailure::Identities {
+      input: Box::new(input),
+      expected: expected
+        .iter()
+        .map(|&(kind, name, is_test)| (kind, name.to_owned(), is_test))
+        .collect(),
+      units,
+      source: Box::new(source),
+    })
+  }
+
+  /// Keep native file successes and failures together when a contract assertion fails.
+  fn check_files(
+    outcomes: Vec<Result<ParsedRustFile, RustFileError>>,
+    check: impl FnOnce(&[Result<ParsedRustFile, RustFileError>]) -> Result<(), TestFailure>,
+  ) -> Result<(), ParserTestFailure> {
+    check(&outcomes).map_err(|source| ParserTestFailure::Files {
+      outcomes,
+      source,
+    })
+  }
 
   #[test]
-  fn extracts_top_level_functions() {
-    let units = write_and_parse(
-      r#"
+  fn extracts_free_inherent_and_trait_function_identities() -> Result<(), ParserTestFailure> {
+    let functions = r#"
             fn foo(x: i32) -> i32 {
                 let y = x + 1;
                 y * 2
@@ -565,21 +799,8 @@ mod tests {
             fn bar() {
                 println!("hello");
             }
-            "#,
-      1,
-    );
-    let fns: Vec<_> = units.iter().filter(|u| u.kind == CodeUnitKind::Function).collect();
-    assert_eq!(fns.len(), 2);
-    assert_eq!(fns[0].name, "foo");
-    assert_eq!(fns[1].name, "bar");
-  }
-
-  // jscpd:ignore-end
-
-  #[test]
-  fn extracts_methods_from_impl() {
-    let units = write_and_parse(
-      r"
+            "#;
+    let inherent = "
             struct Foo;
             impl Foo {
                 fn bar(&self) -> i32 {
@@ -589,19 +810,8 @@ mod tests {
                     let _ = val + 1;
                 }
             }
-            ",
-      1,
-    );
-    let methods: Vec<_> = units.iter().filter(|u| u.kind == CodeUnitKind::Method).collect();
-    assert_eq!(methods.len(), 2);
-    assert!(methods[0].name.contains("Foo::bar"));
-    assert!(methods[1].name.contains("Foo::baz"));
-  }
-
-  #[test]
-  fn extracts_trait_impl_methods() {
-    let units = write_and_parse(
-      r"
+            ";
+    let trait_impl = "
             struct Foo;
             trait MyTrait {
                 fn do_thing(&self) -> i32;
@@ -612,49 +822,52 @@ mod tests {
                     x + 1
                 }
             }
-            ",
-      1,
-    );
-    let trait_impls: Vec<_> = units.iter().filter(|u| u.kind == CodeUnitKind::TraitImplBlock).collect();
-    assert_eq!(trait_impls.len(), 1);
-    assert!(trait_impls[0].name.contains("Foo"));
-    assert!(trait_impls[0].name.contains("MyTrait"));
-    assert!(trait_impls[0].name.contains("do_thing"));
+            ";
+    check_declarations(functions, &[
+      (CodeUnitKind::Function, "foo", false),
+      (CodeUnitKind::Function, "bar", false),
+    ])?;
+    check_declarations(inherent, &[
+      (CodeUnitKind::Method, "Foo::bar", false),
+      (CodeUnitKind::Method, "Foo::baz", false),
+    ])?;
+    check_declarations(trait_impl, &[(CodeUnitKind::TraitImplBlock, "<Foo as MyTrait>::do_thing", false)])
   }
 
   #[test]
-  fn respects_min_node_count() {
-    let units_low = write_and_parse(
-      r"
+  fn respects_min_node_count() -> Result<(), ParserTestFailure> {
+    let source = "
             fn tiny() -> i32 { 1 }
             fn bigger(x: i32) -> i32 {
                 let a = x + 1;
                 let b = a * 2;
                 a + b
             }
-            ",
-      1,
-    );
-    let units_high = write_and_parse(
-      r"
-            fn tiny() -> i32 { 1 }
-            fn bigger(x: i32) -> i32 {
-                let a = x + 1;
-                let b = a * 2;
-                a + b
-            }
-            ",
-      20,
-    );
-    assert!(units_low.len() >= units_high.len());
+            ";
+    let units_low = parse_test_source(source, 1)?;
+    let expected_high = units_low
+      .iter()
+      .filter(|unit| unit.node_count >= 20)
+      .cloned()
+      .collect::<Vec<_>>();
+    check_units(source, units_low, |parsed| {
+      ensure(parsed.len() == 2, "the lower node floor admits both functions")?;
+      ensure(
+        parsed.iter().any(|unit| unit.node_count < 20),
+        "the higher floor excludes an actually smaller function",
+      )
+    })?;
+    check_units(source, parse_test_source(source, 20)?, |parsed| {
+      ensure(
+        parsed == expected_high,
+        "the higher node floor retains exactly the eligible complete units",
+      )
+    })
   }
 
-  // jscpd:ignore-start
-
   #[test]
-  fn duplicate_functions_same_fingerprint() {
-    let units = write_and_parse(
-      r"
+  fn function_fingerprints_ignore_renaming_and_distinguish_behavior() -> Result<(), ParserTestFailure> {
+    let renamed = "
             fn foo(x: i32) -> i32 {
                 let y = x + 1;
                 y * 2
@@ -663,59 +876,121 @@ mod tests {
                 let b = a + 1;
                 b * 2
             }
-            ",
-      1,
-    );
-    let fns: Vec<_> = units.iter().filter(|u| u.kind == CodeUnitKind::Function).collect();
-    assert_eq!(fns.len(), 2);
-    assert_eq!(fns[0].fingerprint, fns[1].fingerprint);
-  }
-
-  #[test]
-  fn different_functions_different_fingerprint() {
-    let units = write_and_parse(
-      r"
+            ";
+    let different = "
             fn add(x: i32) -> i32 {
                 x + 1
             }
             fn mul(x: i32) -> i32 {
                 x * 2
             }
-            ",
-      1,
-    );
-    let fns: Vec<_> = units.iter().filter(|u| u.kind == CodeUnitKind::Function).collect();
-    assert_eq!(fns.len(), 2);
-    assert_ne!(fns[0].fingerprint, fns[1].fingerprint);
+            ";
+    for (code, equal) in [(renamed, true), (different, false)] {
+      let input = SourceFile {
+        path:     Path::new("test.rs").to_path_buf(),
+        contents: code.to_owned(),
+      };
+      let units = parse_source(&input.path, &input.contents, 1, 0)?;
+      ensure(
+        matches!(units.as_slice(), [first, second]
+          if (first.kind, second.kind) == (CodeUnitKind::Function, CodeUnitKind::Function)
+            && (first.fingerprint == second.fingerprint) == equal),
+        "renaming bindings preserves function identity while different arithmetic behavior changes it",
+      )
+      .map_err(|source| ParserTestFailure::Fingerprints {
+        input: Box::new(input),
+        equal,
+        units,
+        source,
+      })?;
+    }
+    Ok(())
   }
 
-  // jscpd:ignore-end
-
   #[test]
-  fn handles_parse_errors_gracefully() {
-    let tmp = TempDir::new().unwrap();
+  fn handles_parse_errors_gracefully() -> Result<(), ParserTestFailure> {
+    let tmp = TempDir::new()?;
     let file = tmp.path().join("broken.rs");
-    fs::write(&file, "fn broken( { }").unwrap();
-    let result = parse_file(&file, 1, 0);
-    assert!(result.is_err());
+    let contents = "fn broken( { }";
+    fs::write(&file, contents)?;
+    check_files(vec![parse_file(&file, 1, 0)], |outcomes| {
+      let [Err(RustFileError::Parse(ref failure))] = *outcomes else {
+        return ensure(false, "invalid Rust must return its typed parse failure");
+      };
+      ensure(
+        failure.input.path == file && failure.input.contents == contents && failure.source.span().start().line == 1,
+        "the parse failure retains the source identity, complete contents, and native diagnostic span",
+      )
+    })
   }
 
   #[test]
-  fn parse_files_collects_warnings() {
-    let tmp = TempDir::new().unwrap();
+  fn parse_files_preserves_successes_and_native_failures_in_order() -> Result<(), ParserTestFailure> {
+    let tmp = TempDir::new()?;
     let good = tmp.path().join("good.rs");
     let bad = tmp.path().join("bad.rs");
-    fs::write(&good, "fn good() { let x = 1; }").unwrap();
-    fs::write(&bad, "fn bad( {").unwrap();
-    let (units, warnings) = parse_files(&[good, bad], 1, 0);
-    assert!(!units.is_empty());
-    assert_eq!(warnings.len(), 1);
+    let invalid_utf8 = tmp.path().join("bytes.rs");
+    let missing = tmp.path().join("missing.rs");
+    let last = tmp.path().join("last.rs");
+    let good_source = "fn good() { let count = 1; }";
+    let bad_source = "fn bad( {";
+    let last_source = "fn last() { let total = 2; }";
+    for (path, contents) in [(&good, good_source), (&bad, bad_source), (&last, last_source)] {
+      fs::write(path, contents)?;
+    }
+    let invalid_bytes = [b'f', b'n', b' ', 0xff];
+    fs::write(&invalid_utf8, invalid_bytes)?;
+    check_files(
+      parse_files(
+        &[good.clone(), bad.clone(), invalid_utf8.clone(), missing.clone(), last.clone()],
+        1,
+        0,
+      ),
+      |outcomes| {
+        let [
+          Ok(ref first),
+          Err(RustFileError::Parse(ref syntax)),
+          Err(RustFileError::Read(SourceReadError::Utf8 {
+            path: ref utf8_path,
+            source: ref utf8,
+          })),
+          Err(RustFileError::Read(SourceReadError::Read {
+            path: ref missing_path,
+            source: ref read,
+          })),
+          Ok(ref final_file),
+        ] = *outcomes
+        else {
+          return ensure(false, "retain the five file outcomes in request order and continue after failures");
+        };
+        ensure(
+          first.file.path == good
+            && first.file.contents == good_source
+            && first.units.iter().map(|unit| unit.name.as_str()).collect::<Vec<_>>() == ["good"]
+            && final_file.file.path == last
+            && final_file.file.contents == last_source
+            && final_file.units.iter().map(|unit| unit.name.as_str()).collect::<Vec<_>>() == ["last"],
+          "retain complete source reads and extracted units on both sides of the failures",
+        )?;
+        ensure(
+          syntax.input.path == bad && syntax.input.contents == bad_source && syntax.source.span().start().line == 1,
+          "retain the original parse failure and rejected source",
+        )?;
+        ensure(
+          utf8_path == &invalid_utf8 && utf8.as_bytes() == invalid_bytes,
+          "retain every byte from the file that is not valid UTF-8",
+        )?;
+        ensure(
+          missing_path == &missing && read.kind() == io::ErrorKind::NotFound && read.raw_os_error().is_some(),
+          "retain the native missing-file failure with its operating-system error code",
+        )
+      },
+    )
   }
 
   #[test]
-  fn code_unit_has_line_numbers() {
-    let units = write_and_parse(
-      r"
+  fn code_unit_has_line_numbers() -> Result<(), ParserTestFailure> {
+    let code = "
 fn first() {
     let x = 1;
 }
@@ -723,26 +998,32 @@ fn first() {
 fn second() {
     let y = 2;
 }
-            ",
-      1,
-    );
-    assert!(units.len() >= 2);
-    // First function starts at line 2
-    assert!(units[0].line_start > 0);
-    assert!(units[0].line_end >= units[0].line_start);
+            ";
+    check_units(code, parse_test_source(code, 1)?, |parsed| {
+      ensure(
+        parsed
+          .iter()
+          .map(|unit| (unit.name.as_str(), unit.line_start, unit.line_end))
+          .collect::<Vec<_>>()
+          == [("first", 2, 4), ("second", 6, 8)],
+        "retain precise inclusive function spans",
+      )
+    })
   }
 
   #[test]
-  fn code_unit_kind_display() {
-    assert_eq!(CodeUnitKind::Function.to_string(), "function");
-    assert_eq!(CodeUnitKind::Method.to_string(), "method");
-    assert_eq!(CodeUnitKind::Closure.to_string(), "closure");
+  fn code_unit_kind_display() -> Result<(), TestFailure> {
+    ensure(
+      [CodeUnitKind::Function, CodeUnitKind::Method, CodeUnitKind::Closure].map(|kind| kind.to_string())
+        == ["function", "method", "closure"],
+      "render the public function, method, and closure labels",
+    )
   }
 
   #[test]
-  fn extracts_closures() {
-    let units = write_and_parse(
-      r"
+  fn closures_remain_units_before_pipeline_classification() -> Result<(), ParserTestFailure> {
+    for code in [
+      "
             fn foo() {
                 let f = |x: i32, y: i32| {
                     let sum = x + y;
@@ -751,21 +1032,40 @@ fn second() {
                 };
             }
             ",
-      1,
-    );
-    let has_closure = units.iter().any(|u| u.kind == CodeUnitKind::Closure);
-    assert!(has_closure);
+      "
+            fn sort_groups(groups: &mut Vec<Group>) {
+                groups.sort_by(|a, b| start_key(a).cmp(&start_key(b)));
+            }
+            ",
+      r#"
+            fn collect_names(paths: &[Item]) -> Vec<String> {
+                paths
+                    .iter()
+                    .map(|item| {
+                        let name = item.ident.to_string();
+                        format!("{name}::suffix")
+                    })
+                    .collect()
+            }
+            "#,
+    ] {
+      check_units(code, parse_test_source(code, 1)?, |parsed| {
+        ensure(
+          parsed.iter().map(|unit| (unit.kind, unit.suppressed)).collect::<Vec<_>>()
+            == [(CodeUnitKind::Function, None), (CodeUnitKind::Closure, None)],
+          "arithmetic, comparator, and structured closures remain separate units with their containing function before pipeline tagging",
+        )
+      })?;
+    }
+    Ok(())
   }
 
-  // jscpd:ignore-start
-
   #[test]
-  fn parse_sub_units_extracts_if_chain_with_precise_span() {
+  fn parse_sub_units_extracts_if_chain_with_precise_span() -> Result<(), ParserTestFailure> {
     // Consecutive option-to-field setter branches are one coherent
     // chain unit, not many tiny if-branch fragments.
-    let units = parse_sub_units(
-      Path::new("test.rs"),
-      r"
+    check_sub_units(
+      "
             fn apply(config: &mut Config, overrides: &Overrides) {
                 if let Some(width_limit) = overrides.width_limit {
                     config.width_limit = width_limit;
@@ -778,29 +1078,30 @@ fn second() {
                 }
             }
             ",
-      1,
+      |parsed| {
+        let [ref chain, ref first, ref second, ref third] = *parsed else {
+          return ensure(false, "extract one complete chain and all three constituent branches");
+        };
+        ensure(
+          (chain.kind, chain.name.as_str(), chain.line_start, chain.line_end) == (CodeUnitKind::IfChain, "if chain (3 branches)", 3, 11),
+          "the chain spans all consecutive branches",
+        )?;
+        ensure(
+          [first, second, third].iter().all(|branch| {
+            branch.kind == CodeUnitKind::IfBranch
+              && branch.parent_chain == Some(chain.fingerprint)
+              && branch.parent_name.as_deref() == Some("apply")
+          }),
+          "retain every branch with the owning chain fingerprint and function identity",
+        )
+      },
     )
-    .unwrap();
-
-    let chains: Vec<_> = units.iter().filter(|u| u.kind == CodeUnitKind::IfChain).collect();
-    assert_eq!(chains.len(), 1);
-    assert_eq!(chains[0].name, "if chain (3 branches)");
-    assert_eq!(chains[0].line_start, 3);
-    assert_eq!(chains[0].line_end, 11);
-    let branches: Vec<_> = units.iter().filter(|u| u.kind == CodeUnitKind::IfBranch).collect();
-    assert_eq!(branches.len(), 3, "chained setter branches stay extracted, linked to the chain");
-    for branch in branches {
-      assert_eq!(branch.parent_chain, Some(chains[0].fingerprint));
-    }
   }
 
-  // jscpd:ignore-end
-
   #[test]
-  fn parse_sub_units_keeps_single_if_branch_extraction() {
-    let units = parse_sub_units(
-      Path::new("test.rs"),
-      r"
+  fn parse_sub_units_keeps_single_if_branch_extraction() -> Result<(), ParserTestFailure> {
+    check_sub_units(
+      "
             fn single(config: &mut Config, value: Option<usize>) {
                 if let Some(value) = value {
                     config.min_nodes = value;
@@ -808,21 +1109,19 @@ fn second() {
                 let _ = config;
             }
             ",
-      1,
+      |parsed| {
+        ensure(
+          parsed.iter().map(|unit| (unit.kind, unit.parent_chain)).collect::<Vec<_>>() == [(CodeUnitKind::IfBranch, None)],
+          "a standalone branch remains extracted without an owning chain",
+        )
+      },
     )
-    .unwrap();
-
-    assert!(units.iter().any(|u| u.kind == CodeUnitKind::IfBranch));
-    assert!(units.iter().all(|u| u.kind != CodeUnitKind::IfChain));
   }
 
-  // jscpd:ignore-start
-
   #[test]
-  fn identical_if_chains_share_fingerprints_across_functions() {
-    let units = parse_sub_units(
-      Path::new("test.rs"),
-      r"
+  fn identical_if_chains_share_fingerprints_across_functions() -> Result<(), ParserTestFailure> {
+    check_sub_units(
+      "
             fn apply_first(config: &mut Config, overrides: &Overrides) {
                 if let Some(node_quota) = overrides.node_quota {
                     config.node_quota = node_quota;
@@ -840,22 +1139,27 @@ fn second() {
                 }
             }
             ",
-      1,
+      |parsed| {
+        let chains = parsed
+          .iter()
+          .filter(|unit| unit.kind == CodeUnitKind::IfChain)
+          .collect::<Vec<_>>();
+        let [first, second] = *chains.as_slice() else {
+          return ensure(false, "extract both renamed chains");
+        };
+        ensure(
+          first.fingerprint == second.fingerprint
+            && (first.parent_name.as_deref(), second.parent_name.as_deref()) == (Some("apply_first"), Some("apply_second")),
+          "chain fingerprints survive renaming while parent identities remain distinct",
+        )
+      },
     )
-    .unwrap();
-
-    let chains: Vec<_> = units.iter().filter(|u| u.kind == CodeUnitKind::IfChain).collect();
-    assert_eq!(chains.len(), 2);
-    assert_eq!(chains[0].fingerprint, chains[1].fingerprint);
   }
 
-  // jscpd:ignore-end
-
   #[test]
-  fn parse_sub_units_extracts_each_loop_body_kind() {
-    let units = parse_sub_units(
-      Path::new("test.rs"),
-      r"
+  fn parse_sub_units_extracts_each_loop_body_kind() -> Result<(), ParserTestFailure> {
+    check_sub_units(
+      "
             fn loops(xs: Vec<i32>) {
                 loop {
                     break;
@@ -868,20 +1172,23 @@ fn second() {
                 }
             }
             ",
-      1,
+      |parsed| {
+        ensure(
+          parsed.iter().map(|unit| (unit.kind, unit.name.as_str())).collect::<Vec<_>>()
+            == [
+              (CodeUnitKind::LoopBody, "loop body"),
+              (CodeUnitKind::LoopBody, "while body"),
+              (CodeUnitKind::LoopBody, "for body"),
+            ],
+          "extract loop, while, and for bodies in source order",
+        )
+      },
     )
-    .unwrap();
-    let loop_names: Vec<_> = units
-      .iter()
-      .filter(|u| u.kind == CodeUnitKind::LoopBody)
-      .map(|u| u.name.as_str())
-      .collect();
-    assert_eq!(loop_names, ["loop body", "while body", "for body"]);
   }
 
   #[test]
-  fn min_line_count_filters_short_functions() {
-    let code = r"
+  fn min_line_count_filters_short_functions() -> Result<(), ParserTestFailure> {
+    let code = "
 fn short(x: i32) -> i32 {
     x + 1
 }
@@ -894,106 +1201,74 @@ fn longer(x: i32) -> i32 {
     a + b + c + d
 }
         ";
-    let tmp = TempDir::new().unwrap();
+    let tmp = TempDir::new()?;
     let file = tmp.path().join("test.rs");
-    fs::write(&file, code).unwrap();
-
-    // With min_line_count=0, both functions should appear
-    let units_all = parse_file(&file, 1, 0).unwrap();
-    assert!(units_all.len() >= 2);
-
-    // With min_line_count=5, only the longer function should pass
-    let units_filtered = parse_file(&file, 1, 5).unwrap();
-    assert!(units_filtered.len() < units_all.len());
-    for unit in &units_filtered {
-      let lines = unit.line_end.saturating_sub(unit.line_start) + 1;
-      assert!(lines >= 5, "unit {} has only {lines} lines", unit.name);
-    }
+    fs::write(&file, code)?;
+    check_files(vec![parse_file(&file, 1, 0), parse_file(&file, 1, 5)], |outcomes| {
+      let [Ok(ref unfiltered), Ok(ref filtered)] = *outcomes else {
+        return ensure(false, "both file parses must succeed");
+      };
+      ensure(
+        unfiltered.file.path == file && filtered.file.path == file && unfiltered.file.contents == code && filtered.file.contents == code,
+        "both runs retain the complete file read",
+      )?;
+      let [ref short, ref longer] = *unfiltered.units.as_slice() else {
+        return ensure(false, "the unrestricted run must retain both functions");
+      };
+      ensure(
+        (short.name.as_str(), short.line_start, short.line_end) == ("short", 2, 4)
+          && (longer.name.as_str(), longer.line_start, longer.line_end) == ("longer", 6, 12)
+          && filtered.units.as_slice() == [longer.clone()],
+        "the five-line floor removes the short function and preserves the complete longer unit",
+      )
+    })
   }
 
   #[test]
-  fn test_has_test_attr() {
-    let file: syn::File = syn::parse_str(
-      r"
+  fn test_attributes_mark_their_scope_and_restore_sibling_context() -> Result<(), ParserTestFailure> {
+    let attributed = "
             #[test]
             fn my_test() {}
             fn normal() {}
-            ",
-    )
-    .unwrap();
-
-    let items = &file.items;
-    if let syn::Item::Fn(f) = &items[0] {
-      assert!(has_test_attr(&f.attrs));
-    } else {
-      panic!("expected function");
-    }
-    if let syn::Item::Fn(f) = &items[1] {
-      assert!(!has_test_attr(&f.attrs));
-    } else {
-      panic!("expected function");
-    }
-  }
-
-  #[test]
-  fn test_has_cfg_test_attr() {
-    let file: syn::File = syn::parse_str(
-      r"
+            ";
+    let configured = "
             #[cfg(test)]
-            mod tests {}
-            mod normal {}
-            ",
-    )
-    .unwrap();
-
-    let items = &file.items;
-    if let syn::Item::Mod(m) = &items[0] {
-      assert!(has_cfg_test_attr(&m.attrs));
-    } else {
-      panic!("expected module");
+            mod tests { fn helper() {} }
+            #[cfg(unix)]
+            mod normal { fn production() {} }
+            ";
+    for (code, tagged, ordinary) in [(attributed, "my_test", "normal"), (configured, "helper", "production")] {
+      check_declarations(code, &[
+        (CodeUnitKind::Function, tagged, true),
+        (CodeUnitKind::Function, ordinary, false),
+      ])?;
     }
-    if let syn::Item::Mod(m) = &items[1] {
-      assert!(!has_cfg_test_attr(&m.attrs));
-    } else {
-      panic!("expected module");
-    }
+    Ok(())
   }
 
-  // jscpd:ignore-start
-
   #[test]
-  fn test_functions_tagged_as_test() {
-    let code = r"
+  fn executable_functions_inherit_only_their_own_test_context() -> Result<(), ParserTestFailure> {
+    let production = "
             fn production(x: i32) -> i32 {
                 let y = x + 1;
                 y * 2
             }
+";
+    let attributed = [
+      production,
+      "
             #[test]
             fn my_test() {
                 let x = 1;
                 let y = x + 1;
                 assert_eq!(y, 2);
             }
-        ";
-
-    let units = write_and_parse(code, 1);
-    let prod: Vec<_> = units.iter().filter(|u| u.name == "production").collect();
-    let test: Vec<_> = units.iter().filter(|u| u.name == "my_test").collect();
-
-    assert_eq!(prod.len(), 1);
-    assert!(!prod[0].is_test);
-    assert_eq!(test.len(), 1);
-    assert!(test[0].is_test);
-  }
-
-  #[test]
-  fn cfg_test_module_functions_tagged_as_test() {
-    let code = r"
-            fn production(x: i32) -> i32 {
-                let y = x + 1;
-                y * 2
-            }
-
+        ",
+    ]
+    .concat();
+    let module = [
+      production,
+      "
             #[cfg(test)]
             mod tests {
                 fn helper(x: i32) -> i32 {
@@ -1001,42 +1276,10 @@ fn longer(x: i32) -> i32 {
                     y * 2
                 }
             }
-        ";
-
-    let units = write_and_parse(code, 1);
-    let prod: Vec<_> = units.iter().filter(|u| u.name == "production").collect();
-    let helper: Vec<_> = units.iter().filter(|u| u.name == "helper").collect();
-
-    assert_eq!(prod.len(), 1);
-    assert!(!prod[0].is_test);
-    assert_eq!(helper.len(), 1);
-    assert!(helper[0].is_test);
-  }
-
-  #[test]
-  fn non_test_code_not_tagged() {
-    let code = r"
-            fn production(x: i32) -> i32 {
-                let y = x + 1;
-                y * 2
-            }
-            #[test]
-            fn my_test() {
-                let x = 1;
-                let y = x + 1;
-                assert_eq!(y, 2);
-            }
-        ";
-
-    let units = write_and_parse(code, 1);
-    let non_test: Vec<_> = units.iter().filter(|u| !u.is_test).collect();
-    assert!(!non_test.is_empty());
-    assert!(non_test.iter().all(|u| u.name != "my_test"));
-  }
-
-  #[test]
-  fn cfg_test_impl_blocks_tagged_as_test() {
-    let code = r"
+        ",
+    ]
+    .concat();
+    let implementation = "
             struct Foo;
 
             impl Foo {
@@ -1054,32 +1297,35 @@ fn longer(x: i32) -> i32 {
                 }
             }
         ";
-
-    let units = write_and_parse(code, 1);
-    let prod: Vec<_> = units.iter().filter(|u| u.name.contains("production")).collect();
-    let helper: Vec<_> = units.iter().filter(|u| u.name.contains("test_helper")).collect();
-
-    assert_eq!(prod.len(), 1);
-    assert!(!prod[0].is_test);
-    assert_eq!(helper.len(), 1);
-    assert!(helper[0].is_test);
+    for (code, kind, ordinary, tagged) in [
+      (attributed.as_str(), CodeUnitKind::Function, "production", "my_test"),
+      (module.as_str(), CodeUnitKind::Function, "production", "helper"),
+      (implementation, CodeUnitKind::Method, "Foo::production", "Foo::test_helper"),
+    ] {
+      check_declarations(code, &[(kind, ordinary, false), (kind, tagged, true)])?;
+    }
+    Ok(())
   }
 
-  // jscpd:ignore-end
-
   #[test]
-  fn parse_source_works() {
+  fn parse_source_works() -> Result<(), ParserTestFailure> {
     let path = Path::new("test.rs");
     let source = "fn foo(x: i32) -> i32 { x + 1 }";
-    let units = parse_source(path, source, 1, 0).unwrap();
-    assert_eq!(units.len(), 1);
-    assert_eq!(units[0].name, "foo");
+    check_units(source, parse_source(path, source, 1, 0)?, |parsed| {
+      ensure(
+        parsed
+          .iter()
+          .map(|unit| (unit.name.as_str(), unit.file.as_path()))
+          .collect::<Vec<_>>()
+          == [("foo", path)],
+        "parse in-memory source with its supplied source identity",
+      )
+    })
   }
 
   #[test]
-  fn builder_setters_are_not_emitted_as_units() {
-    let units = write_and_parse(
-      r"
+  fn setters_validators_and_accessors_remain_units_for_pipeline_tagging() -> Result<(), ParserTestFailure> {
+    let setters = "
             struct Builder { resolver: Option<u32>, detector: Option<u32> }
             impl Builder {
                 pub fn with_resolver(mut self, resolver: u32) -> Self {
@@ -1091,22 +1337,8 @@ fn longer(x: i32) -> i32 {
                     self
                 }
             }
-            ",
-      1,
-    );
-    // The parser emits setters unconditionally; the pipeline tags
-    // them with ast.setter-returning-self (pinned in dupes-core tests).
-    assert_eq!(
-      units.iter().filter(|u| u.name.contains("with_")).count(),
-      2,
-      "setter-and-return-self bodies are emitted for pipeline tagging"
-    );
-  }
-
-  #[test]
-  fn validating_builder_setters_remain_units() {
-    let units = write_and_parse(
-      r#"
+            ";
+    let validator = r#"
             struct Builder { port: u16 }
             impl Builder {
                 pub fn with_port(mut self, port: u16) -> Result<Self, String> {
@@ -1117,19 +1349,8 @@ fn longer(x: i32) -> i32 {
                     Ok(self)
                 }
             }
-            "#,
-      1,
-    );
-    assert!(
-      units.iter().any(|u| u.name.contains("with_port")),
-      "behavior-bearing setters must remain reportable"
-    );
-  }
-
-  #[test]
-  fn accessor_forwarding_methods_are_not_emitted_as_units() {
-    let units = write_and_parse(
-      r"
+            "#;
+    let accessors = "
             struct Stats { exact: usize, near: usize }
             impl Stats {
                 pub fn exact_percent(&self) -> f64 {
@@ -1139,79 +1360,37 @@ fn longer(x: i32) -> i32 {
                     self.percent_of(self.near)
                 }
             }
-            ",
-      1,
-    );
-    // Accessors are emitted unconditionally and tagged by the
-    // pipeline with ast.forwarding-accessor (pinned in dupes-core tests).
-    assert_eq!(
-      units.iter().filter(|u| u.kind == CodeUnitKind::Method).count(),
-      2,
-      "forwarding accessors are emitted for pipeline tagging"
-    );
+            ";
+    check_declarations(setters, &[
+      (CodeUnitKind::Method, "Builder::with_resolver", false),
+      (CodeUnitKind::Method, "Builder::with_detector", false),
+    ])?;
+    check_declarations(validator, &[(CodeUnitKind::Method, "Builder::with_port", false)])?;
+    check_declarations(accessors, &[
+      (CodeUnitKind::Method, "Stats::exact_percent", false),
+      (CodeUnitKind::Method, "Stats::near_percent", false),
+    ])
   }
 
   #[test]
-  fn comparator_adapter_closures_are_not_emitted_as_units() {
-    let units = write_and_parse(
-      r"
-            fn sort_groups(groups: &mut Vec<Group>) {
-                groups.sort_by(|a, b| start_key(a).cmp(&start_key(b)));
-            }
-            ",
-      1,
-    );
-    // Comparator-adapter closures are emitted unconditionally and
-    // tagged by the pipeline with ast.comparator-adapter.
-    assert!(units.iter().any(|u| u.kind == CodeUnitKind::Closure));
-  }
-
-  #[test]
-  fn constant_binding_wrappers_remain_units() {
+  fn constant_binding_wrappers_remain_units() -> Result<(), ParserTestFailure> {
     // `fixture_path("cargo-dupes", name)`-style named specializations
     // stay reportable: the wrapper binds a constant.
-    let units = write_and_parse(
-      r#"
+    let code = r#"
             fn rust_fixture_path(name: &str) -> PathBuf {
                 fixture_path("cargo-dupes", name)
             }
-            "#,
-      1,
-    );
-    assert_eq!(units.len(), 1);
-    assert_eq!(units[0].name, "rust_fixture_path");
+            "#;
+    check_declarations(code, &[(CodeUnitKind::Function, "rust_fixture_path", false)])
   }
 
   #[test]
-  fn behavior_bearing_small_functions_remain_units() {
-    let units = write_and_parse(
-      r"
+  fn behavior_bearing_small_functions_remain_units() -> Result<(), ParserTestFailure> {
+    let code = "
             fn clamp_total(total: i32) -> i32 {
                 if total > 100 { 100 } else { total }
             }
-            ",
-      1,
-    );
-    assert_eq!(units.len(), 1);
-  }
-
-  #[test]
-  fn structured_closures_remain_units() {
-    let units = write_and_parse(
-      r#"
-            fn collect_names(paths: &[Item]) -> Vec<String> {
-                paths
-                    .iter()
-                    .map(|item| {
-                        let name = item.ident.to_string();
-                        format!("{name}::suffix")
-                    })
-                    .collect()
-            }
-            "#,
-      1,
-    );
-    let closure_count = units.iter().filter(|u| u.kind == CodeUnitKind::Closure).count();
-    assert_eq!(closure_count, 1, "the mapping closure stays a unit");
+            ";
+    check_declarations(code, &[(CodeUnitKind::Function, "clamp_total", false)])
   }
 }

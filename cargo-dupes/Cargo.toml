@@ -18,6 +18,7 @@ workspace = true
 dupes-core = { workspace = true, features = ["cli"] }
 dupes-rust = { workspace = true }
 clap = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
@@ -26,3 +27,6 @@ predicates = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 cargo-husky = { workspace = true }
+strict-test-support = { workspace = true }
+syn = { workspace = true }
+proc-macro2 = { workspace = true }

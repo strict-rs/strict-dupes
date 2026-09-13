@@ -1,562 +1,662 @@
-use super::*;
+//! Native Rust normalization contracts, with complete values retained on assertion failure.
 
-fn parse_expr(code: &str) -> syn::Expr {
-  syn::parse_str::<syn::Expr>(code).unwrap()
+use dupes_core::fingerprint::Fingerprint;
+use strict_test_support::TestFailure;
+use strict_test_support::ensure;
+use syn::parse::Parse;
+
+use super::LiteralKind;
+use super::NodeKind;
+use super::NormalizationContext;
+use super::NormalizedNode;
+use super::count_nodes;
+use super::normalize_expr;
+use super::normalize_impl_block;
+use super::normalize_item_fn;
+use super::normalize_type;
+use super::reindex_placeholders;
+
+/// One method's complete name, normalized signature, and body.
+type NormalizedMethod = (String, NormalizedNode, NormalizedNode);
+
+/// Native fixture failures and complete observations that violated a behavior contract.
+#[derive(Debug, thiserror::Error)]
+enum NormalizerTestFailure {
+  /// Rust parsing rejected the exact supplied fixture.
+  #[error("fixture {input:?} was rejected: {source}")]
+  Parse {
+    /// Complete input supplied to syn.
+    input:  String,
+    /// Native parser diagnostic.
+    source: syn::Error,
+  },
+  /// Normalized values failed the requested semantic comparison.
+  #[error("normalization expectation failed: {source}; nodes: {nodes:?}")]
+  Nodes {
+    /// Complete observed nodes in comparison order.
+    nodes:  Vec<NormalizedNode>,
+    /// Failed behavioral assertion.
+    source: TestFailure,
+  },
+  /// Implementation methods differed from their expected names and order.
+  #[error("method expectation failed: {source}; methods: {methods:?}")]
+  Methods {
+    /// Complete normalized methods, including signatures and bodies.
+    methods: Vec<NormalizedMethod>,
+    /// Failed behavioral assertion.
+    source:  TestFailure,
+  },
+  /// The fixture's normalized body lacked the required conditional branch.
+  #[error("the normalized function lacks its conditional branch: {body:?}")]
+  MissingBranch {
+    /// Complete normalized body returned by the real function normalizer.
+    body: Box<NormalizedNode>,
+  },
 }
 
-fn parse_fn(code: &str) -> syn::ItemFn {
-  syn::parse_str::<syn::ItemFn>(code).unwrap()
+/// Parse a fixture while retaining its exact input and native diagnostic.
+fn parse_fixture<T: Parse>(input: &str) -> Result<T, NormalizerTestFailure> {
+  syn::parse_str(input).map_err(|source| NormalizerTestFailure::Parse {
+    input: input.to_owned(),
+    source,
+  })
 }
 
-fn normalize_code_expr(code: &str) -> NormalizedNode {
-  let expr = parse_expr(code);
-  let mut ctx = NormalizationContext::new();
-  normalize_expr(&expr, &mut ctx)
+/// Normalize an expression using a fresh context at the public Rust boundary.
+fn normalize_code_expr(input: &str) -> Result<NormalizedNode, NormalizerTestFailure> {
+  let expression: syn::Expr = parse_fixture(input)?;
+  Ok(normalize_expr(&expression, &mut NormalizationContext::new()))
 }
 
-// jscpd:ignore-start
-
-#[test]
-fn renamed_variables_produce_identical_trees() {
-  let code1 = "fn foo(x: i32) -> i32 { let y = x + 1; y }";
-  let code2 = "fn bar(a: i32) -> i32 { let b = a + 1; b }";
-  let f1 = parse_fn(code1);
-  let f2 = parse_fn(code2);
-  let (sig1, body1) = normalize_item_fn(&f1);
-  let (sig2, body2) = normalize_item_fn(&f2);
-  assert_eq!(sig1, sig2);
-  assert_eq!(body1, body2);
+/// Preserve the signature and body produced by one parsed function.
+fn normalize_function(input: &str) -> Result<(NormalizedNode, NormalizedNode), NormalizerTestFailure> {
+  let function: syn::ItemFn = parse_fixture(input)?;
+  Ok(normalize_item_fn(&function))
 }
 
-// jscpd:ignore-end
-
-#[test]
-fn structural_changes_produce_different_trees() {
-  let code1 = "fn foo(x: i32) -> i32 { x + 1 }";
-  let code2 = "fn foo(x: i32) -> i32 { x * 1 }";
-  let f1 = parse_fn(code1);
-  let f2 = parse_fn(code2);
-  let (_, body1) = normalize_item_fn(&f1);
-  let (_, body2) = normalize_item_fn(&f2);
-  assert_ne!(body1, body2);
+/// Assert a semantic contract without losing any observed normalized values.
+fn check_nodes<const COUNT: usize>(
+  nodes: [NormalizedNode; COUNT],
+  check: impl FnOnce([&NormalizedNode; COUNT]) -> Result<(), TestFailure>,
+) -> Result<(), NormalizerTestFailure> {
+  check(nodes.each_ref()).map_err(|source| NormalizerTestFailure::Nodes {
+    nodes: Vec::from(nodes),
+    source,
+  })
 }
 
-#[test]
-fn literal_kind_preserved_but_value_erased() {
-  let n1 = normalize_code_expr("42");
-  let n2 = normalize_code_expr("99");
-  let n3 = normalize_code_expr("3.14");
-  assert_eq!(n1, n2); // both are Int
-  assert_ne!(n1, n3); // Int vs Float
+/// Compare complete normalized nodes against an independently supplied equality expectation.
+fn check_relation(original: NormalizedNode, compared: NormalizedNode, equal: bool) -> Result<(), NormalizerTestFailure> {
+  check_nodes([original, compared], |[first, second]| {
+    ensure(
+      (first == second) == equal,
+      "normalized values preserve the expected semantic relation",
+    )
+  })
 }
 
-#[test]
-fn string_literals_are_equal() {
-  let n1 = normalize_code_expr("\"hello\"");
-  let n2 = normalize_code_expr("\"world\"");
-  assert_eq!(n1, n2);
+/// Compare the semantic kind and child count of a real expression fixture.
+fn check_shape(input: &str, kind: &NodeKind, children: usize) -> Result<(), NormalizerTestFailure> {
+  check_nodes([normalize_code_expr(input)?], |[node]| {
+    ensure(
+      (&node.kind, node.children.len()) == (kind, children),
+      "the expression retains its semantic kind and ordered child slots",
+    )
+  })
 }
 
-#[test]
-fn bool_literals_normalize_as_placeholders() {
-  let n1 = normalize_code_expr("true");
-  let n2 = normalize_code_expr("false");
-  assert_eq!(n1, n2);
-}
-
-#[test]
-fn multi_segment_expression_paths_are_path_nodes() {
-  let n = normalize_code_expr("foo::bar");
-  assert_eq!(n.kind, NodeKind::Path);
-  assert_eq!(n.children.len(), 2);
-}
-
-#[test]
-fn multi_segment_type_paths_are_type_path_nodes() {
-  let ty: syn::Type = syn::parse_str("std::vec::Vec<i32>").unwrap();
-  let mut ctx = NormalizationContext::new();
-  let n = normalize_type(&ty, &mut ctx);
-  assert_eq!(n.kind, NodeKind::TypePath);
-  assert_eq!(n.children.len(), 3);
-}
-
-#[test]
-fn binary_ops_preserved() {
-  let n1 = normalize_code_expr("a + b");
-  let n2 = normalize_code_expr("a - b");
-  assert_ne!(n1, n2);
-}
-
-#[test]
-fn method_calls_normalized() {
-  let code1 = "x.foo(y)";
-  let code2 = "a.foo(b)";
-  let n1 = normalize_code_expr(code1);
-  let n2 = normalize_code_expr(code2);
-  assert_eq!(n1, n2);
-}
-
-#[test]
-fn method_name_preserved_as_token() {
-  let node = normalize_code_expr("x.foo(y)");
-  assert_eq!(node.kind, NodeKind::MethodCall);
-  assert_eq!(node.children[1].kind, NodeKind::Token("foo".to_string()));
-}
-
-#[test]
-fn different_method_names_get_different_fingerprints() {
-  let n1 = normalize_code_expr("ch.is_ascii_alphabetic()");
-  let n2 = normalize_code_expr("ch.is_ascii_alphanumeric()");
-  assert_ne!(n1, n2);
-  assert_ne!(
-    dupes_core::fingerprint::Fingerprint::from_node(&n1),
-    dupes_core::fingerprint::Fingerprint::from_node(&n2)
-  );
-}
-
-#[test]
-fn method_call_fingerprint_pin() {
-  // The registry (.dupes-ignore.toml) records fingerprints from this
-  // method-name-preserving regime; any change to this value means every
-  // registered entry just went stale.
-  let f = parse_fn("fn probe(x: &str) -> usize { x.trim().len() + 1 }");
-  let (_, body) = normalize_item_fn(&f);
-  assert_eq!(dupes_core::fingerprint::Fingerprint::from_node(&body).to_hex(), "80a3bfe1fbf90075");
-}
-
-#[test]
-fn if_else_structure_preserved() {
-  let code1 = "if x > 0 { x } else { -x }";
-  let code2 = "if a > 0 { a } else { -a }";
-  let n1 = normalize_code_expr(code1);
-  let n2 = normalize_code_expr(code2);
-  assert_eq!(n1, n2);
-}
-
-#[test]
-fn if_vs_if_else_different() {
-  let code1 = "if x > 0 { x }";
-  let code2 = "if x > 0 { x } else { 0 }";
-  let n1 = normalize_code_expr(code1);
-  let n2 = normalize_code_expr(code2);
-  assert_ne!(n1, n2);
-}
-
-#[test]
-fn match_arms_normalized() {
-  let code = r#"match x { 0 => "zero", _ => "other" }"#;
-  let n = normalize_code_expr(code);
-  // Match -> [expr, arm0, arm1]
-  assert_eq!(n.kind, NodeKind::Match);
-  // children[0] is expr, children[1..] are arms
-  assert_eq!(n.children.len(), 3); // expr + 2 arms
-}
-
-#[test]
-fn closures_normalized() {
-  let code1 = "|x| x + 1";
-  let code2 = "|y| y + 1";
-  let n1 = normalize_code_expr(code1);
-  let n2 = normalize_code_expr(code2);
-  assert_eq!(n1, n2);
-}
-
-#[test]
-fn for_loops_normalized() {
-  let code1 = "for i in 0..10 { println!(\"hello\") }";
-  let code2 = "for j in 0..10 { println!(\"world\") }";
-  let n1 = normalize_code_expr(code1);
-  let n2 = normalize_code_expr(code2);
-  assert_eq!(n1, n2);
-}
-
-#[test]
-fn node_counting_works() {
-  let code = "fn foo(x: i32) -> i32 { x + 1 }";
-  let f = parse_fn(code);
-  let (sig, body) = normalize_item_fn(&f);
-  let sig_count = count_nodes(&sig);
-  let body_count = count_nodes(&body);
-  assert!(sig_count > 0);
-  assert!(body_count > 0);
-}
-
-#[test]
-fn tuple_pattern_normalized() {
-  let code1 = "fn foo() { let (a, b) = (1, 2); }";
-  let code2 = "fn bar() { let (x, y) = (1, 2); }";
-  let f1 = parse_fn(code1);
-  let f2 = parse_fn(code2);
-  let (_, body1) = normalize_item_fn(&f1);
-  let (_, body2) = normalize_item_fn(&f2);
-  assert_eq!(body1, body2);
-}
-
-#[test]
-fn reference_expressions_normalized() {
-  let n1 = normalize_code_expr("&x");
-  let n2 = normalize_code_expr("&mut x");
-  assert_ne!(n1, n2); // mutability matters
-}
-
-#[test]
-fn impl_block_methods_normalized() {
-  let code = r"
-        impl Foo {
-            fn bar(&self) -> i32 { self.x + 1 }
-            fn baz(&mut self, val: i32) { self.x = val; }
-        }
-    ";
-  let item: syn::ItemImpl = syn::parse_str(code).unwrap();
-  let methods = normalize_impl_block(&item);
-  assert_eq!(methods.len(), 2);
-  assert_eq!(methods[0].0, "bar");
-  assert_eq!(methods[1].0, "baz");
-}
-
-#[test]
-fn cast_expression_normalized() {
-  let n = normalize_code_expr("x as f64");
-  assert_eq!(n.kind, NodeKind::Cast);
-}
-
-#[test]
-fn index_expression_normalized() {
-  let n = normalize_code_expr("arr[0]");
-  assert_eq!(n.kind, NodeKind::Index);
-}
-
-#[test]
-fn await_expression_normalized() {
-  let n = normalize_code_expr("fut.await");
-  assert_eq!(n.kind, NodeKind::Await);
-}
-
-#[test]
-fn try_expression_normalized() {
-  let n = normalize_code_expr("result?");
-  assert_eq!(n.kind, NodeKind::Try);
-}
-
-#[test]
-fn range_expression_normalized() {
-  let n = normalize_code_expr("0..10");
-  // Range -> [from_or_None, to_or_None]
-  assert_eq!(n.kind, NodeKind::Range);
-  assert_eq!(n.children.len(), 2);
-  assert!(!n.children[0].is_none());
-  assert!(!n.children[1].is_none());
-}
-
-// jscpd:ignore-start
-
-#[test]
-fn complex_function_normalization() {
-  let code1 = r"
-        fn process(data: Vec<i32>) -> Result<i32, String> {
-            let mut sum = 0;
-            for item in data.iter() {
-                if *item > 0 {
-                    sum += *item;
-                }
-            }
-            Ok(sum)
-        }
-    ";
-  let code2 = r"
-        fn compute(values: Vec<i32>) -> Result<i32, String> {
-            let mut total = 0;
-            for val in values.iter() {
-                if *val > 0 {
-                    total += *val;
-                }
-            }
-            Ok(total)
-        }
-    ";
-  let f1 = parse_fn(code1);
-  let f2 = parse_fn(code2);
-  let (sig1, body1) = normalize_item_fn(&f1);
-  let (sig2, body2) = normalize_item_fn(&f2);
-  assert_eq!(sig1, sig2);
-  assert_eq!(body1, body2);
-}
-
-// jscpd:ignore-end
-
-#[test]
-fn macro_invocations_produce_macro_call() {
-  let n = normalize_code_expr("println!(\"hello\")");
-  match &n.kind {
-    NodeKind::MacroCall {
-      name,
-    } => {
-      assert_eq!(name, "println");
-      assert_eq!(n.children.len(), 1);
-      assert_eq!(n.children[0], NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Str)));
-    }
-    _ => panic!("Expected MacroCall node, got {n:?}"),
-  }
-}
-
-#[test]
-fn different_macro_names_produce_different_nodes() {
-  let n1 = normalize_code_expr("println!(\"hello\")");
-  let n2 = normalize_code_expr("eprintln!(\"hello\")");
-  assert_ne!(n1, n2);
-}
-
-#[test]
-fn same_macro_different_literal_values_are_equal() {
-  let n1 = normalize_code_expr("println!(\"hello\")");
-  let n2 = normalize_code_expr("println!(\"world\")");
-  assert_eq!(n1, n2);
-}
-
-#[test]
-fn same_macro_different_arg_count_are_different() {
-  let n1 = normalize_code_expr("println!(\"a\")");
-  let n2 = normalize_code_expr("println!(\"a\", \"b\")");
-  assert_ne!(n1, n2);
-}
-
-#[test]
-fn vec_macro_normalized() {
-  let n = normalize_code_expr("vec![1, 2, 3]");
-  match &n.kind {
-    NodeKind::MacroCall {
-      name,
-    } => {
-      assert_eq!(name, "vec");
-      assert_eq!(n.children.len(), 3);
-    }
-    _ => panic!("Expected MacroCall node, got {n:?}"),
-  }
-}
-
-#[test]
-fn multi_segment_macro_path_uses_last_segment() {
-  let n = normalize_code_expr("std::println!(\"hello\")");
-  match &n.kind {
-    NodeKind::MacroCall {
-      name,
-    } => {
-      assert_eq!(name, "println");
-    }
-    _ => panic!("Expected MacroCall node, got {n:?}"),
-  }
-}
-
-#[test]
-fn macro_call_node_count() {
-  let n = normalize_code_expr("println!(\"a\", \"b\")");
-  // 1 for MacroCall + 2 args (Literal each = 1)
-  assert_eq!(count_nodes(&n), 3);
-}
-
-#[test]
-fn unparseable_macro_args_produce_opaque() {
-  let n = normalize_code_expr("vec![x; 10]");
-  match &n.kind {
-    NodeKind::MacroCall {
-      name,
-    } => {
-      assert_eq!(name, "vec");
-      assert_eq!(n.children.len(), 1);
-      assert_eq!(n.children[0], NormalizedNode::leaf(NodeKind::Opaque));
-    }
-    _ => panic!("Expected MacroCall node, got {n:?}"),
-  }
-}
-
-#[test]
-fn unparseable_macro_differs_from_no_args() {
-  let n_empty = normalize_code_expr("my_macro!()");
-  let n_unparseable = normalize_code_expr("vec![x; 10]");
-  match (&n_empty.kind, &n_unparseable.kind) {
-    (
-      NodeKind::MacroCall {
-        ..
-      },
-      NodeKind::MacroCall {
-        ..
-      },
-    ) => {
-      assert!(n_empty.children.is_empty());
-      assert_eq!(n_unparseable.children.len(), 1);
-      assert_eq!(n_unparseable.children[0], NormalizedNode::leaf(NodeKind::Opaque));
-    }
-    _ => panic!("Expected MacroCall nodes"),
-  }
-}
-
-#[test]
-fn type_position_macro_normalized() {
-  let code = "fn foo() -> my_type!(i32) {}";
-  if let Ok(f) = syn::parse_str::<syn::ItemFn>(code) {
-    let (sig, _) = normalize_item_fn(&f);
-    assert!(count_nodes(&sig) > 0);
-  }
-}
-
-#[test]
-fn pat_macro_normalized() {
-  let code = "fn foo(x: i32) { match x { my_pat!(x) => {} _ => {} } }";
-  if let Ok(f) = syn::parse_str::<syn::ItemFn>(code) {
-    let (_, body) = normalize_item_fn(&f);
-    assert!(count_nodes(&body) > 0);
-  }
-}
-
-#[test]
-fn while_loop_normalized() {
-  let code1 = "while x > 0 { x = x - 1; }";
-  let code2 = "while a > 0 { a = a - 1; }";
-  let n1 = normalize_code_expr(code1);
-  let n2 = normalize_code_expr(code2);
-  assert_eq!(n1, n2);
-}
-
-#[test]
-fn return_expression_normalized() {
-  let n1 = normalize_code_expr("return 42");
-  let n2 = normalize_code_expr("return 99");
-  assert_eq!(n1, n2); // both return Int literals
-}
-
-#[test]
-fn assign_expression_normalized() {
-  let n = normalize_code_expr("x = 5");
-  assert_eq!(n.kind, NodeKind::Assign);
-}
-
-#[test]
-fn struct_init_normalized() {
-  let code1 = "Foo { x: 1, y: 2 }";
-  let code2 = "Bar { a: 1, b: 2 }";
-  let n1 = normalize_code_expr(code1);
-  let n2 = normalize_code_expr(code2);
-  // Both have StructInit; children[0] is rest_or_None, rest are fields
-  assert_eq!(n1.kind, NodeKind::StructInit);
-  assert_eq!(n2.kind, NodeKind::StructInit);
-  // Same number of fields
-  assert_eq!(n1.children.len(), n2.children.len());
-}
-
-#[test]
-fn array_expression_normalized() {
-  let n = normalize_code_expr("[1, 2, 3]");
-  assert_eq!(n.kind, NodeKind::Array);
-  assert_eq!(n.children.len(), 3);
-}
-
-#[test]
-fn tuple_expression_normalized() {
-  let n = normalize_code_expr("(1, 2, 3)");
-  assert_eq!(n.kind, NodeKind::Tuple);
-  assert_eq!(n.children.len(), 3);
-}
-
-#[test]
-fn field_access_normalized() {
-  let n = normalize_code_expr("foo.bar");
-  assert_eq!(n.kind, NodeKind::FieldAccess);
-}
-
-#[test]
-fn unary_ops_preserved() {
-  let n1 = normalize_code_expr("!x");
-  let n2 = normalize_code_expr("-x");
-  assert_ne!(n1, n2);
-}
-
-#[test]
-fn loop_normalized() {
-  let code = "loop { break; }";
-  let n = normalize_code_expr(code);
-  assert_eq!(n.kind, NodeKind::Loop);
-}
-
-#[test]
-fn empty_block_normalized() {
-  let code = "fn foo() {}";
-  let f = parse_fn(code);
-  let (_, body) = normalize_item_fn(&f);
-  assert_eq!(body.kind, NodeKind::Block);
-  assert!(body.children.is_empty());
-}
-
-#[test]
-fn break_expression_normalized() {
-  let with_value = normalize_code_expr("loop { break 42; }");
-  let without_value = normalize_code_expr("loop { break; }");
-  assert_ne!(with_value, without_value);
-  assert_eq!(normalize_code_expr("loop { break 42; }"), normalize_code_expr("loop { break 99; }"),);
-}
-
-#[test]
-fn paren_expression_normalized() {
-  let n = normalize_code_expr("(x + 1)");
-  assert_eq!(n.kind, NodeKind::Paren);
-  assert_eq!(n.children.len(), 1);
-}
-
-#[test]
-fn repeat_expression_normalized() {
-  let n = normalize_code_expr("[0; 16]");
-  assert_eq!(n.kind, NodeKind::Repeat);
-  assert_eq!(n.children.len(), 2);
-}
-
-#[test]
-fn or_and_slice_patterns_normalized() {
-  assert_ne!(
-    normalize_code_expr("match x { 1 | 2 => 0, _ => 1 }"),
-    normalize_code_expr("match x { [first, rest @ ..] => 0, _ => 1 }"),
-    "or-patterns and slice patterns keep distinct shapes"
-  );
-  assert_eq!(
-    normalize_code_expr("match x { [a, b] => 0, _ => 1 }"),
-    normalize_code_expr("match y { [c, d] => 0, _ => 1 }"),
-  );
-}
-
-#[test]
-fn type_reference_and_slice_normalized() {
-  let f1 = parse_fn("fn foo(values: &[i32]) -> &mut i32 { unimplemented!() }");
-  let f2 = parse_fn("fn bar(items: &[u64]) -> &mut u64 { unimplemented!() }");
-  let (sig1, _) = normalize_item_fn(&f1);
-  let (sig2, _) = normalize_item_fn(&f2);
-  assert_eq!(sig1, sig2);
-
-  let f3 = parse_fn("fn baz(values: &mut [i32]) -> &i32 { unimplemented!() }");
-  let (sig3, _) = normalize_item_fn(&f3);
-  assert_ne!(sig1, sig3, "mutability is preserved in reference types");
-}
-
-#[test]
-fn reindex_from_real_function_subtrees() {
-  let f1 = parse_fn("fn foo(x: i32, y: i32) -> i32 { if x > 0 { let z = y + 1; z } else { x } }");
-  let f2 = parse_fn("fn bar(unused: i32, a: i32, b: i32) -> i32 { if a > 0 { let c = b + 1; c } else { a } }");
-  let (_, body1) = normalize_item_fn(&f1);
-  let (_, body2) = normalize_item_fn(&f2);
-
-  // Extract the then_branch from each: Block -> stmts[0] -> If -> children[1]
-  let then1 = match &body1.kind {
-    NodeKind::Block => match &body1.children[0].kind {
-      NodeKind::If => body1.children[0].children[1].clone(),
-      _ => panic!("expected If"),
+/// Compare both normalized parts across a complete function-renaming fixture pair.
+fn check_function_renaming(first: &str, second: &str) -> Result<(), NormalizerTestFailure> {
+  let (first_signature, first_body) = normalize_function(first)?;
+  let (second_signature, second_body) = normalize_function(second)?;
+  check_nodes(
+    [first_signature, first_body, second_signature, second_body],
+    |[original_signature, original_body, renamed_signature, renamed_body]| {
+      ensure(
+        (original_signature, original_body) == (renamed_signature, renamed_body),
+        "renaming preserves the complete signature and body",
+      )
     },
-    _ => panic!("expected Block"),
-  };
-  let then2 = match &body2.kind {
-    NodeKind::Block => match &body2.children[0].kind {
-      NodeKind::If => body2.children[0].children[1].clone(),
-      _ => panic!("expected If"),
-    },
-    _ => panic!("expected Block"),
-  };
+  )
+}
 
-  assert_ne!(then1, then2);
-  assert_eq!(reindex_placeholders(&then1), reindex_placeholders(&then2));
+/// Describe a complete expected macro node independently of parsing its arguments.
+fn macro_node(name: &str, children: Vec<NormalizedNode>) -> NormalizedNode {
+  NormalizedNode::with_children(
+    NodeKind::MacroCall {
+      name: name.to_owned()
+    },
+    children,
+  )
+}
+
+/// Renaming function names and bindings preserves both signature and body.
+#[test]
+fn renamed_variables_produce_identical_trees() -> Result<(), NormalizerTestFailure> {
+  check_function_renaming(
+    "fn foo(x: i32) -> i32 { let y = x + 1; y }",
+    "fn bar(a: i32) -> i32 { let b = a + 1; b }",
+  )
+}
+
+/// Changing a function's arithmetic changes its body.
+#[test]
+fn structural_changes_produce_different_trees() -> Result<(), NormalizerTestFailure> {
+  let (_, first) = normalize_function("fn foo(x: i32) -> i32 { x + 1 }")?;
+  let (_, second) = normalize_function("fn foo(x: i32) -> i32 { x * 1 }")?;
+  check_relation(first, second, false)
+}
+
+/// Integer values normalize together while floating literals remain distinct.
+#[test]
+fn literal_kind_preserved_but_value_erased() -> Result<(), NormalizerTestFailure> {
+  check_nodes(
+    [
+      normalize_code_expr("42")?,
+      normalize_code_expr("99")?,
+      normalize_code_expr("3.14")?,
+    ],
+    |[first, second, floating]| {
+      ensure(
+        first == second && first != floating,
+        "literal normalization erases values while preserving their kinds",
+      )
+    },
+  )
+}
+
+/// Distinct string values have the same literal representation.
+#[test]
+fn string_literals_are_equal() -> Result<(), NormalizerTestFailure> {
+  check_relation(normalize_code_expr("\"hello\"")?, normalize_code_expr("\"world\"")?, true)
+}
+
+/// Boolean values share their normalized literal representation.
+#[test]
+fn bool_literals_normalize_as_placeholders() -> Result<(), NormalizerTestFailure> {
+  check_relation(normalize_code_expr("true")?, normalize_code_expr("false")?, true)
+}
+
+/// Expression paths retain each segment beneath a path node.
+#[test]
+fn multi_segment_expression_paths_are_path_nodes() -> Result<(), NormalizerTestFailure> {
+  check_shape("foo::bar", &NodeKind::Path, 2)
+}
+
+/// Type paths retain their three source segments.
+#[test]
+fn multi_segment_type_paths_are_type_path_nodes() -> Result<(), NormalizerTestFailure> {
+  let ty: syn::Type = parse_fixture("std::vec::Vec<i32>")?;
+  check_nodes([normalize_type(&ty, &mut NormalizationContext::new())], |[node]| {
+    ensure(
+      node.kind == NodeKind::TypePath && node.children.len() == 3,
+      "type paths preserve their segment structure",
+    )
+  })
+}
+
+/// Addition and subtraction retain distinct operators.
+#[test]
+fn binary_ops_preserved() -> Result<(), NormalizerTestFailure> {
+  check_relation(normalize_code_expr("a + b")?, normalize_code_expr("a - b")?, false)
+}
+
+/// Renamed receivers and arguments preserve an otherwise identical method call.
+#[test]
+fn method_calls_normalized() -> Result<(), NormalizerTestFailure> {
+  check_relation(normalize_code_expr("x.foo(y)")?, normalize_code_expr("a.foo(b)")?, true)
+}
+
+/// The method token occupies the slot between receiver and arguments.
+#[test]
+fn method_name_preserved_as_token() -> Result<(), NormalizerTestFailure> {
+  check_nodes([normalize_code_expr("x.foo(y)")?], |[node]| {
+    ensure(
+      node.kind == NodeKind::MethodCall
+        && node
+          .children
+          .get(1)
+          .is_some_and(|method| method.kind == NodeKind::Token("foo".to_owned())),
+      "the method name remains a semantic token in its established slot",
+    )
+  })
+}
+
+/// Distinct method names change both normalized trees and content identities.
+#[test]
+fn different_method_names_get_different_fingerprints() -> Result<(), NormalizerTestFailure> {
+  check_nodes(
+    [
+      normalize_code_expr("ch.is_ascii_alphabetic()")?,
+      normalize_code_expr("ch.is_ascii_alphanumeric()")?,
+    ],
+    |[first, second]| {
+      ensure(
+        first != second && Fingerprint::from_node(first) != Fingerprint::from_node(second),
+        "method identity remains part of the fingerprint",
+      )
+    },
+  )
+}
+
+/// Existing ignore registries depend on this method-name-preserving identity.
+#[test]
+fn method_call_fingerprint_pin() -> Result<(), NormalizerTestFailure> {
+  let (_, body) = normalize_function("fn probe(x: &str) -> usize { x.trim().len() + 1 }")?;
+  check_nodes([body], |[observed]| {
+    ensure(
+      Fingerprint::from_node(observed).to_hex() == "80a3bfe1fbf90075",
+      "preserve the recorded method-call fingerprint",
+    )
+  })
+}
+
+/// Renaming a conditional's bindings preserves both branch structures.
+#[test]
+fn if_else_structure_preserved() -> Result<(), NormalizerTestFailure> {
+  check_relation(
+    normalize_code_expr("if x > 0 { x } else { -x }")?,
+    normalize_code_expr("if a > 0 { a } else { -a }")?,
+    true,
+  )
+}
+
+/// A missing alternative differs from an explicit else branch.
+#[test]
+fn if_vs_if_else_different() -> Result<(), NormalizerTestFailure> {
+  check_relation(
+    normalize_code_expr("if x > 0 { x }")?,
+    normalize_code_expr("if x > 0 { x } else { 0 }")?,
+    false,
+  )
+}
+
+/// A match contains its subject followed by both arms.
+#[test]
+fn match_arms_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape(r#"match x { 0 => "zero", _ => "other" }"#, &NodeKind::Match, 3)
+}
+
+/// Closure parameter renaming preserves its body relationship.
+#[test]
+fn closures_normalized() -> Result<(), NormalizerTestFailure> {
+  check_relation(normalize_code_expr("|x| x + 1")?, normalize_code_expr("|y| y + 1")?, true)
+}
+
+/// Loop binding names and string values normalize consistently.
+#[test]
+fn for_loops_normalized() -> Result<(), NormalizerTestFailure> {
+  check_relation(
+    normalize_code_expr("for i in 0..10 { println!(\"hello\") }")?,
+    normalize_code_expr("for j in 0..10 { println!(\"world\") }")?,
+    true,
+  )
+}
+
+/// Function signatures and bodies both contribute countable normalized nodes.
+#[test]
+fn node_counting_works() -> Result<(), NormalizerTestFailure> {
+  let parts = normalize_function("fn foo(x: i32) -> i32 { x + 1 }")?;
+  check_nodes(parts.into(), |[signature, body]| {
+    ensure(
+      count_nodes(signature) > 0 && count_nodes(body) > 0,
+      "both function parts contain normalized syntax",
+    )
+  })
+}
+
+/// Tuple binding renaming preserves the complete function body.
+#[test]
+fn tuple_pattern_normalized() -> Result<(), NormalizerTestFailure> {
+  let (_, first) = normalize_function("fn foo() { let (a, b) = (1, 2); }")?;
+  let (_, second) = normalize_function("fn bar() { let (x, y) = (1, 2); }")?;
+  check_relation(first, second, true)
+}
+
+/// Shared and mutable reference expressions remain distinct.
+#[test]
+fn reference_expressions_normalized() -> Result<(), NormalizerTestFailure> {
+  check_relation(normalize_code_expr("&x")?, normalize_code_expr("&mut x")?, false)
+}
+
+/// Impl normalization retains method names and their declaration order.
+#[test]
+fn impl_block_methods_normalized() -> Result<(), NormalizerTestFailure> {
+  let implementation: syn::ItemImpl =
+    parse_fixture("impl Foo { fn bar(&self) -> i32 { self.x + 1 } fn baz(&mut self, val: i32) { self.x = val; } }")?;
+  let methods = normalize_impl_block(&implementation);
+  ensure(
+    methods.iter().map(|method| method.0.as_str()).eq(["bar", "baz"]),
+    "both methods retain their names and source order",
+  )
+  .map_err(|source| NormalizerTestFailure::Methods {
+    methods,
+    source,
+  })
+}
+
+/// Casts retain their expression and target type.
+#[test]
+fn cast_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape("x as f64", &NodeKind::Cast, 2)
+}
+
+/// Indexing retains the indexed expression and index.
+#[test]
+fn index_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape("arr[0]", &NodeKind::Index, 2)
+}
+
+/// Await retains its future expression.
+#[test]
+fn await_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape("fut.await", &NodeKind::Await, 1)
+}
+
+/// Try retains its fallible operand.
+#[test]
+fn try_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape("result?", &NodeKind::Try, 1)
+}
+
+/// A bounded range retains both populated endpoint slots.
+#[test]
+fn range_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_nodes([normalize_code_expr("0..10")?], |[node]| {
+    ensure(
+      node.kind == NodeKind::Range && node.children.len() == 2 && node.children.iter().all(|child| !child.is_none()),
+      "bounded ranges preserve both endpoints",
+    )
+  })
+}
+
+/// Renaming a nested loop, conditional, and accumulation preserves complete function structure.
+#[test]
+fn complex_function_normalization() -> Result<(), NormalizerTestFailure> {
+  check_function_renaming(
+    "fn process(data: Vec<i32>) -> Result<i32, String> { let mut sum = 0; for item in data.iter() { if *item > 0 { sum += *item; } } \
+     Ok(sum) }",
+    "fn compute(values: Vec<i32>) -> Result<i32, String> { let mut total = 0; for val in values.iter() { if *val > 0 { total += *val; } } \
+     Ok(total) }",
+  )
+}
+
+/// An expression-list macro retains its name and normalized string argument.
+#[test]
+fn macro_invocations_produce_macro_call() -> Result<(), NormalizerTestFailure> {
+  check_relation(
+    normalize_code_expr("println!(\"hello\")")?,
+    macro_node("println", vec![NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Str))]),
+    true,
+  )
+}
+
+/// Changing a macro name changes its normalized node.
+#[test]
+fn different_macro_names_produce_different_nodes() -> Result<(), NormalizerTestFailure> {
+  check_relation(
+    normalize_code_expr("println!(\"hello\")")?,
+    normalize_code_expr("eprintln!(\"hello\")")?,
+    false,
+  )
+}
+
+/// Macro string values erase while their name and argument count remain equal.
+#[test]
+fn same_macro_different_literal_values_are_equal() -> Result<(), NormalizerTestFailure> {
+  check_relation(
+    normalize_code_expr("println!(\"hello\")")?,
+    normalize_code_expr("println!(\"world\")")?,
+    true,
+  )
+}
+
+/// Changing a macro's argument count changes its normalized node.
+#[test]
+fn same_macro_different_arg_count_are_different() -> Result<(), NormalizerTestFailure> {
+  check_relation(
+    normalize_code_expr("println!(\"a\")")?,
+    normalize_code_expr("println!(\"a\", \"b\")")?,
+    false,
+  )
+}
+
+/// A vector expression-list macro retains all three integer arguments.
+#[test]
+fn vec_macro_normalized() -> Result<(), NormalizerTestFailure> {
+  check_relation(
+    normalize_code_expr("vec![1, 2, 3]")?,
+    macro_node("vec", vec![NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)); 3]),
+    true,
+  )
+}
+
+/// A qualified macro path uses its final segment as its semantic name.
+#[test]
+fn multi_segment_macro_path_uses_last_segment() -> Result<(), NormalizerTestFailure> {
+  check_relation(
+    normalize_code_expr("std::println!(\"hello\")")?,
+    macro_node("println", vec![NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Str))]),
+    true,
+  )
+}
+
+/// Macro node counts include the macro node and both arguments.
+#[test]
+fn macro_call_node_count() -> Result<(), NormalizerTestFailure> {
+  check_nodes([normalize_code_expr("println!(\"a\", \"b\")")?], |[node]| {
+    ensure(count_nodes(node) == 3, "count the macro and both argument nodes")
+  })
+}
+
+/// Unsupported macro argument grammar remains an explicit opaque child.
+#[test]
+fn unparseable_macro_args_produce_opaque() -> Result<(), NormalizerTestFailure> {
+  check_relation(
+    normalize_code_expr("vec![x; 10]")?,
+    macro_node("vec", vec![NormalizedNode::leaf(NodeKind::Opaque)]),
+    true,
+  )
+}
+
+/// An empty macro and an unsupported macro body retain different complete shapes.
+#[test]
+fn unparseable_macro_differs_from_no_args() -> Result<(), NormalizerTestFailure> {
+  check_nodes(
+    [normalize_code_expr("my_macro!()")?, normalize_code_expr("vec![x; 10]")?],
+    |[empty, opaque]| {
+      ensure(
+        empty == &macro_node("my_macro", vec![]) && opaque == &macro_node("vec", vec![NormalizedNode::leaf(NodeKind::Opaque)]),
+        "empty arguments stay empty while unsupported arguments retain an opaque child",
+      )
+    },
+  )
+}
+
+/// A type-position macro parses and contributes to the signature.
+#[test]
+fn type_position_macro_normalized() -> Result<(), NormalizerTestFailure> {
+  let (signature, _) = normalize_function("fn foo() -> my_type!(i32) {}")?;
+  check_nodes([signature], |[observed]| {
+    ensure(count_nodes(observed) > 0, "a parsed type macro contributes signature syntax")
+  })
+}
+
+/// A pattern macro parses and contributes to the function body.
+#[test]
+fn pat_macro_normalized() -> Result<(), NormalizerTestFailure> {
+  let (_, body) = normalize_function("fn foo(x: i32) { match x { my_pat!(x) => {} _ => {} } }")?;
+  check_nodes([body], |[observed]| {
+    ensure(count_nodes(observed) > 0, "a parsed pattern macro contributes body syntax")
+  })
+}
+
+/// Renamed while-loop bindings preserve the condition and update body.
+#[test]
+fn while_loop_normalized() -> Result<(), NormalizerTestFailure> {
+  check_relation(
+    normalize_code_expr("while x > 0 { x = x - 1; }")?,
+    normalize_code_expr("while a > 0 { a = a - 1; }")?,
+    true,
+  )
+}
+
+/// Returned integer literal values erase consistently.
+#[test]
+fn return_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_relation(normalize_code_expr("return 42")?, normalize_code_expr("return 99")?, true)
+}
+
+/// Assignment retains its target and value.
+#[test]
+fn assign_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape("x = 5", &NodeKind::Assign, 2)
+}
+
+/// Renamed struct fields preserve the initializer kind and field population.
+#[test]
+fn struct_init_normalized() -> Result<(), NormalizerTestFailure> {
+  check_nodes(
+    [
+      normalize_code_expr("Foo { x: 1, y: 2 }")?,
+      normalize_code_expr("Bar { a: 1, b: 2 }")?,
+    ],
+    |[first, second]| {
+      ensure(
+        first.kind == NodeKind::StructInit && second.kind == NodeKind::StructInit && first.children.len() == second.children.len(),
+        "both struct initializers retain their field population",
+      )
+    },
+  )
+}
+
+/// Arrays retain each element.
+#[test]
+fn array_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape("[1, 2, 3]", &NodeKind::Array, 3)
+}
+
+/// Tuples retain each element.
+#[test]
+fn tuple_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape("(1, 2, 3)", &NodeKind::Tuple, 3)
+}
+
+/// Field access retains its base and field placeholder.
+#[test]
+fn field_access_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape("foo.bar", &NodeKind::FieldAccess, 2)
+}
+
+/// Logical negation and arithmetic negation remain distinct.
+#[test]
+fn unary_ops_preserved() -> Result<(), NormalizerTestFailure> {
+  check_relation(normalize_code_expr("!x")?, normalize_code_expr("-x")?, false)
+}
+
+/// Infinite loops retain their body.
+#[test]
+fn loop_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape("loop { break; }", &NodeKind::Loop, 1)
+}
+
+/// An empty function body remains an empty block.
+#[test]
+fn empty_block_normalized() -> Result<(), NormalizerTestFailure> {
+  let (_, body) = normalize_function("fn foo() {}")?;
+  check_nodes([body], |[observed]| {
+    ensure(
+      observed.kind == NodeKind::Block && observed.children.is_empty(),
+      "empty bodies remain empty blocks",
+    )
+  })
+}
+
+/// Break payload absence matters while integer payload values erase.
+#[test]
+fn break_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_nodes(
+    [
+      normalize_code_expr("loop { break 42; }")?,
+      normalize_code_expr("loop { break; }")?,
+      normalize_code_expr("loop { break 99; }")?,
+    ],
+    |[first, empty, second]| {
+      ensure(
+        first != empty && first == second,
+        "break retains payload presence and erases integer values",
+      )
+    },
+  )
+}
+
+/// Parenthesized expressions retain their wrapper and operand.
+#[test]
+fn paren_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape("(x + 1)", &NodeKind::Paren, 1)
+}
+
+/// Array repetition retains the element and repeat count expressions.
+#[test]
+fn repeat_expression_normalized() -> Result<(), NormalizerTestFailure> {
+  check_shape("[0; 16]", &NodeKind::Repeat, 2)
+}
+
+/// Or-patterns differ from slice patterns, while slice binding renaming preserves structure.
+#[test]
+fn or_and_slice_patterns_normalized() -> Result<(), NormalizerTestFailure> {
+  check_nodes(
+    [
+      normalize_code_expr("match x { 1 | 2 => 0, _ => 1 }")?,
+      normalize_code_expr("match x { [first, rest @ ..] => 0, _ => 1 }")?,
+      normalize_code_expr("match x { [a, b] => 0, _ => 1 }")?,
+      normalize_code_expr("match y { [c, d] => 0, _ => 1 }")?,
+    ],
+    |[alternatives, rest, first_slice, second_slice]| {
+      ensure(
+        alternatives != rest && first_slice == second_slice,
+        "pattern kinds remain distinct while binding names erase",
+      )
+    },
+  )
+}
+
+/// Reference type mutability remains significant when type and argument names erase.
+#[test]
+fn type_reference_and_slice_normalized() -> Result<(), NormalizerTestFailure> {
+  let (first, _) = normalize_function("fn foo(values: &[i32]) -> &mut i32 { unimplemented!() }")?;
+  let (second, _) = normalize_function("fn bar(items: &[u64]) -> &mut u64 { unimplemented!() }")?;
+  let (different, _) = normalize_function("fn baz(values: &mut [i32]) -> &i32 { unimplemented!() }")?;
+  check_nodes([first, second, different], |[original, renamed, changed]| {
+    ensure(
+      original == renamed && original != changed,
+      "type erasure preserves the direction of reference mutability",
+    )
+  })
+}
+
+/// Select the real then-branch only from the expected block and conditional structure.
+fn then_branch(body: NormalizedNode) -> Result<NormalizedNode, NormalizerTestFailure> {
+  let branch = body
+    .children
+    .first()
+    .filter(|conditional| body.kind == NodeKind::Block && conditional.kind == NodeKind::If)
+    .and_then(|conditional| conditional.children.get(1))
+    .cloned();
+  branch.ok_or_else(|| NormalizerTestFailure::MissingBranch {
+    body: Box::new(body)
+  })
+}
+
+/// Reindexing real function subtrees removes enclosing placeholder offsets.
+#[test]
+fn reindex_from_real_function_subtrees() -> Result<(), NormalizerTestFailure> {
+  let (_, first) = normalize_function("fn foo(x: i32, y: i32) -> i32 { if x > 0 { let z = y + 1; z } else { x } }")?;
+  let (_, second) = normalize_function("fn bar(unused: i32, a: i32, b: i32) -> i32 { if a > 0 { let c = b + 1; c } else { a } }")?;
+  check_nodes([then_branch(first)?, then_branch(second)?], |[original, renamed]| {
+    ensure(
+      original != renamed && reindex_placeholders(original) == reindex_placeholders(renamed),
+      "reindexing preserves subtree structure while removing enclosing index offsets",
+    )
+  })
 }

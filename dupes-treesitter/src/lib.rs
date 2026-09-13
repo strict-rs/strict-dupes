@@ -11,8 +11,8 @@
 //! For the simplest integration, construct a [`TreeSitterAnalyzer`] with your
 //! grammar, extraction query, and mapping, then pass it to `dupes_core::analyze()`.
 //!
-//! For lower-level access, call [`extract_code_units`] or [`normalize_ts_node`]
-//! directly.
+//! For lower-level access, configure a [`CodeUnitExtractor`] for parsed byte
+//! sources or call [`normalize_ts_node`] directly.
 
 pub mod analyzer;
 pub mod extractor;
@@ -35,7 +35,7 @@ pub use dupes_core::node::NormalizationContext;
 pub use dupes_core::node::NormalizedNode;
 pub use dupes_core::node::PlaceholderKind;
 pub use dupes_core::node::UnOpKind;
+pub use extractor::CodeUnitExtractor;
 pub use extractor::KindResolver;
-pub use extractor::extract_code_units;
 pub use mapping::NodeMapping;
 pub use normalizer::normalize_ts_node;

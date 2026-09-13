@@ -1,68 +1,73 @@
 //! The text reporter: the human-readable stats summary and group sections.
 
+use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::io;
+use std::path::PathBuf;
 
 use crate::AnalysisResult;
 use crate::grouper::DuplicateGroup;
 use crate::grouper::DuplicationStats;
 use crate::grouper::MatchKind;
+use crate::output::ReportError;
 use crate::output::ReportOptions;
 use crate::output::ReportSection;
 use crate::output::Reporter;
 use crate::output::display_path;
+use crate::output::displayed_similarity;
 
-fn format_with_commas(n: usize) -> String {
-  let s = n.to_string();
-  let mut result = String::with_capacity(s.len() + s.len() / 3);
-  for (i, c) in s.chars().enumerate() {
-    if i > 0 && (s.len() - i).is_multiple_of(3) {
+/// Render a source-line count with decimal thousands separators.
+#[allow(
+  clippy::single_call_fn,
+  reason = "The statistics formatter owns decimal grouping independently of report layout."
+)]
+fn format_with_commas(count: usize) -> String {
+  let digits = count.to_string();
+  let mut result = String::with_capacity(digits.len());
+  for (index, character) in digits.char_indices() {
+    if index > 0 && digits.len().saturating_sub(index).is_multiple_of(3) {
       result.push(',');
     }
-    result.push(c);
+    result.push(character);
   }
   result
 }
 
 /// Renders analysis results as human-readable text.
+#[derive(Debug)]
 pub struct TextReporter {
   /// Base path for displaying relative paths.
-  pub base_path: Option<std::path::PathBuf>,
+  pub base_path: Option<PathBuf>,
   /// Presentation options.
   pub options:   ReportOptions,
 }
 
-// jscpd:ignore-start
-
 impl TextReporter {
   /// Reporter with default presentation options.
   #[must_use]
-  pub const fn new(base_path: Option<std::path::PathBuf>) -> Self {
-    Self::with_options(base_path, ReportOptions {
-      show_suppressed: false,
-      verbose:         false,
-    })
+  pub const fn new(base_path: Option<PathBuf>) -> Self {
+    Self::with_options(base_path, ReportOptions::DEFAULT)
   }
 
   /// Reporter with explicit presentation options.
   #[must_use]
-  pub const fn with_options(base_path: Option<std::path::PathBuf>, options: ReportOptions) -> Self {
+  pub const fn with_options(base_path: Option<PathBuf>, options: ReportOptions) -> Self {
     Self {
       base_path,
       options,
     }
   }
 
-  // jscpd:ignore-end
-
+  /// Render a requested section, including its empty-state policy and group rows.
   fn write_groups(
     &self,
     groups: &[DuplicateGroup],
-    writer: &mut dyn io::Write,
+    writer: &mut impl io::Write,
     title: &str,
     empty_message: Option<&str>,
     show_similarity: bool,
     show_parent: bool,
-  ) -> io::Result<()> {
+  ) -> Result<(), ReportError> {
     if groups.is_empty() {
       if let Some(msg) = empty_message {
         writeln!(writer, "{msg}")?;
@@ -74,88 +79,107 @@ impl TextReporter {
     writeln!(writer, "{}", "=".repeat(title.len()))?;
     writeln!(writer)?;
 
-    for (i, group) in groups.iter().enumerate() {
-      let fp = group.fingerprint.to_hex();
-      let rule = group
-        .suppressed
-        .map(|rule| format!(" [rule: {}]", rule.as_str()))
-        .unwrap_or_default();
-      if show_similarity {
-        writeln!(
-          writer,
-          "Group {} (fingerprint: {}, similarity: {:.0}%, {} members):{}",
-          i + 1,
-          fp,
-          group.similarity * 100.0,
-          group.members.len(),
-          rule,
-        )?;
-      } else {
-        writeln!(
-          writer,
-          "Group {} (fingerprint: {}, {} members):{}",
-          i + 1,
-          fp,
-          group.members.len(),
-          rule,
-        )?;
-      }
-      for member in &group.members {
-        let parent = if show_parent {
-          member.parent_name.as_deref().map(|p| format!(" in {p}")).unwrap_or_default()
-        } else {
-          String::new()
-        };
-        let marker = if group.suppressed.is_none() {
-          member
-            .suppressed
-            .map(|rule| format!(" [suppressed: {}]", rule.as_str()))
-            .unwrap_or_default()
-        } else {
-          String::new()
-        };
-        writeln!(
-          writer,
-          "  - {} ({}){} at {}:{}-{}{}",
-          member.name,
-          member.kind,
-          parent,
-          display_path(self.base_path.as_deref(), &member.file),
-          member.line_start,
-          member.line_end,
-          marker,
-        )?;
-      }
-      if self.options.show_suppressed {
-        for note in &group.also_seen {
-          writeln!(
-            writer,
-            "  also seen as: {} {} {} group(s)",
-            note.group_count, note.dimension, note.match_kind,
-          )?;
-        }
-      }
-      writeln!(writer)?;
+    for (index, group) in groups.iter().enumerate() {
+      self.write_group(group, index, writer, show_similarity, show_parent)?;
     }
     Ok(())
   }
 
+  /// Render one group's identity, member locations, and requested cross-dimension notes.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "Each report section reuses the same complete group rendering contract."
+  )]
+  fn write_group(
+    &self,
+    group: &DuplicateGroup,
+    index: usize,
+    writer: &mut impl io::Write,
+    show_similarity: bool,
+    show_parent: bool,
+  ) -> Result<(), ReportError> {
+    let fp = group.fingerprint.to_hex();
+    let group_rule = group
+      .suppressed
+      .map(|rule| format!(" [rule: {}]", rule.as_str()))
+      .unwrap_or_default();
+    if show_similarity {
+      let percentage = displayed_similarity(group, 100.0)?;
+      writeln!(
+        writer,
+        "Group {} (fingerprint: {}, similarity: {:.0}%, {} members):{}",
+        index.saturating_add(1),
+        fp,
+        percentage,
+        group.members.len(),
+        group_rule,
+      )?;
+    } else {
+      writeln!(
+        writer,
+        "Group {} (fingerprint: {}, {} members):{}",
+        index.saturating_add(1),
+        fp,
+        group.members.len(),
+        group_rule,
+      )?;
+    }
+    for member in &group.members {
+      let parent = if show_parent {
+        member
+          .parent_name
+          .as_deref()
+          .map(|parent_name| format!(" in {parent_name}"))
+          .unwrap_or_default()
+      } else {
+        String::new()
+      };
+      let marker = if group.suppressed.is_none() {
+        member
+          .suppressed
+          .map(|rule| format!(" [suppressed: {}]", rule.as_str()))
+          .unwrap_or_default()
+      } else {
+        String::new()
+      };
+      writeln!(
+        writer,
+        "  - {} ({}){} at {}:{}-{}{}",
+        member.name,
+        member.kind,
+        parent,
+        display_path(self.base_path.as_deref(), &member.file),
+        member.line_start,
+        member.line_end,
+        marker,
+      )?;
+    }
+    if self.options.show_suppressed {
+      for note in &group.also_seen {
+        writeln!(
+          writer,
+          "  also seen as: {} {} {} group(s)",
+          note.group_count, note.dimension, note.match_kind,
+        )?;
+      }
+    }
+    writeln!(writer)?;
+    Ok(())
+  }
+
   /// Write the suppression and registry accounting lines of the stats.
-  fn write_suppression_stats(&self, stats: &DuplicationStats, writer: &mut dyn io::Write) -> io::Result<()> {
-    if stats.suppressed_unit_count > 0 || stats.suppressed_group_count > 0 {
+  fn write_suppression_stats(&self, stats: &DuplicationStats, writer: &mut impl io::Write) -> io::Result<()> {
+    let has_suppressed = stats.suppressed_unit_count > 0 || stats.suppressed_group_count > 0;
+    if has_suppressed {
       writeln!(writer)?;
       writeln!(
         writer,
         "Suppressed: {} units, {} groups (--show-suppressed to list)",
         stats.suppressed_unit_count, stats.suppressed_group_count
       )?;
-      if self.options.verbose {
-        writeln!(writer, "Suppressed by rule:")?;
-        for (rule, count) in &stats.suppressed_by_rule {
-          let noun = if rule.starts_with("group.") { "groups" } else { "units" };
-          writeln!(writer, "  {rule}: {count} {noun}")?;
-        }
-      }
+    }
+    if has_suppressed && self.options.verbose {
+      write_rule_counts(&stats.suppressed_by_rule, writer)?;
     }
     if stats.ignored_group_count > 0 {
       writeln!(writer, "Ignored (registry): {} groups", stats.ignored_group_count)?;
@@ -165,7 +189,7 @@ impl TextReporter {
 
   /// Write the rule-suppressed groups, partitioned per dimension and match
   /// kind under `Suppressed ...` section titles.
-  fn write_suppressed_sections(&self, groups: &[DuplicateGroup], writer: &mut dyn io::Write) -> io::Result<()> {
+  fn write_suppressed_sections(&self, groups: &[DuplicateGroup], writer: &mut impl io::Write) -> Result<(), ReportError> {
     use crate::code_unit::DetectionDimension;
     let sections = [
       (DetectionDimension::Ast, MatchKind::Exact, "Suppressed Exact Duplicates"),
@@ -217,7 +241,7 @@ impl TextReporter {
 }
 
 impl Reporter for TextReporter {
-  fn report_full(&self, result: &AnalysisResult, writer: &mut dyn io::Write) -> io::Result<()> {
+  fn report_full<ParseError: Display>(&self, result: &AnalysisResult<ParseError>, writer: &mut impl io::Write) -> Result<(), ReportError> {
     self.report_stats(&result.stats, writer)?;
     writeln!(writer)?;
     self.report_exact(&result.exact_groups, writer)?;
@@ -256,7 +280,9 @@ impl Reporter for TextReporter {
     Ok(())
   }
 
-  fn report_stats(&self, stats: &DuplicationStats, writer: &mut dyn io::Write) -> io::Result<()> {
+  fn report_stats(&self, stats: &DuplicationStats, writer: &mut impl io::Write) -> Result<(), ReportError> {
+    let exact_percent = stats.exact_duplicate_percent()?;
+    let near_percent = stats.near_duplicate_percent()?;
     writeln!(writer, "Duplication Statistics")?;
     writeln!(writer, "=====================")?;
     writeln!(writer, "Total code units analyzed: {}", stats.total_code_units)?;
@@ -277,8 +303,8 @@ impl Reporter for TextReporter {
     writeln!(
       writer,
       "Duplication: {:.1}% exact, {:.1}% near (of {} total lines)",
-      stats.exact_duplicate_percent(),
-      stats.near_duplicate_percent(),
+      exact_percent,
+      near_percent,
       format_with_commas(stats.total_lines),
     )?;
     write_dimension_pair(
@@ -309,10 +335,11 @@ impl Reporter for TextReporter {
         stats.line_exact_groups, stats.line_exact_units
       )?;
     }
-    self.write_suppression_stats(stats, writer)
+    self.write_suppression_stats(stats, writer)?;
+    Ok(())
   }
 
-  fn report_groups(&self, groups: &[DuplicateGroup], writer: &mut dyn io::Write, section: ReportSection) -> io::Result<()> {
+  fn report_groups(&self, groups: &[DuplicateGroup], writer: &mut impl io::Write, section: ReportSection) -> Result<(), ReportError> {
     self.write_groups(
       groups,
       writer,
@@ -320,14 +347,29 @@ impl Reporter for TextReporter {
       section.empty_message(),
       section.show_similarity(),
       section.show_parent(),
-    )
+    )?;
+    Ok(())
   }
+}
+
+/// Render rule accounting in registry order with each rule's counting unit.
+#[allow(
+  clippy::single_call_fn,
+  reason = "Rule accounting owns its row labels and ordering separately from the statistics section's visibility policy."
+)]
+fn write_rule_counts(counts: &BTreeMap<String, usize>, writer: &mut impl io::Write) -> io::Result<()> {
+  writeln!(writer, "Suppressed by rule:")?;
+  for (rule, count) in counts {
+    let noun = if rule.starts_with("group.") { "groups" } else { "units" };
+    writeln!(writer, "  {rule}: {count} {noun}")?;
+  }
+  Ok(())
 }
 
 /// Write one paired exact/near dimension stats block when either side has
 /// groups; the labels carry their own alignment padding.
 fn write_dimension_pair(
-  writer: &mut dyn io::Write,
+  writer: &mut impl io::Write,
   exact_label: &str,
   near_label: &str,
   exact: (usize, usize),
@@ -342,93 +384,121 @@ fn write_dimension_pair(
   Ok(())
 }
 
-// jscpd:ignore-start
-
 #[cfg(test)]
 mod tests {
+  use std::path::Path;
   use std::path::PathBuf;
 
-  use super::*;
-  use crate::output::test_support::analysis_result;
-  use crate::output::test_support::block_fingerprint;
-  use crate::output::test_support::exact_group;
-  use crate::output::test_support::make_unit;
-  use crate::output::test_support::near_group;
-  use crate::output::test_support::stats;
-  use crate::output::test_support::with_duplicate_lines;
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
+  use strict_test_support::ensure_eq;
 
+  use super::TextReporter;
+  use crate::ReportTestFailure;
+  use crate::analysis_result;
+  use crate::block_fingerprint;
+  use crate::check_text;
+  use crate::code_unit::CodeUnitKind;
+  use crate::code_unit::DetectionDimension;
+  use crate::exact_group;
+  use crate::make_unit;
+  use crate::near_group;
+  use crate::output::ReportSection;
+  use crate::output::Reporter as _;
+  use crate::output::display_path;
+  use crate::render_text;
+  use crate::stats;
+  use crate::suppression::RuleId;
+  use crate::with_duplicate_lines;
+
+  /// The summary renders distinct counts, percentages, and grouped source-line totals.
   #[test]
-  fn text_report_stats() {
+  fn text_report_stats() -> Result<(), ReportTestFailure> {
     let reporter = TextReporter::new(None);
-    let stats = with_duplicate_lines(stats(100, 1000, 5, 12, 3, 8), 61, 43);
-    let mut buf = Vec::new();
-    reporter.report_stats(&stats, &mut buf).unwrap();
-    let output = String::from_utf8(buf).unwrap();
-    assert!(output.contains("100"));
-    assert!(output.contains("5 groups"));
-    assert!(output.contains("3 groups"));
-    assert!(output.contains("Duplicated lines (exact): 61"));
-    assert!(output.contains("Duplicated lines (near):  43"));
-    assert!(output.contains("Duplication: 6.1% exact, 4.3% near"));
+    let statistics = with_duplicate_lines(stats(100, 1000, 5, 12, 3, 8), 61, 43);
+    let rendered = render_text(|writer| reporter.report_stats(&statistics, writer))?;
+    check_text(rendered, |output| {
+      ensure(output.contains("Total code units analyzed: 100"), "render the analyzed-unit total")?;
+      ensure(output.contains("Exact duplicates: 5 groups"), "render the exact-group count")?;
+      ensure(output.contains("Near duplicates:  3 groups"), "render the near-group count")?;
+      ensure(output.contains("Duplicated lines (exact): 61"), "render exact duplicate lines")?;
+      ensure(output.contains("Duplicated lines (near):  43"), "render near duplicate lines")?;
+      ensure(
+        output.contains("Duplication: 6.1% exact, 4.3% near (of 1,000 total lines)"),
+        "render both percentages with one decimal place and group the total source-line count",
+      )
+    })
   }
 
+  /// Empty AST sections show their messages while empty sub-function sections emit no bytes.
   #[test]
-  fn text_report_exact_empty() {
+  fn empty_sections_follow_their_presentation_contract() -> Result<(), ReportTestFailure> {
     let reporter = TextReporter::new(None);
-    let mut buf = Vec::new();
-    reporter.report_exact(&[], &mut buf).unwrap();
-    let output = String::from_utf8(buf).unwrap();
-    assert!(output.contains("No exact duplicates"));
+    for (section, expected) in [
+      (ReportSection::Exact, "No exact duplicates found.\n"),
+      (ReportSection::Near, "No near duplicates found.\n"),
+      (ReportSection::SubExact, ""),
+      (ReportSection::SubNear, ""),
+    ] {
+      let rendered = render_text(|writer| reporter.report_groups(&[], writer, section))?;
+      check_text(rendered, |output| {
+        ensure_eq(&output, &expected, "render the section's documented empty state")
+      })?;
+    }
+    Ok(())
   }
 
+  /// Visible exact groups retain their identity, relative locations, and each member's suppression.
   #[test]
-  fn text_report_exact_with_groups() {
+  fn text_report_exact_with_groups() -> Result<(), ReportTestFailure> {
     let reporter = TextReporter::new(Some(PathBuf::from("/project")));
-    let group = exact_group(vec![
-      make_unit("foo", "/project/src/a.rs", 10, 20),
-      make_unit("bar", "/project/src/b.rs", 30, 40),
-    ]);
-    let mut buf = Vec::new();
-    reporter.report_exact(&[group], &mut buf).unwrap();
-    let output = String::from_utf8(buf).unwrap();
-    assert!(output.contains("Group 1"));
-    assert!(output.contains("foo"));
-    assert!(output.contains("bar"));
-    assert!(output.contains("src/a.rs"));
-    assert!(output.contains("src/b.rs"));
+    let mut tagged = make_unit("foo", "/project/src/a.rs", 10, 20);
+    tagged.suppressed = Some(RuleId::AstForwardingAccessor);
+    let group = exact_group(vec![tagged, make_unit("bar", "/project/src/b.rs", 30, 40)]);
+    let fingerprint = group.fingerprint;
+    let expected = format!(
+      "Exact Duplicates\n================\n\nGroup 1 (fingerprint: {fingerprint}, 2 members):\n  - foo (function) at src/a.rs:10-20 \
+       [suppressed: ast.forwarding-accessor]\n  - bar (function) at src/b.rs:30-40\n\n"
+    );
+    let rendered = render_text(|writer| reporter.report_exact(&[group], writer))?;
+    check_text(rendered, |output| {
+      ensure_eq(
+        &output,
+        &expected.as_str(),
+        "a visible mixed group retains its complete identity and locations while attributing suppression only to the tagged member",
+      )
+    })
   }
 
+  /// Near groups retain their content identity, score, and member locations.
   #[test]
-  fn text_report_near_with_groups() {
+  fn text_report_near_with_groups() -> Result<(), ReportTestFailure> {
     let reporter = TextReporter::new(None);
     let fp = block_fingerprint();
     let group = near_group(fp, 0.85, vec![
       make_unit("process", "/src/a.rs", 10, 25),
       make_unit("compute", "/src/b.rs", 30, 45),
     ]);
-    let mut buf = Vec::new();
-    reporter.report_near(&[group], &mut buf).unwrap();
-    let output = String::from_utf8(buf).unwrap();
-    assert!(output.contains("fingerprint:"));
-    assert!(output.contains(&fp.to_hex()));
-    assert!(output.contains("85%"));
-    assert!(output.contains("process"));
-    assert!(output.contains("compute"));
+    let rendered = render_text(|writer| reporter.report_near(&[group], writer))?;
+    check_text(rendered, |output| {
+      ensure(output.contains(&format!("fingerprint: {fp}")), "render the near-group identity")?;
+      ensure(output.contains("85%"), "render near similarity as a percentage")?;
+      ensure(
+        output.contains("process (function) at /src/a.rs:10-25"),
+        "retain the first near member's location",
+      )?;
+      ensure(
+        output.contains("compute (function) at /src/b.rs:30-45"),
+        "retain the second near member's location",
+      )
+    })
   }
 
+  /// Full reports dispatch AST and sub-function sections with their identities and parent names.
   #[test]
-  fn text_report_near_empty() {
+  fn text_report_full_includes_stats_and_group_sections() -> Result<(), ReportTestFailure> {
     let reporter = TextReporter::new(None);
-    let mut buf = Vec::new();
-    reporter.report_near(&[], &mut buf).unwrap();
-    let output = String::from_utf8(buf).unwrap();
-    assert!(output.contains("No near duplicates"));
-  }
-
-  #[test]
-  fn text_report_full_includes_stats_and_group_sections() {
-    let reporter = TextReporter::new(None);
-    let result = analysis_result(
+    let mut result = analysis_result(
       with_duplicate_lines(stats(4, 200, 1, 2, 1, 2), 20, 15),
       vec![exact_group(vec![
         make_unit("foo", "/src/a.rs", 1, 10),
@@ -440,21 +510,47 @@ mod tests {
       ])],
       Vec::new(),
     );
-    let mut buf = Vec::new();
-    reporter.report_full(&result, &mut buf).unwrap();
-    let output = String::from_utf8(buf).unwrap();
-    assert!(output.contains("Duplication Statistics"));
-    assert!(output.contains("Exact Duplicates"));
-    assert!(output.contains("Near Duplicates"));
-    assert!(output.contains("process"));
+    let mut first_branch = make_unit("then branch", "/src/e.rs", 80, 85);
+    first_branch.kind = CodeUnitKind::IfBranch;
+    first_branch.parent_name = Some("validate".to_owned());
+    let mut second_branch = make_unit("else branch", "/src/f.rs", 100, 105);
+    second_branch.kind = CodeUnitKind::IfBranch;
+    second_branch.parent_name = Some("prepare".to_owned());
+    let mut sub_near = near_group(block_fingerprint(), 0.75, vec![first_branch, second_branch]);
+    sub_near.dimension = DetectionDimension::SubAst;
+    let sub_fingerprint = sub_near.fingerprint;
+    result.sub_near_groups.push(sub_near);
+    result.stats.sub_near_groups = 1;
+    result.stats.sub_near_units = 2;
+    let rendered = render_text(|writer| reporter.report_full(&result, writer))?;
+    check_text(rendered, |output| {
+      ensure(
+        output.contains("Duplication Statistics"),
+        "include statistics in the complete report",
+      )?;
+      ensure(output.contains("Exact Duplicates"), "include the exact group section")?;
+      ensure(output.contains("Near Duplicates"), "include the near group section")?;
+      ensure(output.contains("process"), "include members of near groups")?;
+      ensure(
+        output.contains(&format!(
+          "Sub-function Near Duplicates\n============================\n\nGroup 1 (fingerprint: {sub_fingerprint}, similarity: 75%, 2 \
+           members):\n  - then branch (if branch) in validate at /src/e.rs:80-85\n  - else branch (if branch) in prepare at \
+           /src/f.rs:100-105\n\n"
+        )),
+        "a full report must retain the sub-function near section, group identity, score, member spans, and parent names",
+      )
+    })
   }
 
+  /// Member paths below the configured report root are displayed relative to it.
   #[test]
-  fn relative_path_stripping() {
-    let base = PathBuf::from("/home/user/project");
-    let result = display_path(Some(base.as_path()), std::path::Path::new("/home/user/project/src/main.rs"));
-    assert_eq!(result, "src/main.rs");
+  fn relative_path_stripping() -> Result<(), TestFailure> {
+    let base = PathBuf::from("/project");
+    let result = display_path(Some(base.as_path()), Path::new("/project/src/main.rs"));
+    ensure_eq(
+      &result.as_ref(),
+      &"src/main.rs",
+      "strip the configured base path from a nested source path",
+    )
   }
 }
-
-// jscpd:ignore-end
