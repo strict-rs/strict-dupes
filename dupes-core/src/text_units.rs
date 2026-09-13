@@ -673,10 +673,6 @@ fn strip_block_comments(line: &str, in_block_comment: &mut bool) -> String {
 /// Whether the quote span preceding `chars` closes on this line
 /// (backslash escapes skipped). Unclosed openers — lifetimes, labels, prose
 /// apostrophes, multi-line string heads — stay ordinary punctuation.
-#[allow(
-  clippy::single_call_fn,
-  reason = "Quote lookahead protects literal markers without consuming an unclosed quote as a string."
-)]
 fn quote_span_closes_on_line(mut chars: impl Iterator<Item = char>, quote: char) -> bool {
   while let Some(ch) = chars.next() {
     match ch {
@@ -906,7 +902,7 @@ fn line_is_field_like(line: &[&Token]) -> bool {
 fn token_is_runtime_behavior(token: &Token) -> bool {
   matches!(
     token.raw.as_str(),
-    "fn" | "return" | "if" | "match" | "for" | "while" | "loop" | "let" | "=" | "+" | "*" | "%"
+    "fn" | "return" | "if" | "match" | "for" | "while" | "loop" | "let" | "=" | "+" | "-" | "*" | "/" | "%"
   )
 }
 
@@ -1056,7 +1052,7 @@ fn line_window_is_builder_chain_run(slice: &[(usize, String)]) -> bool {
 }
 
 /// A complete `.ident(...)` builder step on one line, optionally `,` or `;`
-/// terminated.
+/// terminated. Parentheses inside complete quoted arguments are content.
 #[allow(
   clippy::single_call_fn,
   reason = "Balanced arguments and the permitted terminator define a complete builder step."
@@ -1077,6 +1073,9 @@ fn line_is_builder_step(line: &str) -> bool {
   let mut chars = arguments.chars();
   while let Some(ch) = chars.next() {
     match ch {
+      '"' | '\'' if quote_span_closes_on_line(chars.clone(), ch) => {
+        drop(consume_quoted(ch, &mut chars));
+      }
       '(' => depth = depth.saturating_add(1),
       ')' => {
         depth = depth.saturating_sub(1);
@@ -1474,6 +1473,44 @@ fn normalize_construct(
     source:   ComparisonFailure<Vec<Token>, Vec<Token>>,
   }
 
+  /// Native comparison of the complete text and continuation state from comment stripping.
+  type CommentStrippingComparisonFailure = ComparisonFailure<(String, bool), (String, bool)>;
+
+  /// Native text-operation comparisons together with their complete source inputs.
+  #[derive(Debug, thiserror::Error)]
+  enum TextOperationTestFailure {
+    /// A token-row classifier disagreed with its expected result.
+    #[error("structured-token comparison failed: {source}; document: {document:?}; profile: {profile:?}; tokens: {tokens:?}")]
+    StructuredTokens {
+      /// Original unmodified lexer input.
+      document: &'static str,
+      /// Quote handling used to produce the observed tokens.
+      profile:  QuoteProfile,
+      /// Complete raw and normalized tokens with their source spans.
+      tokens:   Vec<Token>,
+      /// Native actual and expected classification results.
+      source:   ComparisonFailure<bool, bool>,
+    },
+    /// A builder-step classifier disagreed with its expected result.
+    #[error("builder-step comparison failed: {source}; line: {line:?}")]
+    BuilderStep {
+      /// Complete original builder-step candidate.
+      line:   &'static str,
+      /// Native actual and expected classification results.
+      source: ComparisonFailure<bool, bool>,
+    },
+    /// Block-comment stripping disagreed with its expected text or continuation state.
+    #[error("block-comment comparison failed: {source}; line: {line:?}; prior comment state: {in_comment_before}")]
+    BlockComments {
+      /// Complete source line before comment removal.
+      line:              &'static str,
+      /// Comment continuation state before processing this line.
+      in_comment_before: bool,
+      /// Native actual and expected text and continuation state after processing.
+      source:            CommentStrippingComparisonFailure,
+    },
+  }
+
   /// Compare complete token sequences while retaining the lexer inputs and outputs.
   fn check_tokens(document: &str, profile: QuoteProfile, expected: Vec<Token>) -> Result<(), Box<TokenizationTestFailure>> {
     ensure_eq(
@@ -1651,8 +1688,8 @@ fn beta(items: &[u32]) -> Vec<u32> {
   }
 
   #[test]
-  fn structured_token_rows_require_content_on_both_sides_of_the_colon() -> Result<(), ConditionFailure> {
-    for (source, expected) in [
+  fn structured_token_rows_require_content_on_both_sides_of_the_colon() -> Result<(), Box<TextOperationTestFailure>> {
+    for (document, expected) in [
       ("alpha: 42", true),
       ("alpha: :beta", true),
       ("alpha:", false),
@@ -1660,12 +1697,22 @@ fn beta(items: &[u32]) -> Vec<u32> {
       ("alpha beta", false),
       (":::", false),
     ] {
-      let tokens = tokenize(source, QuoteProfile::default());
-      ensure(
-        line_has_structured_tokens(&tokens) == expected,
+      let profile = QuoteProfile::default();
+      let tokens = tokenize(document, profile);
+      ensure_eq(
+        line_has_structured_tokens(&tokens),
+        expected,
         "a separator alone or a missing key or value cannot form a structured row",
       )
-      .map(drop)?;
+      .map(drop)
+      .map_err(|source| {
+        Box::new(TextOperationTestFailure::StructuredTokens {
+          document,
+          profile,
+          tokens,
+          source,
+        })
+      })?;
     }
     Ok(())
   }
@@ -1705,14 +1752,14 @@ fn beta(items: &[u32]) -> Vec<u32> {
     .map(drop)
   }
 
-  /// Require actual candidates and the expected rule on every retained unit.
+  /// Require actual candidates and the expected visible or tagged classification on every unit.
   #[track_caller]
-  fn ensure_all_tagged(units: &[CodeUnit], rule: RuleId) -> Result<(), ConditionFailure> {
-    ensure(!units.is_empty(), "windows must exist to carry the tag").map(drop)?;
+  fn ensure_window_classification(units: &[CodeUnit], rule: Option<RuleId>) -> Result<(), ConditionFailure> {
+    ensure(!units.is_empty(), "windows must exist to check their classification").map(drop)?;
     for unit in units {
       ensure(
-        unit.suppressed == Some(rule),
-        "every retained window carries the expected suppression rule",
+        unit.suppressed == rule,
+        "every retained window carries the expected visible or suppressed classification",
       )
       .map(drop)?;
     }
@@ -1735,7 +1782,7 @@ fn beta(items: &[u32]) -> Vec<u32> {
         ..Config::default()
       };
       check_windows("sample.rs", document, config, rule, |units, &expected| {
-        ensure_all_tagged(&units.normalized_tokens, expected)
+        ensure_window_classification(&units.normalized_tokens, Some(expected))
       })?;
     }
     Ok(())
@@ -1767,12 +1814,22 @@ fn beta(items: &[u32]) -> Vec<u32> {
     Ok(())
   }
 
-  /// Extract both token dimensions over the complete supplied declaration or body.
-  fn declaration_window_units(source: &str, suppression: SuppressionPolicy) -> TextUnits {
-    extract(
-      Path::new("declarations.rs"),
+  /// Check both complete declaration windows while retaining their source and configuration.
+  fn check_declaration_windows(source: &str, expected: Option<RuleId>) -> WindowTestResult<Option<RuleId>> {
+    check_windows(
+      "declarations.rs",
       source,
-      &declaration_window_config(source, suppression),
+      declaration_window_config(source, SuppressionPolicy::default()),
+      expected,
+      |units, &rule| {
+        ensure(
+          (units.normalized_tokens.len(), units.raw_tokens.len()) == (1, 1),
+          "classification must retain one complete candidate in each token dimension",
+        )
+        .map(drop)?;
+        ensure_window_classification(&units.normalized_tokens, rule)?;
+        ensure_window_classification(&units.raw_tokens, rule)
+      },
     )
   }
 
@@ -1788,26 +1845,14 @@ fn beta(items: &[u32]) -> Vec<u32> {
   }
 
   #[test]
-  fn declaration_windows_recognize_visibility_and_ignore_comment_behavior_words() -> Result<(), ConditionFailure> {
+  fn declaration_windows_recognize_visibility_and_ignore_comment_behavior_words() -> WindowTestResult<Option<RuleId>> {
     for visibility in ["", "pub ", "pub(crate) ", "pub(super) ", "pub(in crate::owner) "] {
       let source = format!(
         "/// Values for callers; fn, if, let, and return describe their use.\n#[derive(Debug)]\npub struct State {{\n/// First value for \
          callers.\n{visibility}first: u8, // if a caller needs it\n/// Second value for callers.\n{visibility}second: u16, // return this \
          value\n}}"
       );
-      let units = declaration_window_units(&source, SuppressionPolicy::default());
-      ensure(
-        (units.normalized_tokens.len(), units.raw_tokens.len()) == (1, 1),
-        "classification must retain the complete candidate in both token dimensions",
-      )
-      .map(drop)?;
-      for unit in units.normalized_tokens.iter().chain(&units.raw_tokens) {
-        ensure(
-          unit.suppressed == Some(RuleId::TokenDeclarationScaffold),
-          "field visibility and documentation must not turn declaration scaffolding into executable behavior",
-        )
-        .map(drop)?;
-      }
+      check_declaration_windows(&source, Some(RuleId::TokenDeclarationScaffold))?;
     }
     Ok(())
   }
@@ -1870,28 +1915,18 @@ fn beta(items: &[u32]) -> Vec<u32> {
   }
 
   #[test]
-  fn declaration_windows_keep_executable_counterexamples_visible() -> Result<(), ConditionFailure> {
+  fn declaration_windows_keep_executable_counterexamples_visible() -> WindowTestResult<Option<RuleId>> {
     for source in [
       "pub struct State {\n    pub first: u8,\n    pub second: u16,\n}\nimpl State {\n    fn total(&self) -> u16 {\n        \
        u16::from(self.first) + self.second\n    }\n}",
       "pub struct State {\n    pub first: [u8; 2 + 3],\n    pub second: u16,\n}",
+      "pub struct State {\n    pub first: [u8; 8 - 2],\n    pub second: u16,\n}",
+      "pub struct State {\n    pub first: [u8; 8 / 2],\n    pub second: u16,\n}",
       "// A struct with fields is only mentioned here.\nfn build() -> State {\n    State {\n        first: 1,\n        second: 2,\n    \
        }\n}",
       "pub struct State {\n    pub(crate first: u8,\n    pub second: u16,\n}",
     ] {
-      let units = declaration_window_units(source, SuppressionPolicy::default());
-      ensure(
-        (units.normalized_tokens.len(), units.raw_tokens.len()) == (1, 1),
-        "counterexample windows must exist in both dimensions",
-      )
-      .map(drop)?;
-      for unit in units.normalized_tokens.iter().chain(&units.raw_tokens) {
-        ensure(
-          unit.suppressed.is_none(),
-          "runtime code, computed fields, comment-only type headers, and incomplete visibility must remain reportable",
-        )
-        .map(drop)?;
-      }
+      check_declaration_windows(source, None)?;
     }
     Ok(())
   }
@@ -2307,23 +2342,38 @@ struct Settings {
   }
 
   #[test]
-  fn builder_steps_require_balanced_arguments_and_a_complete_terminator() -> Result<(), ConditionFailure> {
+  fn builder_steps_require_balanced_arguments_and_a_complete_terminator() -> Result<(), Box<TextOperationTestFailure>> {
     for (line, expected) in [
       (".compute(outer(inner()));", true),
       ("  .arg(\"\u{96ea}\"),  ", true),
       (".step()", true),
+      (r#".arg("(")"#, true),
+      (r#".arg(")")"#, true),
+      (r#".arg("\"(")"#, true),
+      (".arg(')')", true),
+      (r#".call(inner("("), ")");"#, true),
       ("step()", false),
       (".()", false),
       (".step(", false),
       (".step(inner()", false),
       (".step())", false),
       (".step() trailing", false),
+      (r#".arg("(""#, false),
+      (r#".arg(")") extra"#, false),
+      (r#".arg(")"))"#, false),
     ] {
-      ensure(
-        line_is_builder_step(line) == expected,
+      ensure_eq(
+        line_is_builder_step(line),
+        expected,
         "builder-step admission requires one complete balanced call with only a supported terminator",
       )
-      .map(drop)?;
+      .map(drop)
+      .map_err(|source| {
+        Box::new(TextOperationTestFailure::BuilderStep {
+          line,
+          source,
+        })
+      })?;
     }
     Ok(())
   }
@@ -2442,8 +2492,8 @@ command()
         ..Config::default()
       };
       check_windows("sample.rs", source, config, rule, |units, &expected| {
-        ensure_all_tagged(&units.normalized_tokens, expected)?;
-        ensure_all_tagged(&units.raw_tokens, expected)
+        ensure_window_classification(&units.normalized_tokens, Some(expected))?;
+        ensure_window_classification(&units.raw_tokens, Some(expected))
       })?;
     }
     Ok(())
@@ -2477,7 +2527,7 @@ command()
   }
 
   #[test]
-  fn line_windows_attribute_import_scaffolding_and_detached_chains() -> WindowTestResult<RuleId> {
+  fn line_windows_classify_imports_and_chain_shapes() -> WindowTestResult<Option<RuleId>> {
     let imports = "\
 use crate::alpha::Beta;
 use crate::gamma::Delta;
@@ -2501,16 +2551,18 @@ command()
     .collect::<Vec<_>>();
 ";
     for (source, min_lines, rule) in [
-      (imports, 5, RuleId::LineImportScaffold),
-      (chain, 5, RuleId::LineChainTail),
-      (callback_tail, 4, RuleId::LineChainTail),
+      (imports, 5, Some(RuleId::LineImportScaffold)),
+      (chain, 5, Some(RuleId::LineChainTail)),
+      (callback_tail, 4, Some(RuleId::LineChainTail)),
+      (".arg(\"(\")\n.arg(\")\");\n", 2, None),
+      (".arg(\"(\")\n.arg(\")\") extra\n", 2, Some(RuleId::LineChainTail)),
     ] {
       let config = Config {
         line_min_lines: min_lines,
         ..Config::default()
       };
       check_windows("sample.rs", source, config, rule, |units, &expected| {
-        ensure_all_tagged(&units.lines, expected)
+        ensure_window_classification(&units.lines, expected)
       })?;
     }
     Ok(())
@@ -2588,7 +2640,7 @@ let clamped = widened / four;
   }
 
   #[test]
-  fn strip_block_comments_tracks_comment_state_across_lines() -> Result<(), ConditionFailure> {
+  fn strip_block_comments_tracks_comment_state_across_lines() -> Result<(), Box<TextOperationTestFailure>> {
     let mut in_comment = false;
     let sequence = [
       ("alpha /* gone */ beta", "alpha  beta", false),
@@ -2597,18 +2649,13 @@ let clamped = widened / four;
       ("done */ tail", " tail", false),
     ];
     for (line, expected, state_after) in sequence {
-      let output = strip_block_comments(line, &mut in_comment);
-      ensure(
-        (output.as_str(), in_comment) == (expected, state_after),
-        "comment stripping preserves the visible text and tracks its continuation state",
-      )
-      .map(drop)?;
+      check_comment_stripping(line, &mut in_comment, expected, state_after)?;
     }
     Ok(())
   }
 
   #[test]
-  fn strip_block_comments_keeps_quoted_and_prose_markers() -> Result<(), ConditionFailure> {
+  fn strip_block_comments_keeps_quoted_and_prose_markers() -> Result<(), Box<TextOperationTestFailure>> {
     for (line, expected) in [
       ("rest.find(\"/*\")", "rest.find(\"/*\")"),
       ("let quote = '\"'; /* gone */", "let quote = '\"'; "),
@@ -2617,13 +2664,32 @@ let clamped = widened / four;
       ("fn f<'a>(s: &'a str) { /* gone */ }", "fn f<'a>(s: &'a str) {  }"),
     ] {
       let mut in_comment = false;
-      let output = strip_block_comments(line, &mut in_comment);
-      ensure(
-        (output.as_str(), in_comment) == (expected, false),
-        "quoted and prose markers stay literal while actual block comments close",
-      )
-      .map(drop)?;
+      check_comment_stripping(line, &mut in_comment, expected, false)?;
     }
     Ok(())
+  }
+
+  /// Compare the coupled text and state result while retaining the input and prior state.
+  fn check_comment_stripping(
+    line: &'static str,
+    in_comment: &mut bool,
+    expected: &'static str,
+    expected_state: bool,
+  ) -> Result<(), Box<TextOperationTestFailure>> {
+    let in_comment_before = *in_comment;
+    let output = strip_block_comments(line, in_comment);
+    ensure_eq(
+      (output, *in_comment),
+      (expected.to_owned(), expected_state),
+      "comment stripping preserves the visible text and tracks its continuation state",
+    )
+    .map(drop)
+    .map_err(|source| {
+      Box::new(TextOperationTestFailure::BlockComments {
+        line,
+        in_comment_before,
+        source,
+      })
+    })
   }
 }

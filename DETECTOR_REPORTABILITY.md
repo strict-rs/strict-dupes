@@ -76,7 +76,7 @@ This is the recovery channel for cross-file clap-style CLI structs and blank-spr
 
 ### `line.builder-chain-run`
 
-A window is admitted when **every** line is a complete single-line builder step: `.ident(args)` with balanced parens entirely on the line, optionally `,`/`;` terminated. Detached tails and windows mixing receivers or other lines keep their `line.chain-tail` suppression.
+A window is admitted when **every** line is a complete single-line builder step: `.ident(args)` with balanced parens entirely on the line, optionally `,`/`;` terminated. Parentheses inside complete single- or double-quoted arguments are content; escaped quotes do not close those arguments. Detached tails and windows mixing receivers or other lines keep their `line.chain-tail` suppression.
 
 ### Comment Stripping Is Quote-Aware
 
