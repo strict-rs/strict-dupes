@@ -55,36 +55,38 @@ fn line_member_spans(report: &Value, suffix: &str) -> Result<Vec<(u64, u64)>, Cl
 fn stats_pins() -> Result<(), CliTestFailure> {
   check_json(fixture_json(cargo_dupes, FIXTURE, STATS_ARGS)?, |stats| {
     // The total covers the full extracted population, suppressed included.
-    ensure_eq(&json_count(stats, "total_code_units")?, &42, "total_code_units")?;
+    ensure_eq(json_count(stats, "total_code_units")?, 42, "total_code_units").map(drop)?;
     // ranges_overlap/spans_collide (size-cap release) and chain_x/chain_y.
-    ensure_eq(&json_count(stats, "exact_duplicate_groups")?, &2, "exact_duplicate_groups")?;
-    ensure_eq(&json_count(stats, "exact_duplicate_units")?, &4, "exact_duplicate_units")?;
+    ensure_eq(json_count(stats, "exact_duplicate_groups")?, 2, "exact_duplicate_groups").map(drop)?;
+    ensure_eq(json_count(stats, "exact_duplicate_units")?, 4, "exact_duplicate_units").map(drop)?;
     // collect/rank pairs at >= 0.9 plus the 0.8-threshold captures: the
     // *_total quartet, both touch/order pairs, the dispatch pair, and the
     // build_one/build_two runs (method-name preservation keeps them near).
-    ensure_eq(&json_count(stats, "near_duplicate_groups")?, &7, "near_duplicate_groups")?;
-    ensure_eq(&json_count(stats, "near_duplicate_units")?, &16, "near_duplicate_units")?;
+    ensure_eq(json_count(stats, "near_duplicate_groups")?, 7, "near_duplicate_groups").map(drop)?;
+    ensure_eq(json_count(stats, "near_duplicate_units")?, 16, "near_duplicate_units").map(drop)?;
     // The released 14-member apply branch group and the chain_x/chain_y
     // IfChain pair; the 6-member chain branch group is covered and hidden.
-    ensure_eq(&json_count(stats, "sub_exact_groups")?, &2, "sub_exact_groups")?;
+    ensure_eq(json_count(stats, "sub_exact_groups")?, 2, "sub_exact_groups").map(drop)?;
     ensure_eq(
-      &json_count(stats, "token_normalized_exact_groups")?,
-      &2,
+      json_count(stats, "token_normalized_exact_groups")?,
+      2,
       "token_normalized_exact_groups",
-    )?;
+    )
+    .map(drop)?;
     ensure_eq(
-      &json_count(stats, "token_normalized_near_groups")?,
-      &1,
+      json_count(stats, "token_normalized_near_groups")?,
+      1,
       "token_normalized_near_groups",
-    )?;
-    ensure_eq(&json_count(stats, "token_raw_exact_groups")?, &1, "token_raw_exact_groups")?;
+    )
+    .map(drop)?;
+    ensure_eq(json_count(stats, "token_raw_exact_groups")?, 1, "token_raw_exact_groups").map(drop)?;
     // The Dense pair, the Renderer trio, the CliA/CliB stanza windows, and
     // at least one SpreadA/SpreadB table group admitted by the structural
     // stanza coalescer; the builder-run pair sits under group.covered-by-ast
     // because build_one/build_two form an ast near pair at the 0.8 threshold.
     // Closing the Cli declarations before the Spread blocks also retains the
     // Cli pair's own final window over its epsilon/zeta stanzas.
-    ensure_eq(&json_count(stats, "line_exact_groups")?, &9, "line_exact_groups")?;
+    ensure_eq(json_count(stats, "line_exact_groups")?, 9, "line_exact_groups").map(drop)?;
     // The Rust quote profile lexes the doc-comment apostrophes ("chain's")
     // as punctuation, so the overrides spans yield four signature-prefix
     // token windows over chain_x/chain_y and one suppressed group (the
@@ -92,8 +94,8 @@ fn stats_pins() -> Result<(), CliTestFailure> {
     // eight declaration-scaffold tags without changing visible groups.
     // Six low-signal windows that crossed completed declaration boundaries
     // are no longer extracted.
-    ensure_eq(&json_count(stats, "suppressed_unit_count")?, &102, "suppressed_unit_count")?;
-    ensure_eq(&json_count(stats, "suppressed_group_count")?, &27, "suppressed_group_count")?;
+    ensure_eq(json_count(stats, "suppressed_unit_count")?, 102, "suppressed_unit_count").map(drop)?;
+    ensure_eq(json_count(stats, "suppressed_group_count")?, 27, "suppressed_group_count").map(drop)?;
     Ok(())
   })
 }
@@ -144,15 +146,16 @@ fn suppressed_rule_attribution_pins() -> Result<(), CliTestFailure> {
       context:  "suppression attribution must be an object",
     })?;
     for (rule, count) in expected {
-      ensure_eq(&suppressed_count_for_rule(stats, rule)?, &count, rule)?;
+      ensure_eq(suppressed_count_for_rule(stats, rule)?, count, rule).map(drop)?;
     }
     // The comparator rule must NOT fire here: the fixture's field-projection
     // comparators attribute to ast.forwarding-accessor (shadowing note above).
     ensure(
       !map.contains_key("ast.comparator-adapter"),
       "field comparators attribute to forwarding-accessor",
-    )?;
-    ensure_eq(&map.len(), &expected.len(), "no unexpected suppression rules fire")?;
+    )
+    .map(drop)?;
+    ensure_eq(map.len(), expected.len(), "no unexpected suppression rules fire").map(drop)?;
     Ok(())
   })
 }
@@ -161,7 +164,7 @@ fn suppressed_rule_attribution_pins() -> Result<(), CliTestFailure> {
 fn show_suppressed_exposes_tagged_groups() -> Result<(), CliTestFailure> {
   check_json(fixture_json(cargo_dupes, FIXTURE, SHOW_SUPPRESSED_REPORT_ARGS)?, |report| {
     let suppressed = json_array(json_field(report, "suppressed_groups")?)?;
-    ensure(!suppressed.is_empty(), "suppressed groups must be exposed")?;
+    ensure(!suppressed.is_empty(), "suppressed groups must be exposed").map(drop)?;
     let mut chain_covered = false;
     // The chain-covered chain_x branch members surface here with their rule.
     for group in suppressed {
@@ -170,7 +173,7 @@ fn show_suppressed_exposes_tagged_groups() -> Result<(), CliTestFailure> {
         chain_covered |= rule == "sub.covered-by-chain" && json_text(json_field(member, "file")?)?.ends_with("overrides_a.rs");
       }
     }
-    ensure(chain_covered, "chain-covered branch members must retain their suppression rule")?;
+    ensure(chain_covered, "chain-covered branch members must retain their suppression rule").map(drop)?;
     Ok(())
   })?;
   // Without the flag the array is absent from the document.
@@ -178,7 +181,8 @@ fn show_suppressed_exposes_tagged_groups() -> Result<(), CliTestFailure> {
     ensure(
       report.get("suppressed_groups").is_none(),
       "suppressed groups are omitted without the flag",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   })
 }
@@ -226,22 +230,24 @@ fn disabling_a_rule_unhides_its_findings() -> Result<(), CliTestFailure> {
   };
   check_json(run("report")?, |report| {
     let arms = ensure_some(
-      group_containing_member(report, "match arm", "shapes.rs")?,
+      group_containing_member(report, "match arm", "shapes.rs")?.cloned(),
       "dispatch arms become visible",
     )?;
     ensure_eq(
-      &json_text(json_field(arms, "dimension")?)?,
-      &"sub_ast",
+      (json_text(json_field(&arms, "dimension")?)?).to_owned(),
+      "sub_ast".to_owned(),
       "released dispatch-arm dimension",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   })?;
   check_json(run("stats")?, |stats| {
     ensure_eq(
-      &suppressed_count_for_rule(stats, "sub.value-plumbing")?,
-      &0,
+      suppressed_count_for_rule(stats, "sub.value-plumbing")?,
+      0,
       "disabled rules have no attributed suppression",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   })
 }
@@ -249,21 +255,31 @@ fn disabling_a_rule_unhides_its_findings() -> Result<(), CliTestFailure> {
 #[test]
 fn identical_if_chains_group_as_whole_chains() -> Result<(), CliTestFailure> {
   check_json(fixture_json(cargo_dupes, FIXTURE, REPORT_ARGS)?, |report| {
-    let chain_fns = ensure_some(group_containing_member(report, "chain_x", "overrides_a.rs")?, "chain function pair")?;
-    ensure_eq(&json_text(json_field(chain_fns, "dimension")?)?, &"ast", "chain function dimension")?;
+    let chain_fns = ensure_some(
+      group_containing_member(report, "chain_x", "overrides_a.rs")?.cloned(),
+      "chain function pair",
+    )?;
+    ensure_eq(
+      (json_text(json_field(&chain_fns, "dimension")?)?).to_owned(),
+      "ast".to_owned(),
+      "chain function dimension",
+    )
+    .map(drop)?;
     ensure(
       group_containing_member(report, "chain_y", "overrides_b.rs")?.is_some(),
       "the chain pair spans both files",
-    )?;
+    )
+    .map(drop)?;
     let chain_subs = ensure_some(
-      group_containing_member(report, "if chain (3 branches)", "overrides_a.rs")?,
+      group_containing_member(report, "if chain (3 branches)", "overrides_a.rs")?.cloned(),
       "chain sub-unit pair",
     )?;
     ensure_eq(
-      &json_text(json_field(chain_subs, "dimension")?)?,
-      &"sub_ast",
+      (json_text(json_field(&chain_subs, "dimension")?)?).to_owned(),
+      "sub_ast".to_owned(),
       "chain sub-unit dimension",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   })
 }
@@ -275,22 +291,19 @@ fn override_branch_duplication_is_released() -> Result<(), CliTestFailure> {
   // IfBranch group visible; the chain_x/chain_y branches stay hidden under
   // sub.covered-by-chain.
   check_json(fixture_json(cargo_dupes, FIXTURE, REPORT_ARGS)?, |report| {
-    ensure_eq(
-      &groups_of_dimension(report, "sub_ast")?.len(),
-      &2,
-      "released branch and chain groups",
-    )?;
+    ensure_eq(groups_of_dimension(report, "sub_ast")?.len(), 2, "released branch and chain groups").map(drop)?;
     let released = ensure_some(
-      group_containing_member(report, "if-then branch", "overrides_a.rs")?,
+      group_containing_member(report, "if-then branch", "overrides_a.rs")?.cloned(),
       "released apply-branch group",
     )?;
     ensure_eq(
-      &json_text(json_field(released, "dimension")?)?,
-      &"sub_ast",
+      (json_text(json_field(&released, "dimension")?)?).to_owned(),
+      "sub_ast".to_owned(),
       "released branch dimension",
-    )?;
-    let members = json_array(json_field(released, "members")?)?;
-    ensure_eq(&members.len(), &14, "all apply branches remain visible")?;
+    )
+    .map(drop)?;
+    let members = json_array(json_field(&released, "members")?)?;
+    ensure_eq(members.len(), 14, "all apply branches remain visible").map(drop)?;
     let mut in_second_file = false;
     // Only apply rows may appear: apply_a spans lines 6-34 of overrides_a.rs
     // and apply_b spans lines 6-22 of overrides_b.rs; the chain branches
@@ -300,12 +313,12 @@ fn override_branch_duplication_is_released() -> Result<(), CliTestFailure> {
       let start = json_count(member, "line_start")?;
       in_second_file |= file.ends_with("overrides_b.rs");
       if file.ends_with("overrides_a.rs") {
-        ensure(start <= 34, "chain branch leaked into the released group")?;
+        ensure(start <= 34, "chain branch leaked into the released group").map(drop)?;
       } else {
-        ensure(start <= 22, "chain branch leaked into the released group")?;
+        ensure(start <= 22, "chain branch leaked into the released group").map(drop)?;
       }
     }
-    ensure(in_second_file, "the released group spans both files")?;
+    ensure(in_second_file, "the released group spans both files").map(drop)?;
     Ok(())
   })
 }
@@ -323,20 +336,24 @@ fn declaration_stanzas_are_admitted() -> Result<(), CliTestFailure> {
     ensure(
       decl_members.iter().any(|&(start, _)| start <= 14),
       "no admitted window reaches the first CliA stanza",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       decl_members.iter().any(|&(_, end)| end >= 32),
       "no admitted window reaches the final CliA stanza",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       decl_members.contains(&(29, 34)),
       "the final CliA window stays anchored inside its own declaration",
-    )?;
+    )
+    .map(drop)?;
     // At least one admitted window lies inside the SpreadA row span (40-50).
     ensure(
       decl_members.iter().any(|&(start, end)| start >= 40 && end <= 50),
       "no admitted window covers the SpreadA/SpreadB table",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   })
 }
@@ -357,7 +374,7 @@ fn contiguous_derive_table_is_visible() -> Result<(), CliTestFailure> {
       }
       dense_pair |= first && second;
     }
-    ensure(dense_pair, "DenseA and DenseB must share a visible line group")?;
+    ensure(dense_pair, "DenseA and DenseB must share a visible line group").map(drop)?;
     Ok(())
   })
 }
@@ -371,11 +388,21 @@ fn builder_runs_are_admitted() -> Result<(), CliTestFailure> {
   // the tail_one/tail_two fragments (lines 39+) stay chain-tail suppressed.
   check_json(fixture_json(cargo_dupes, FIXTURE, SHOW_SUPPRESSED_REPORT_ARGS)?, |report| {
     let builders = ensure_some(
-      group_containing_member(report, "build_one", "builders.rs")?,
+      group_containing_member(report, "build_one", "builders.rs")?.cloned(),
       "builder function pair",
     )?;
-    ensure_eq(&json_text(json_field(builders, "dimension")?)?, &"ast", "builder pair dimension")?;
-    ensure_eq(&json_text(json_field(builders, "match_kind")?)?, &"near", "builder pair match kind")?;
+    ensure_eq(
+      (json_text(json_field(&builders, "dimension")?)?).to_owned(),
+      "ast".to_owned(),
+      "builder pair dimension",
+    )
+    .map(drop)?;
+    ensure_eq(
+      (json_text(json_field(&builders, "match_kind")?)?).to_owned(),
+      "near".to_owned(),
+      "builder pair match kind",
+    )
+    .map(drop)?;
     let mut covered = false;
     for group in json_array(json_field(report, "suppressed_groups")?)? {
       if json_text(json_field(group, "suppressed")?)? != "group.covered-by-ast" {
@@ -387,14 +414,15 @@ fn builder_runs_are_admitted() -> Result<(), CliTestFailure> {
           && json_count(member, "line_end")? <= 23;
       }
     }
-    ensure(covered, "the admitted builder run retains AST coverage attribution")?;
+    ensure(covered, "the admitted builder run retains AST coverage attribution").map(drop)?;
     Ok(())
   })?;
   check_json(fixture_json(cargo_dupes, FIXTURE, REPORT_ARGS)?, |report| {
     ensure(
       line_member_spans(report, "builders.rs")?.is_empty(),
       "AST coverage removes the builder line shadow",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   })
 }
@@ -407,23 +435,26 @@ fn capped_boolean_projections_surface_while_trivial_shapes_stay_suppressed() -> 
   // rule-suppressed.
   check_json(fixture_json(cargo_dupes, FIXTURE, REPORT_ARGS)?, |report| {
     let released = ensure_some(
-      group_containing_member(report, "ranges_overlap", "shapes.rs")?,
+      group_containing_member(report, "ranges_overlap", "shapes.rs")?.cloned(),
       "size-cap released function pair",
     )?;
     ensure_eq(
-      &json_text(json_field(released, "dimension")?)?,
-      &"ast",
+      (json_text(json_field(&released, "dimension")?)?).to_owned(),
+      "ast".to_owned(),
       "released function dimension",
-    )?;
+    )
+    .map(drop)?;
     ensure_eq(
-      &json_text(json_field(released, "match_kind")?)?,
-      &"exact",
+      (json_text(json_field(&released, "match_kind")?)?).to_owned(),
+      "exact".to_owned(),
       "released function match kind",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       group_containing_member(report, "spans_collide", "shapes.rs")?.is_some(),
       "the size-cap release includes both functions",
-    )?;
+    )
+    .map(drop)?;
     assert_member_needles_absent(
       report,
       &[
@@ -447,9 +478,9 @@ fn mutation_setters_are_suppressed_with_attribution() -> Result<(), CliTestFailu
       }
       let names = json_array(json_field(group, "members")?)?
         .iter()
-        .map(|member| json_text(json_field(member, "name")?))
+        .map(|member| json_text(json_field(member, "name")?).map(str::to_owned))
         .collect::<Result<Vec<_>, _>>()?;
-      if names.contains(&"Gauge::push_item") {
+      if names.iter().any(|name| name == "Gauge::push_item") {
         setters = Some(names);
         break;
       }
@@ -457,7 +488,8 @@ fn mutation_setters_are_suppressed_with_attribution() -> Result<(), CliTestFailu
     ensure(
       ensure_some(setters, "mutation-setter pair")? == ["Gauge::push_item", "Gauge::push_mark"],
       "the mutation-setter pair groups alone",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   })
 }
@@ -471,11 +503,13 @@ fn sub_unit_noise_shapes_stay_suppressed() -> Result<(), CliTestFailure> {
     ensure(
       group_containing_member(report, "if-then branch", "shapes.rs")?.is_none(),
       "guard branches stay suppressed",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       group_containing_member(report, "match arm", "shapes.rs")?.is_none(),
       "dispatch arms stay suppressed",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   })
 }
@@ -499,10 +533,15 @@ fn impl_signature_parity_stays_visible() -> Result<(), CliTestFailure> {
       }
     }
     ensure_eq(
-      &json_text(json_field(ensure_some(parity, "Renderer signature parity group")?, "match_kind")?)?,
-      &"exact",
+      (json_text(json_field(
+        &ensure_some(parity.cloned(), "Renderer signature parity group")?,
+        "match_kind",
+      )?)?)
+      .to_owned(),
+      "exact".to_owned(),
       "signature parity match kind",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   })
 }
@@ -516,7 +555,7 @@ fn import_scaffolding_line_windows_stay_invisible() -> Result<(), CliTestFailure
   check_json(fixture_json(cargo_dupes, FIXTURE, REPORT_ARGS)?, |report| {
     for suffix in ["decl_a.rs", "decl_b.rs"] {
       for (start, _) in line_member_spans(report, suffix)? {
-        ensure(start > 7, "line windows must start after the import block")?;
+        ensure(start > 7, "line windows must start after the import block").map(drop)?;
       }
     }
     Ok(())

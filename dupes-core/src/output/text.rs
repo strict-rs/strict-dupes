@@ -389,7 +389,7 @@ mod tests {
   use std::path::Path;
   use std::path::PathBuf;
 
-  use strict_test_support::TestFailure;
+  use strict_test_support::ComparisonFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_eq;
 
@@ -418,15 +418,16 @@ mod tests {
     let statistics = with_duplicate_lines(stats(100, 1000, 5, 12, 3, 8), 61, 43);
     let rendered = render_text(|writer| reporter.report_stats(&statistics, writer))?;
     check_text(rendered, |output| {
-      ensure(output.contains("Total code units analyzed: 100"), "render the analyzed-unit total")?;
-      ensure(output.contains("Exact duplicates: 5 groups"), "render the exact-group count")?;
-      ensure(output.contains("Near duplicates:  3 groups"), "render the near-group count")?;
-      ensure(output.contains("Duplicated lines (exact): 61"), "render exact duplicate lines")?;
-      ensure(output.contains("Duplicated lines (near):  43"), "render near duplicate lines")?;
+      ensure(output.contains("Total code units analyzed: 100"), "render the analyzed-unit total").map(drop)?;
+      ensure(output.contains("Exact duplicates: 5 groups"), "render the exact-group count").map(drop)?;
+      ensure(output.contains("Near duplicates:  3 groups"), "render the near-group count").map(drop)?;
+      ensure(output.contains("Duplicated lines (exact): 61"), "render exact duplicate lines").map(drop)?;
+      ensure(output.contains("Duplicated lines (near):  43"), "render near duplicate lines").map(drop)?;
       ensure(
         output.contains("Duplication: 6.1% exact, 4.3% near (of 1,000 total lines)"),
         "render both percentages with one decimal place and group the total source-line count",
       )
+      .map(drop)
     })
   }
 
@@ -441,9 +442,7 @@ mod tests {
       (ReportSection::SubNear, ""),
     ] {
       let rendered = render_text(|writer| reporter.report_groups(&[], writer, section))?;
-      check_text(rendered, |output| {
-        ensure_eq(&output, &expected, "render the section's documented empty state")
-      })?;
+      ensure_eq(rendered, expected.to_owned(), "render the section's documented empty state").map(drop)?;
     }
     Ok(())
   }
@@ -461,13 +460,13 @@ mod tests {
        [suppressed: ast.forwarding-accessor]\n  - bar (function) at src/b.rs:30-40\n\n"
     );
     let rendered = render_text(|writer| reporter.report_exact(&[group], writer))?;
-    check_text(rendered, |output| {
-      ensure_eq(
-        &output,
-        &expected.as_str(),
-        "a visible mixed group retains its complete identity and locations while attributing suppression only to the tagged member",
-      )
-    })
+    ensure_eq(
+      rendered,
+      expected,
+      "a visible mixed group retains its complete identity and locations while attributing suppression only to the tagged member",
+    )
+    .map(drop)
+    .map_err(ReportTestFailure::from)
   }
 
   /// Near groups retain their content identity, score, and member locations.
@@ -481,16 +480,18 @@ mod tests {
     ]);
     let rendered = render_text(|writer| reporter.report_near(&[group], writer))?;
     check_text(rendered, |output| {
-      ensure(output.contains(&format!("fingerprint: {fp}")), "render the near-group identity")?;
-      ensure(output.contains("85%"), "render near similarity as a percentage")?;
+      ensure(output.contains(&format!("fingerprint: {fp}")), "render the near-group identity").map(drop)?;
+      ensure(output.contains("85%"), "render near similarity as a percentage").map(drop)?;
       ensure(
         output.contains("process (function) at /src/a.rs:10-25"),
         "retain the first near member's location",
-      )?;
+      )
+      .map(drop)?;
       ensure(
         output.contains("compute (function) at /src/b.rs:30-45"),
         "retain the second near member's location",
       )
+      .map(drop)
     })
   }
 
@@ -527,10 +528,11 @@ mod tests {
       ensure(
         output.contains("Duplication Statistics"),
         "include statistics in the complete report",
-      )?;
-      ensure(output.contains("Exact Duplicates"), "include the exact group section")?;
-      ensure(output.contains("Near Duplicates"), "include the near group section")?;
-      ensure(output.contains("process"), "include members of near groups")?;
+      )
+      .map(drop)?;
+      ensure(output.contains("Exact Duplicates"), "include the exact group section").map(drop)?;
+      ensure(output.contains("Near Duplicates"), "include the near group section").map(drop)?;
+      ensure(output.contains("process"), "include members of near groups").map(drop)?;
       ensure(
         output.contains(&format!(
           "Sub-function Near Duplicates\n============================\n\nGroup 1 (fingerprint: {sub_fingerprint}, similarity: 75%, 2 \
@@ -539,18 +541,20 @@ mod tests {
         )),
         "a full report must retain the sub-function near section, group identity, score, member spans, and parent names",
       )
+      .map(drop)
     })
   }
 
   /// Member paths below the configured report root are displayed relative to it.
   #[test]
-  fn relative_path_stripping() -> Result<(), TestFailure> {
+  fn relative_path_stripping() -> Result<(), ComparisonFailure<String, &'static str>> {
     let base = PathBuf::from("/project");
     let result = display_path(Some(base.as_path()), Path::new("/project/src/main.rs"));
     ensure_eq(
-      &result.as_ref(),
-      &"src/main.rs",
+      result.into_owned(),
+      "src/main.rs",
       "strip the configured base path from a nested source path",
     )
+    .map(drop)
   }
 }

@@ -62,7 +62,9 @@ use serde_json::Value;
 use source::SourceFile;
 use source::SourceReadError;
 #[cfg(test)]
-use strict_test_support::TestFailure;
+use strict_test_support::ComparisonFailure;
+#[cfg(test)]
+use strict_test_support::ConditionFailure;
 use suppression::RuleId;
 use suppression::SuppressionWarning;
 use text_units::TextUnits;
@@ -81,6 +83,12 @@ fn split_runs_by<T>(items: &[T], same_run: impl FnMut(&T, &T) -> bool) -> Vec<&[
 #[cfg(test)]
 #[derive(Debug, thiserror::Error)]
 enum ReportTestFailure {
+  /// Complete observed and expected JSON reports differed.
+  #[error(transparent)]
+  JsonComparison(#[from] ComparisonFailure<Value, Value>),
+  /// Complete observed and expected text reports differed.
+  #[error(transparent)]
+  TextComparison(#[from] ComparisonFailure<String, String>),
   /// Rendering failed after producing the retained output prefix.
   #[error("report rendering failed")]
   Render {
@@ -97,7 +105,7 @@ enum ReportTestFailure {
     /// Bytes present after rendering stopped.
     output:  Vec<u8>,
     /// Original assertion failure.
-    source:  TestFailure,
+    source:  ConditionFailure,
   },
   /// Text decoding failed, retaining the complete byte buffer.
   #[error(transparent)]
@@ -116,7 +124,7 @@ enum ReportTestFailure {
     /// Complete parsed document observed by the test.
     document: Value,
     /// Original assertion failure.
-    source:   TestFailure,
+    source:   ConditionFailure,
   },
   /// A text report violated an expectation.
   #[error("text report expectation failed: {source}")]
@@ -124,7 +132,7 @@ enum ReportTestFailure {
     /// Complete rendered text observed by the test.
     output: String,
     /// Original assertion failure.
-    source: TestFailure,
+    source: ConditionFailure,
   },
 }
 
@@ -133,7 +141,7 @@ enum ReportTestFailure {
 fn check_render(
   outcome: Result<(), ReportError>,
   output: Vec<u8>,
-  check: impl FnOnce(&Result<(), ReportError>, &[u8]) -> Result<(), TestFailure>,
+  check: impl FnOnce(&Result<(), ReportError>, &[u8]) -> Result<(), ConditionFailure>,
 ) -> Result<(), ReportTestFailure> {
   check(&outcome, &output).map_err(|source| ReportTestFailure::RenderExpectation {
     outcome: Box::new(outcome),
@@ -167,7 +175,7 @@ fn render_json(render: impl FnOnce(&mut Vec<u8>) -> Result<(), ReportError>) -> 
 
 /// Retain the complete JSON document when a report assertion fails.
 #[cfg(test)]
-fn check_json(document: Value, check: impl FnOnce(&Value) -> Result<(), TestFailure>) -> Result<(), ReportTestFailure> {
+fn check_json(document: Value, check: impl FnOnce(&Value) -> Result<(), ConditionFailure>) -> Result<(), ReportTestFailure> {
   check(&document).map_err(|source| ReportTestFailure::JsonExpectation {
     document,
     source,
@@ -182,7 +190,7 @@ fn render_text(render: impl FnOnce(&mut Vec<u8>) -> Result<(), ReportError>) -> 
 
 /// Retain the complete text report when an assertion fails.
 #[cfg(test)]
-fn check_text(output: String, check: impl FnOnce(&str) -> Result<(), TestFailure>) -> Result<(), ReportTestFailure> {
+fn check_text(output: String, check: impl FnOnce(&str) -> Result<(), ConditionFailure>) -> Result<(), ReportTestFailure> {
   check(&output).map_err(|source| ReportTestFailure::TextExpectation {
     output,
     source,
@@ -1555,7 +1563,7 @@ mod tests {
   use std::path::Path;
   use std::path::PathBuf;
 
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use tempfile::TempDir;
   use thiserror::Error;
@@ -1614,55 +1622,61 @@ mod tests {
 
   /// An empty slice has no adjacent runs.
   #[test]
-  fn empty_input_yields_no_runs() -> Result<(), TestFailure> {
+  fn empty_input_yields_no_runs() -> Result<(), ConditionFailure> {
     let items: [usize; 0] = [];
     ensure(
       split_runs_by(&items, |previous, current| consecutive(*previous, *current)).is_empty(),
       "empty input must not produce a run",
     )
+    .map(drop)
   }
 
   /// A consecutive slice stays one complete borrowed run.
   #[test]
-  fn single_run_stays_whole() -> Result<(), TestFailure> {
+  fn single_run_stays_whole() -> Result<(), ConditionFailure> {
     let items = [3, 4, 5, 6];
     let runs = split_runs_by(&items, |previous, current| consecutive(*previous, *current));
-    ensure(runs == [items.as_slice()], "adjacent input must remain one complete borrowed run")
+    ensure(runs == [items.as_slice()], "adjacent input must remain one complete borrowed run").map(drop)
   }
 
   /// Each gap starts a new run without losing an input element.
   #[test]
-  fn gaps_split_into_multiple_runs() -> Result<(), TestFailure> {
+  fn gaps_split_into_multiple_runs() -> Result<(), ConditionFailure> {
     let items = [1, 2, 5, 6, 9];
     let runs = split_runs_by(&items, |previous, current| consecutive(*previous, *current));
     ensure(
       runs == [[1, 2].as_slice(), [5, 6].as_slice(), [9].as_slice()],
       "each gap must split the input while preserving every element in order",
     )
+    .map(drop)
   }
 
   /// Failed report checks keep their full rendered subject and original rendering failure.
   #[test]
-  fn report_assertion_failures_preserve_their_subjects() -> Result<(), TestFailure> {
+  fn report_assertion_failures_preserve_their_subjects() -> Result<(), ConditionFailure> {
     let text = "complete rendered report\n";
-    let text_failure = check_text(text.to_owned(), |output| ensure(output.is_empty(), "expected an empty report"));
+    let text_failure = check_text(text.to_owned(), |output| {
+      ensure(output.is_empty(), "expected an empty report").map(drop)
+    });
     ensure(
       matches!(text_failure, Err(ReportTestFailure::TextExpectation { output, .. }) if output == text),
       "a failed text expectation retains every rendered character",
-    )?;
+    )
+    .map(drop)?;
     let document = serde_json::Value::from("complete JSON subject");
-    let json_failure = check_json(document.clone(), |output| ensure(output.is_null(), "expected null"));
+    let json_failure = check_json(document.clone(), |output| ensure(output.is_null(), "expected null").map(drop));
     ensure(
       matches!(json_failure, Err(ReportTestFailure::JsonExpectation { document: retained, .. }) if retained == document),
       "a failed JSON expectation retains the complete original value",
-    )?;
+    )
+    .map(drop)?;
     let render_failure = check_render(
       Err(ReportError::Write(io::Error::new(
         io::ErrorKind::BrokenPipe,
         "closed report stream",
       ))),
       b"written prefix".to_vec(),
-      |outcome, _output| ensure(outcome.is_ok(), "expected successful rendering"),
+      |outcome, _output| ensure(outcome.is_ok(), "expected successful rendering").map(drop),
     );
     ensure(
       matches!(render_failure, Err(ReportTestFailure::RenderExpectation { outcome, output, .. })
@@ -1671,6 +1685,7 @@ mod tests {
             if native.kind() == io::ErrorKind::BrokenPipe && native.to_string() == "closed report stream")),
       "a failed rendering expectation retains both the output prefix and complete native writer failure",
     )
+    .map(drop)
   }
 
   /// Native setup and analysis failures from pipeline behavior tests.
@@ -1681,7 +1696,7 @@ mod tests {
     Calculation(#[from] CoverageFailure),
     /// A direct grouping or coverage expectation failed.
     #[error(transparent)]
-    Assertion(#[from] TestFailure),
+    Assertion(#[from] ConditionFailure),
     /// A fixture filesystem operation failed.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -1696,7 +1711,7 @@ mod tests {
       /// Native lengths or typed interval failures in member order.
       measurements: Vec<Result<usize, LineRangeFailure>>,
       /// Failed behavioral expectation.
-      source:       TestFailure,
+      source:       ConditionFailure,
     },
     /// Preparing the registry fixture failed with its original typed evidence.
     #[error(transparent)]
@@ -1715,7 +1730,7 @@ mod tests {
       /// Complete native pipeline result, retained for inspection.
       outcome: Box<Result<AnalysisResult, AnalysisError>>,
       /// Assertion explaining the violated contract.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// A later outcome failed to preserve the findings and warnings from its baseline.
     #[error("pipeline preservation comparison failed: {source}")]
@@ -1725,7 +1740,7 @@ mod tests {
       /// Complete later pipeline result, including native failure evidence.
       outcome:  Box<Result<AnalysisResult, AnalysisError>>,
       /// Failed preservation expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// Coverage annotations differ from the expected complete AST and sub-AST groups.
     #[error("coverage annotation expectation failed: {source}")]
@@ -1735,14 +1750,14 @@ mod tests {
       /// Complete expected groups in the same order.
       expected: Box<(MatchedGroups, MatchedGroups)>,
       /// Failed behavioral expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
   }
 
   /// Keep the complete analysis available when one of its behavioral assertions fails.
   fn check_analysis<Observed>(
     analysis: AnalysisResult,
-    check: impl FnOnce(&AnalysisResult) -> Result<Observed, TestFailure>,
+    check: impl FnOnce(&AnalysisResult) -> Result<Observed, ConditionFailure>,
   ) -> Result<Observed, PipelineTestFailure> {
     check(&analysis).map_err(|source| PipelineTestFailure::Expectation {
       outcome: Box::new(Ok(analysis)),
@@ -1754,7 +1769,7 @@ mod tests {
   fn check_registry_analysis(
     outcome: Result<AnalysisResult, AnalysisError>,
     write: IgnoreFileWrite,
-    check: impl FnOnce(&AnalysisResult) -> Result<(), TestFailure>,
+    check: impl FnOnce(&AnalysisResult) -> Result<(), ConditionFailure>,
   ) -> Result<(), PipelineTestFailure> {
     outcome
       .map_err(PipelineTestFailure::Analysis)
@@ -1767,7 +1782,8 @@ mod tests {
                 && matches!(loaded.observation, IgnoreFileObservation::Read { ref contents }
                   if *contents == write.contents)),
             "analysis retains the exact registry path, complete model, and document from the successful write",
-          )?;
+          )
+          .map(drop)?;
           check(completed)
         })
       })
@@ -1947,6 +1963,7 @@ mod tests {
           if group.members.iter().map(|member| &member.file).eq([&first_doc, &second_doc])),
         "generic text from both documents survives while language-classified test files are excluded",
       )
+      .map(drop)
     })
   }
 
@@ -2044,7 +2061,8 @@ mod tests {
               .collect::<Vec<_>>()
               == expected_rules,
           context,
-        )?;
+        )
+        .map(drop)?;
         ensure(
           analysis
             .groups_with_suppressed()
@@ -2055,6 +2073,7 @@ mod tests {
             == expected_members,
           "coverage classification retains every field of the original line members",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -2099,6 +2118,7 @@ mod tests {
             && analysis.line_exact_groups.is_empty() == rule.is_some(),
           "one group's clipped union covers eight of ten lines in the first case and only six in the second; overlap cannot count twice",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -2135,7 +2155,7 @@ mod tests {
         && analysis.ignored_groups.is_empty()
         && analysis.ignore_file.is_none()),
       "registry failure retains complete pre-ignore findings, typed warnings, statistics, and liveness with the native decoding failure",
-    )
+    ).map(drop)
     .map_err(|source| PipelineTestFailure::Comparison {
       baseline: Box::new(baseline),
       outcome: Box::new(outcome),
@@ -2169,7 +2189,7 @@ mod tests {
             && statistics.source.completed == usize::MAX
             && units.last() == Some(statistics.source.unit.as_ref())
             && statistics.source.source == grouper::LineSumFailureCause::Overflow { incoming: 1 })),
-      "failed line accumulation retains the original corpus and earlier native registry failure without fabricated statistics")
+      "failed line accumulation retains the original corpus and earlier native registry failure without fabricated statistics").map(drop)
       .map_err(|source| PipelineTestFailure::Expectation { outcome: Box::new(outcome), source })
   }
 
@@ -2185,7 +2205,8 @@ mod tests {
       ensure(
         analysis.exact_groups.len() == 1,
         "the unfiltered function pair forms one exact group",
-      )?;
+      )
+      .map(drop)?;
       Ok(analysis.exact_groups.clone())
     })?;
     let expected_fingerprints = expected_groups.iter().map(|group| group.fingerprint).collect::<HashSet<_>>();
@@ -2210,6 +2231,7 @@ mod tests {
           && analysis.all_fingerprints == expected_fingerprints,
         "registry policy retains the complete ignored group and its pre-filter fingerprint liveness",
       )
+      .map(drop)
     })
   }
 
@@ -2224,7 +2246,8 @@ mod tests {
       ensure(
         analysis.near_groups.len() == 1,
         "the distinct bodies form one near group at the configured threshold",
-      )?;
+      )
+      .map(drop)?;
       Ok(analysis.near_groups.clone())
     })?;
     let expected_fingerprints = expected_groups.iter().map(|group| group.fingerprint).collect::<HashSet<_>>();
@@ -2254,6 +2277,7 @@ mod tests {
           && analysis.all_member_fingerprint_sets == expected_member_sets,
         "member-based registry matching preserves the complete near group, current identity, and pre-filter member sets",
       )
+      .map(drop)
     })
   }
 
@@ -2282,6 +2306,7 @@ mod tests {
       !is_covered_by_kept(&candidate, &[first_kept, second_kept], SAME_DIMENSION_OVERLAP_SUPPRESSION_RATIO)?,
       "unrelated retained groups cannot combine their coverage to suppress one candidate family",
     )
+    .map(drop)
     .map_err(PipelineTestFailure::from)
   }
 
@@ -2321,6 +2346,7 @@ return summed * iota;
         ]),
         "both merged members preserve the complete computation and its source span",
       )
+      .map(drop)
     })
   }
 
@@ -2353,6 +2379,7 @@ return summed * iota;
               && analysis.all_fingerprints.contains(&group.fingerprint)),
         "the setter pair remains detectable under its suppression rule and retains pre-ignore liveness",
       )
+      .map(drop)
     })
   }
 
@@ -2372,7 +2399,8 @@ return summed * iota;
       ensure(
         analysis.exact_groups.iter().map(|group| group.suppressed).collect::<Vec<_>>() == [None] && analysis.suppressed_groups.is_empty(),
         "a mixed group remains visible without a group-level suppression tag",
-      )?;
+      )
+      .map(drop)?;
       ensure(
         analysis
           .exact_groups
@@ -2383,6 +2411,7 @@ return summed * iota;
           == [("Gauge::with_a", Some(RuleId::AstSetterReturningSelf)), ("twin impl", None)],
         "only the method member receives the setter rule while the implementation member remains untagged",
       )
+      .map(drop)
     })
   }
 
@@ -2406,7 +2435,8 @@ return summed * iota;
       ensure(
         analysis.suppressed_groups.len() == 1,
         "the setter pair initially forms one rule-suppressed group",
-      )?;
+      )
+      .map(drop)?;
       Ok(analysis.suppressed_groups.clone())
     })?;
     let expected_fingerprints = expected_groups.iter().map(|group| group.fingerprint).collect::<HashSet<_>>();
@@ -2433,6 +2463,7 @@ return summed * iota;
           && analysis.all_fingerprints == expected_fingerprints,
         "registry policy retains the complete suppressed group as ignored and preserves its liveness",
       )
+      .map(drop)
     })
   }
 
@@ -2484,7 +2515,8 @@ let sink = glide + ballast;
             .collect::<Vec<_>>()
             == [Some(RuleId::GroupCoveredByAst)],
         "the AST pair stays visible and retains the covered line group under its rule",
-      )?;
+      )
+      .map(drop)?;
       ensure(
         analysis
           .exact_groups
@@ -2498,6 +2530,7 @@ let sink = glide + ballast;
           }],
         "the precise group records the covered dimension, match kind, and group count together",
       )
+      .map(drop)
     })
   }
 
@@ -2563,6 +2596,7 @@ let sink = glide + ballast;
       outcome == expected,
       "coverage events retain their independent owners and stable annotation order; an empty batch preserves existing notes",
     )
+    .map(drop)
     .map_err(|source| PipelineTestFailure::Coverage {
       outcome: Box::new(outcome),
       expected: Box::new(expected),
@@ -2603,6 +2637,7 @@ builder()
               && analysis.all_fingerprints.contains(&group.fingerprint)),
         "the complete chain-tail pair remains available with its rule, source identities, and pre-ignore liveness",
       )
+      .map(drop)
     })
   }
 
@@ -2624,7 +2659,8 @@ builder()
       ensure(
         analysis.line_exact_groups.len() == 1,
         "the original computation forms one merged group",
-      )?;
+      )
+      .map(drop)?;
       Ok(
         analysis
           .line_exact_groups
@@ -2644,6 +2680,7 @@ builder()
           == expected_fingerprints,
         "moving one computation below unrelated source preserves the complete merged group identity",
       )
+      .map(drop)
     })
   }
 
@@ -2673,7 +2710,8 @@ builder()
     ensure(
       uncovered_kept == expected_uncovered && uncovered_suppressed.is_empty(),
       "the wider concept ranks first while a fragment with an outside member remains fully visible",
-    )?;
+    )
+    .map(drop)?;
 
     let covered_fragment = test_group(DetectionDimension::Line, "covered", vec![
       make_unit(&first, 12, 16),
@@ -2688,6 +2726,7 @@ builder()
       covered_kept == [concept] && covered_suppressed == [expected_suppressed],
       "one concept covering every fragment member retains that complete fragment under the overlap rule",
     )
+    .map(drop)
     .map_err(PipelineTestFailure::from)
   }
 
@@ -2743,6 +2782,7 @@ pub fn {function_name}(input: Vec<i32>) -> i32 {{
           .all(|member| member.line_start >= 2 && member.line_end <= 9),
       "both fixture loop bodies retain at least five lines in one visible group without absorbing their distinct function names",
     )
+    .map(drop)
     .map_err(|source| PipelineTestFailure::LineMeasurements {
       analysis: Box::new(result),
       measurements,
@@ -2779,6 +2819,7 @@ pub fn {function_name}(input: Vec<i32>) -> i32 {{
                 && group.members.iter().map(|member| (&member.file, member.suppressed)).eq([(&first, rule), (&second, rule)])),
           "fallback extraction retains the complete branch pair, suppressing only the trivial shape with its rule",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -2816,6 +2857,7 @@ pub fn {function_name}(input: Vec<i32>) -> i32 {{
               == rule.is_some(),
           "each branch retains its actual chain identity; only an exact duplicate enclosing chain covers the branch group",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -2851,6 +2893,7 @@ pub fn {function_name}(input: Vec<i32>) -> i32 {{
             .any(|group| group.suppressed == Some(RuleId::GroupCoveredByAst)),
         "fallback parent spans are not precise coverage evidence and cannot hide the line pair",
       )
+      .map(drop)
     })
   }
 }

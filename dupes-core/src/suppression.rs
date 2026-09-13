@@ -421,7 +421,8 @@ impl SuppressionPolicy {
 mod tests {
   use std::collections::BTreeSet;
 
-  use strict_test_support::TestFailure;
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_eq;
 
@@ -433,34 +434,36 @@ mod tests {
 
   /// Every identity is represented once in the canonical registry.
   #[test]
-  fn every_rule_id_has_exactly_one_registry_row() -> Result<(), TestFailure> {
+  fn every_rule_id_has_exactly_one_registry_row() -> Result<(), ComparisonFailure<usize, usize>> {
     for id in RuleId::all() {
-      ensure_eq(&RULES.iter().filter(|rule| rule.id == *id).count(), &1, id.as_str())?;
+      ensure_eq(RULES.iter().filter(|rule| rule.id == *id).count(), 1, id.as_str()).map(drop)?;
     }
     ensure_eq(
-      &RULES.len(),
-      &RuleId::all().len(),
+      RULES.len(),
+      RuleId::all().len(),
       "registry rows and identities have the same cardinality",
     )
+    .map(drop)
   }
 
   /// Stable rule strings are unique and parse back to their complete identities.
   #[test]
-  fn rule_id_strings_are_unique_and_round_trip() -> Result<(), TestFailure> {
+  fn rule_id_strings_are_unique_and_round_trip() -> Result<(), ConditionFailure> {
     let mut seen = BTreeSet::new();
     for id in RuleId::all() {
-      ensure(seen.insert(id.as_str()), id.as_str())?;
+      ensure(seen.insert(id.as_str()), id.as_str()).map(drop)?;
       ensure(
         RuleId::parse(id.as_str()) == Some(*id),
         "rule text round-trips to its complete identity",
-      )?;
+      )
+      .map(drop)?;
     }
-    ensure(RuleId::parse("ast.unknown-rule").is_none(), "unknown rule identifiers are rejected")
+    ensure(RuleId::parse("ast.unknown-rule").is_none(), "unknown rule identifiers are rejected").map(drop)
   }
 
   /// Admission remains restricted to the declared line-shape rules.
   #[test]
-  fn admit_rules_are_exactly_the_line_carve_outs() -> Result<(), TestFailure> {
+  fn admit_rules_are_exactly_the_line_carve_outs() -> Result<(), ConditionFailure> {
     let admits: Vec<RuleId> = RULES
       .iter()
       .filter(|rule| rule.action == RuleAction::Admit)
@@ -470,16 +473,17 @@ mod tests {
       admits == [RuleId::LineDeclarationStanza, RuleId::LineBuilderChainRun],
       "only the declared line rules admit candidates",
     )
+    .map(drop)
   }
 
   /// Enable wins after disable, while unknown requests retain their direction and text.
   #[test]
-  fn policy_resolution_applies_disable_then_enable_with_warnings() -> Result<(), TestFailure> {
+  fn policy_resolution_applies_disable_then_enable_with_warnings() -> Result<(), ConditionFailure> {
     let (enabled_policy, unknown_warnings) = SuppressionPolicy::resolve(&["line.chain-tail".to_owned(), "no.such-rule".to_owned()], &[
       "line.chain-tail".to_owned(),
       "no.such-rule".to_owned(),
     ]);
-    ensure(enabled_policy.is_enabled(RuleId::LineChainTail), "enable overrides disable")?;
+    ensure(enabled_policy.is_enabled(RuleId::LineChainTail), "enable overrides disable").map(drop)?;
     ensure(
       unknown_warnings
         == [
@@ -491,35 +495,40 @@ mod tests {
           },
         ],
       "unknown identifiers retain each requested action in application order",
-    )?;
+    )
+    .map(drop)?;
 
     let (disabled_policy, known_warnings) = SuppressionPolicy::resolve(&["sub.value-plumbing".to_owned()], &[]);
-    ensure(known_warnings.is_empty(), "known identifiers do not warn")?;
+    ensure(known_warnings.is_empty(), "known identifiers do not warn").map(drop)?;
     ensure(
       !disabled_policy.is_enabled(RuleId::SubValuePlumbing),
       "disabled rules stay inactive",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       disabled_policy.allow(RuleId::SubValuePlumbing).is_none(),
       "disabled classifiers cannot tag candidates",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       disabled_policy.allow(RuleId::SubNoStructure) == Some(RuleId::SubNoStructure),
       "other active rules retain their identity",
     )
+    .map(drop)
   }
 
   /// Incremental requests preserve unrelated policy and override earlier layers.
   #[test]
-  fn toggles_layer_on_top_of_an_existing_policy() -> Result<(), TestFailure> {
+  fn toggles_layer_on_top_of_an_existing_policy() -> Result<(), ConditionFailure> {
     let (mut policy, initial_warnings) = SuppressionPolicy::resolve(&["line.chain-tail".to_owned()], &[]);
-    ensure(initial_warnings.is_empty(), "the initial policy uses known rules")?;
+    ensure(initial_warnings.is_empty(), "the initial policy uses known rules").map(drop)?;
     let overlay_warnings = policy.apply_toggles(&["token.low-signal".to_owned()], &["line.chain-tail".to_owned()]);
-    ensure(overlay_warnings.is_empty(), "the overlay uses known rules")?;
+    ensure(overlay_warnings.is_empty(), "the overlay uses known rules").map(drop)?;
     ensure(
       policy.is_enabled(RuleId::LineChainTail),
       "the overlay re-enables the existing disabled rule",
-    )?;
-    ensure(!policy.is_enabled(RuleId::TokenLowSignal), "the overlay disables its selected rule")
+    )
+    .map(drop)?;
+    ensure(!policy.is_enabled(RuleId::TokenLowSignal), "the overlay disables its selected rule").map(drop)
   }
 }

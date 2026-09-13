@@ -8,7 +8,9 @@ use assert_cmd::Command;
 use assert_cmd::assert::Assert;
 use assert_cmd::assert::AssertError;
 use serde_json::Value;
-use strict_test_support::TestFailure;
+use strict_test_support::ComparisonFailure;
+use strict_test_support::ConditionFailure;
+use strict_test_support::OptionFailure;
 
 /// Failure of a shared CLI test operation, preserving its native cause and inputs.
 #[derive(Debug, thiserror::Error)]
@@ -123,7 +125,22 @@ pub enum CliTestFailure {
   },
   /// A panic-free expectation from the shared test vocabulary failed.
   #[error(transparent)]
-  Expectation(#[from] TestFailure),
+  Expectation(#[from] ConditionFailure),
+  /// A reported count differed from its complete expected native value.
+  #[error(transparent)]
+  CountComparison(#[from] ComparisonFailure<u64, u64>),
+  /// A collection length differed from its complete expected native value.
+  #[error(transparent)]
+  LengthComparison(#[from] ComparisonFailure<usize, usize>),
+  /// Textual report values differed, retaining both complete strings.
+  #[error(transparent)]
+  TextComparison(#[from] ComparisonFailure<String, String>),
+  /// A required JSON group was absent from the inspected report.
+  #[error(transparent)]
+  MissingGroup(#[from] OptionFailure<Value>),
+  /// A required member-name population was absent from the inspected report.
+  #[error(transparent)]
+  MissingMemberNames(#[from] OptionFailure<Vec<String>>),
 }
 
 impl From<AssertError> for CliTestFailure {

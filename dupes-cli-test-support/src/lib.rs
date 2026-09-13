@@ -752,7 +752,7 @@ stdout_case_helpers! {
 /// Returns the run or report-check failure with its native evidence.
 pub fn json_format_stats(command: CommandFactory) -> Result<(), CliTestFailure> {
   check_json(fixture_json(command, "exact_dupes", &["--format", "json", "stats"])?, |report| {
-    ensure(json_count(report, "total_code_units")? > 0, "stats must count analyzed code units")?;
+    ensure(json_count(report, "total_code_units")? > 0, "stats must count analyzed code units").map(drop)?;
     Ok(())
   })
 }
@@ -766,18 +766,19 @@ pub fn json_format_stats(command: CommandFactory) -> Result<(), CliTestFailure> 
 pub fn json_format_report(command: CommandFactory) -> Result<(), CliTestFailure> {
   check_json(fixture_json(command, "exact_dupes", &["--format", "json", "report"])?, |report| {
     let stats = json_field(report, "stats")?;
-    ensure(json_count(stats, "total_code_units")? > 0, "report stats must count analyzed units")?;
+    ensure(json_count(stats, "total_code_units")? > 0, "report stats must count analyzed units").map(drop)?;
     ensure(
       json_count(stats, "exact_duplicate_groups")? > 0,
       "report stats must count exact groups",
-    )?;
+    )
+    .map(drop)?;
     let groups = json_array(json_field(report, "groups")?)?;
-    ensure(!groups.is_empty(), "the duplicated fixture must produce groups")?;
+    ensure(!groups.is_empty(), "the duplicated fixture must produce groups").map(drop)?;
     for group in groups {
-      ensure(json_field(group, "fingerprint")?.is_string(), "group fingerprints must be strings")?;
-      ensure(json_field(group, "dimension")?.is_string(), "group dimensions must be strings")?;
-      ensure(json_field(group, "match_kind")?.is_string(), "group match kinds must be strings")?;
-      ensure(json_field(group, "members")?.is_array(), "group members must be arrays")?;
+      ensure(json_field(group, "fingerprint")?.is_string(), "group fingerprints must be strings").map(drop)?;
+      ensure(json_field(group, "dimension")?.is_string(), "group dimensions must be strings").map(drop)?;
+      ensure(json_field(group, "match_kind")?.is_string(), "group match kinds must be strings").map(drop)?;
+      ensure(json_field(group, "members")?.is_array(), "group members must be arrays").map(drop)?;
     }
     Ok(())
   })
@@ -793,11 +794,13 @@ pub fn json_stats_includes_line_counts(command: CommandFactory) -> Result<(), Cl
     ensure(
       json_field(report, "exact_duplicate_lines")?.is_u64(),
       "exact duplicate lines must be an unsigned count",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       json_field(report, "near_duplicate_lines")?.is_u64(),
       "near duplicate lines must be an unsigned count",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   })
 }
@@ -841,7 +844,8 @@ pub fn exclude_tests_flag_reduces_duplicates(command: CommandFactory) -> Result<
     ensure(
       json_count(report, "exact_duplicate_units")? == 3,
       "the unfiltered fixture includes its test duplicate",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   })?;
   check_json(
@@ -853,7 +857,8 @@ pub fn exclude_tests_flag_reduces_duplicates(command: CommandFactory) -> Result<
           json_count(report, "total_code_units")?,
         ) == (2, 2),
         "excluding tests must preserve both non-test duplicates",
-      )?;
+      )
+      .map(drop)?;
       Ok(())
     },
   )
@@ -876,7 +881,8 @@ pub fn dimension_option_limits_reported_dimensions(command: CommandFactory) -> R
       ensure(
         json_count(report, "exact_duplicate_groups")? > 0,
         "the fixture must have exact groups before dimension filtering",
-      )?;
+      )
+      .map(drop)?;
       Ok(())
     },
   )?;
@@ -886,17 +892,19 @@ pub fn dimension_option_limits_reported_dimensions(command: CommandFactory) -> R
     ])?,
     |report| {
       let groups = json_array(json_field(report, "groups")?)?;
-      ensure(!groups.is_empty(), "line-only analysis must report line duplicate groups")?;
+      ensure(!groups.is_empty(), "line-only analysis must report line duplicate groups").map(drop)?;
       for group in groups {
         ensure(
           json_text(json_field(group, "dimension")?)? == "line",
           "line-only analysis must report only line groups",
-        )?;
+        )
+        .map(drop)?;
       }
       ensure(
         json_count(json_field(report, "stats")?, "exact_duplicate_groups")? == 0,
         "line-only analysis must omit AST exact groups",
-      )?;
+      )
+      .map(drop)?;
       Ok(())
     },
   )
@@ -1011,7 +1019,8 @@ pub fn sub_function_json_stats(command: CommandFactory) -> Result<(), CliTestFai
       ensure(
         (json_count(report, "sub_exact_groups")?, json_count(report, "sub_exact_units")?) == (3, 6),
         "sub-function stats must retain the fixture's three pairs",
-      )?;
+      )
+      .map(drop)?;
       Ok(())
     },
   )
@@ -1043,7 +1052,8 @@ pub fn without_sub_function_json_no_sub_fields(command: CommandFactory) -> Resul
       ensure(
         report.get("sub_exact_groups").is_none() && report.get("sub_near_groups").is_none(),
         "disabled sub-function analysis must omit its JSON stats fields",
-      )?;
+      )
+      .map(drop)?;
       Ok(())
     },
   )
@@ -1152,7 +1162,8 @@ pub fn cleanup_removes_stale_entries(command: CommandFactory) -> Result<(), CliT
   ensure(
     !final_content.contains("deadbeefdeadbeef"),
     "cleanup must remove the stale fingerprint",
-  )?;
+  )
+  .map(drop)?;
   Ok(())
 }
 
@@ -1170,7 +1181,7 @@ pub fn cleanup_dry_run(command: CommandFactory) -> Result<(), CliTestFailure> {
     "Stale entries (dry run)", "deadbeefdeadbeef", "would be removed",
   ])?;
   let content = read_fixture(&ignore_path)?;
-  ensure(content == original, "cleanup dry-run must preserve the complete ignore file")?;
+  ensure(content == original, "cleanup dry-run must preserve the complete ignore file").map(drop)?;
   Ok(())
 }
 
@@ -1214,7 +1225,8 @@ mod tests {
         }) if variable == "CARGO_BIN_EXE_missing-cli-test-executable"
       ),
       "binary discovery must preserve the requested name instead of becoming a launch or assertion failure",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -1235,7 +1247,8 @@ mod tests {
           && command.get_envs().next().is_none()
           && matches!(source.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)),
       "a launch failure must retain all prepared command inputs and the native path failure",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -1252,18 +1265,19 @@ mod tests {
           observed.status == expected.status && observed.stdout == expected.stdout && observed.stderr == expected.stderr,
           "the typed assertion failure must retain the native exit status and both complete streams",
         )
+        .map(drop)
         .map_err(|source| CliTestFailure::Output {
           captured: Box::new(assertion),
           source:   Box::new(CliTestFailure::Expectation(source)),
         })
       }
       Err(source) => Err(source),
-      Ok(assertion) => {
-        ensure(false, "a missing stdout needle must produce the native assertion failure").map_err(|source| CliTestFailure::Output {
+      Ok(assertion) => ensure(false, "a missing stdout needle must produce the native assertion failure")
+        .map(drop)
+        .map_err(|source| CliTestFailure::Output {
           captured: Box::new(assertion),
           source:   Box::new(CliTestFailure::Expectation(source)),
-        })
-      }
+        }),
     }
   }
 
@@ -1276,7 +1290,8 @@ mod tests {
       matches!(temp_copy_fixture(missing_fixture), Err(CliTestFailure::Fixture { path, source })
         if path == source_path && source.kind() == ErrorKind::NotFound),
       "a missing fixture retains the original source path and filesystem failure",
-    )?;
+    )
+    .map(drop)?;
     let directory = temp_copy_fixture("no_dupes")?;
     let missing = directory.path().join("missing").join("input.rs");
     for outcome in [read_fixture(&missing).map(drop), write_fixture(&missing, b"source")] {
@@ -1284,7 +1299,8 @@ mod tests {
         matches!(outcome, Err(CliTestFailure::Fixture { path, source })
           if path == missing && source.kind() == ErrorKind::NotFound),
         "both fixture reads and writes retain their complete path and native missing-parent failure",
-      )?;
+      )
+      .map(drop)?;
     }
     let invalid_text = directory.path().join("native-bytes");
     write_fixture(&invalid_text, [0xff])?;
@@ -1292,7 +1308,8 @@ mod tests {
       matches!(read_fixture(&invalid_text), Err(CliTestFailure::Fixture { path, source })
         if path == invalid_text && source.kind() == ErrorKind::InvalidData),
       "fixture text decoding preserves the affected path and native invalid-data failure",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -1300,19 +1317,22 @@ mod tests {
   fn report_queries_preserve_members_and_distinguish_absence() -> Result<(), CliTestFailure> {
     let report = json_from_stdout(br#"{"groups":[{"dimension":"ast","members":[{"name":"render","file":"src/view.rs"}]}]}"#)?;
     let groups = groups_of_dimension(&report, "ast")?;
-    ensure_eq(&groups.len(), &1, "the report contains one AST group")?;
+    ensure_eq(groups.len(), 1, "the report contains one AST group").map(drop)?;
     ensure(
       group_containing_member(&report, "render", "view.rs")? == groups.first().copied(),
       "member lookup returns the complete matching group",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       group_containing_member(&report, "render", "other.rs")?.is_none(),
       "member lookup requires both name and file",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       groups_of_dimension(&report, "line")?.is_empty(),
       "dimension filtering preserves actual absence",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -1323,29 +1343,34 @@ mod tests {
       matches!(json_from_stdout(input), Err(CliTestFailure::Json { input: bytes, source })
       if bytes == input && source.is_eof()),
       "invalid JSON retains its bytes and native parser category",
-    )?;
+    )
+    .map(drop)?;
     let report = json_from_stdout(br#"{"groups":false,"total_code_units":"many"}"#)?;
     ensure(
       matches!(groups_of_dimension(&report, "ast"), Err(CliTestFailure::JsonShape { document, .. })
       if document == false),
       "malformed groups must not become an empty result",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       matches!(json_count(&report, "total_code_units"), Err(CliTestFailure::JsonShape { document, .. })
       if document == "many"),
       "malformed counts retain the original value",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       matches!(json_field(&report, "members"), Err(CliTestFailure::JsonField { document, field })
       if document == report && field == "members"),
       "missing fields retain the inspected object and requested key",
-    )?;
+    )
+    .map(drop)?;
     let invalid_dimension = json_from_stdout(br#"{"groups":[{"dimension":false,"members":[]}]}"#)?;
     ensure(
       matches!(groups_of_dimension(&invalid_dimension, "ast"), Err(CliTestFailure::JsonShape { document, context })
         if document == false && context == "field must be a string"),
       "a malformed dimension must retain its original value instead of becoming an absent group",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -1356,14 +1381,16 @@ mod tests {
       ensure(
         json_count(json_field(document, "stats")?, "total_code_units")? == 5,
         "expected five units",
-      )?;
+      )
+      .map(drop)?;
       Ok(())
     });
     ensure(
       matches!(outcome, Err(CliTestFailure::Report { document, source })
       if document == report && matches!(*source, CliTestFailure::Expectation(_))),
       "semantic failures must retain the full report and the original expectation",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -1371,54 +1398,57 @@ mod tests {
   fn fingerprint_selection_preserves_copyable_text_and_missing_report() -> Result<(), CliTestFailure> {
     let report = "fingerprint: abc123, members: 2\nfingerprint: def456, similarity: 0.9\n";
     ensure_eq(
-      &report_fingerprint(report, false)?.as_str(),
-      &"abc123",
+      report_fingerprint(report, false)?,
+      "abc123".to_owned(),
       "exact fingerprints remain copyable",
-    )?;
+    )
+    .map(drop)?;
     ensure_eq(
-      &report_fingerprint(report, true)?.as_str(),
-      &"def456",
+      report_fingerprint(report, true)?,
+      "def456".to_owned(),
       "near selection skips the exact group",
-    )?;
+    )
+    .map(drop)?;
     let exact_only = "fingerprint: abc123, members: 2\n";
     ensure(
       matches!(report_fingerprint(exact_only, true), Err(CliTestFailure::ReportFingerprint { report: observed_report, require_similarity })
       if observed_report == exact_only && require_similarity),
       "a missing near fingerprint must retain the complete report and requested kind",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
   #[test]
   fn suppression_counts_distinguish_absent_rules_from_malformed_counts() -> Result<(), CliTestFailure> {
     let report = json_from_stdout(br#"{"suppressed_by_rule":{"active":3,"invalid":"three"}}"#)?;
+    ensure_eq(suppressed_count_for_rule(&report, "active")?, 3, "present rule counts remain exact").map(drop)?;
     ensure_eq(
-      &suppressed_count_for_rule(&report, "active")?,
-      &3,
-      "present rule counts remain exact",
-    )?;
-    ensure_eq(
-      &suppressed_count_for_rule(&report, "absent")?,
-      &0,
+      suppressed_count_for_rule(&report, "absent")?,
+      0,
       "an absent rule has no suppressed units",
-    )?;
+    )
+    .map(drop)?;
     ensure_eq(
-      &suppressed_count_for_rule(&json_from_stdout(b"{}")?, "absent")?,
-      &0,
+      suppressed_count_for_rule(&json_from_stdout(b"{}")?, "absent")?,
+      0,
       "an absent suppression surface has no suppressed units",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       matches!(suppressed_count_for_rule(&report, "invalid"), Err(CliTestFailure::JsonShape { document, .. })
       if document == "three"),
       "malformed suppression counts must retain the invalid value",
-    )?;
+    )
+    .map(drop)?;
     let invalid_surface = json_from_stdout(br#"{"suppressed_by_rule":["active",3]}"#)?;
     ensure(
       matches!(suppressed_count_for_rule(&invalid_surface, "active"), Err(CliTestFailure::JsonShape { document, context })
         if &document == json_field(&invalid_surface, "suppressed_by_rule")?
           && context == "suppression attribution must be an object"),
       "malformed suppression attribution must retain the complete surface instead of becoming zero",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 }

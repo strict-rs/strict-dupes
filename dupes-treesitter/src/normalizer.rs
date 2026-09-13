@@ -550,8 +550,10 @@ mod tests {
   use dupes_core::node::NormalizedNode;
   use dupes_core::node::PlaceholderKind;
   use dupes_core::node::UnOpKind;
-  use strict_test_support::TestFailure;
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
+  use strict_test_support::ensure_eq;
 
   use super::NodeTextError;
   use super::NormalizationError;
@@ -578,7 +580,7 @@ mod tests {
       /// Native tree used by the attempt.
       tree:    tree_sitter::Tree,
       /// Failed evidence-preservation expectation.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// Parsing returned no tree for the supplied fixture.
     #[error("the parser returned no tree for {input:?}")]
@@ -595,25 +597,11 @@ mod tests {
       selection: &'static str,
     },
     /// A normalized tree violated the expected semantic contract.
-    #[error("{source}; actual normalized tree: {actual:?}; expected: {expected:?}")]
-    Normalized {
-      /// Complete normalized result under test.
-      actual:   Box<NormalizedNode>,
-      /// Complete expected normalized result.
-      expected: Box<NormalizedNode>,
-      /// Failed semantic expectation.
-      source:   TestFailure,
-    },
+    #[error(transparent)]
+    Normalized(#[from] Box<ComparisonFailure<NormalizedNode, NormalizedNode>>),
     /// Normalized children violated their complete sequence expectation.
-    #[error("{source}; actual children: {actual:?}; expected: {expected:?}")]
-    Children {
-      /// Complete child sequence returned by normalization.
-      actual:   Vec<NormalizedNode>,
-      /// Complete expected child sequence.
-      expected: Vec<NormalizedNode>,
-      /// Failed semantic expectation.
-      source:   TestFailure,
-    },
+    #[error(transparent)]
+    Children(#[from] ComparisonFailure<Vec<NormalizedNode>, Vec<NormalizedNode>>),
     /// A malformed fixture did not preserve its native or normalized error signal.
     #[error("{source}; parse tree: {tree:?}; normalized tree: {normalized:?}")]
     Malformed {
@@ -622,7 +610,7 @@ mod tests {
       /// Complete normalized representation of that tree.
       normalized: Box<NormalizedNode>,
       /// Failed semantic expectation.
-      source:     TestFailure,
+      source:     ConditionFailure,
     },
   }
 
@@ -697,25 +685,12 @@ mod tests {
     NormalizedNode::leaf(NodeKind::Placeholder(PlaceholderKind::Variable, index))
   }
 
-  /// Compare complete normalized trees and retain both sides on failure.
-  fn check_node(actual: NormalizedNode, expected: NormalizedNode) -> Result<(), NormalizerTestFailure> {
-    ensure(
-      actual == expected,
-      "normalization preserves the expected kinds and ordered children",
-    )
-    .map_err(|source| NormalizerTestFailure::Normalized {
-      actual: Box::new(actual),
-      expected: Box::new(expected),
-      source,
-    })
-  }
-
   /// Check a fallible attempt while retaining its complete outcome and caller-owned context.
   fn check_attempt(
     tree: tree_sitter::Tree,
     mut context: NormalizationContext,
     outcome: Result<NormalizedNode, NormalizationError>,
-    check: impl FnOnce(&Result<NormalizedNode, NormalizationError>, &mut NormalizationContext) -> Result<(), TestFailure>,
+    check: impl FnOnce(&Result<NormalizedNode, NormalizationError>, &mut NormalizationContext) -> Result<(), ConditionFailure>,
   ) -> Result<(), NormalizerTestFailure> {
     check(&outcome, &mut context).map_err(|source| NormalizerTestFailure::FailureEvidence {
       outcome: Box::new(outcome),
@@ -730,20 +705,19 @@ mod tests {
     let tree = parse(source)?;
     let statement = first_stmt(&tree)?;
     let actual = normalize_ts_node(&statement, source.as_bytes(), &test_mapping(), &mut NormalizationContext::new())?;
-    check_node(actual, expected)
+    ensure_eq(actual, expected, "statement normalization preserves all kinds and ordered children")
+      .map(drop)
+      .map_err(Box::new)
+      .map_err(NormalizerTestFailure::from)
   }
 
   /// Normalize all statements with one shared identifier context.
   fn check_statements(source: &str, mapping: &NodeMapping, expected: Vec<NormalizedNode>) -> Result<(), NormalizerTestFailure> {
     let tree = parse(source)?;
     let actual = normalize_named_children(&tree.root_node(), source.as_bytes(), mapping, &mut NormalizationContext::new())?;
-    ensure(actual == expected, "normalization preserves the complete ordered child sequence").map_err(|failure| {
-      NormalizerTestFailure::Children {
-        actual,
-        expected,
-        source: failure,
-      }
-    })
+    ensure_eq(actual, expected, "normalization preserves the complete ordered child sequence")
+      .map(drop)
+      .map_err(NormalizerTestFailure::from)
   }
 
   /// Normalize a function body without including its declaration's identifiers.
@@ -756,7 +730,14 @@ mod tests {
         selection: "the function body",
       })?;
     let actual = normalize_ts_node(&body, source.as_bytes(), &test_mapping(), &mut NormalizationContext::new())?;
-    check_node(actual, NormalizedNode::with_children(NodeKind::Block, expected))
+    ensure_eq(
+      actual,
+      NormalizedNode::with_children(NodeKind::Block, expected),
+      "function-body normalization retains every ordered child in its block",
+    )
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(NormalizerTestFailure::from)
   }
 
   /// Detect an opaque subtree without depending on malformed grammar internals.
@@ -806,7 +787,14 @@ mod tests {
         selection: "the integer literal expression",
       })?;
     let actual = normalize_ts_node(&literal, source.as_bytes(), &test_mapping(), &mut NormalizationContext::new())?;
-    check_node(actual, NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)))
+    ensure_eq(
+      actual,
+      NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)),
+      "integer syntax normalizes to the complete integer literal node",
+    )
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(NormalizerTestFailure::from)
   }
 
   /// String syntax remains distinct from numeric literals.
@@ -986,6 +974,7 @@ mod tests {
       root.has_error() && has_opaque(&normalized),
       "malformed syntax retains its native parse-error observation and an opaque normalized subtree",
     )
+    .map(drop)
     .map_err(|failure| NormalizerTestFailure::Malformed {
       tree,
       normalized: Box::new(normalized),
@@ -1028,6 +1017,7 @@ mod tests {
           if input == b"na" && range == expected_range),
         "a missing identifier range is reported with the complete bytes instead of panicking or inventing a placeholder",
       )
+      .map(drop)
     })
   }
 
@@ -1049,6 +1039,7 @@ mod tests {
               && source.valid_up_to() == 0 && source.error_len() == Some(1)),
           "unreadable identifiers and operators retain their input, selected range, and native UTF-8 error",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -1070,7 +1061,7 @@ mod tests {
         source: ref child_error,
       }) = *observed
       else {
-        return ensure(false, "the second statement must fail after the first statement was normalized");
+        return ensure(false, "the second statement must fail after the first statement was normalized").map(drop);
       };
       let preserved = kind == "module"
         && range == root_range
@@ -1086,6 +1077,7 @@ mod tests {
           && placeholders.placeholder("after", PlaceholderKind::Variable) == 1,
         "the failed child retains completed siblings, the nested native failure, and the caller's established placeholders",
       )
+      .map(drop)
     })
   }
 
@@ -1148,6 +1140,7 @@ mod tests {
           "structural child failures retain their parent, completed children, native text failure, and established placeholders without \
            normalizing later children",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -1163,10 +1156,19 @@ mod tests {
       NodeMapping::new().skip(&["expression_statement"]),
     ] {
       let normalized = normalize_ts_node(&statement, b"\xff", &mapping, &mut NormalizationContext::new())?;
-      check_node(normalized, NormalizedNode::leaf(NodeKind::Opaque))?;
+      ensure_eq(
+        normalized,
+        NormalizedNode::leaf(NodeKind::Opaque),
+        "opaque and skipped nodes do not read unused source bytes",
+      )
+      .map(drop)
+      .map_err(Box::new)?;
     }
     let identifier = first_expression(&tree)?;
     let normalized = normalize_ts_node(&identifier, b"name\n\xff", &test_mapping(), &mut NormalizationContext::new())?;
-    check_node(normalized, variable(0))
+    ensure_eq(normalized, variable(0), "identifier normalization reads only its own byte range")
+      .map(drop)
+      .map_err(Box::new)
+      .map_err(NormalizerTestFailure::from)
   }
 }

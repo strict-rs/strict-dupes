@@ -28,7 +28,7 @@ mod tests {
   use dupes_python::PythonAnalyzer;
   use dupes_python::PythonAnalyzerError;
   use dupes_treesitter::analyzer::TreeSitterParseError;
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use tempfile::TempDir;
 
@@ -72,7 +72,7 @@ mod tests {
       /// Complete parsed unit population.
       units:  Vec<CodeUnit>,
       /// Failed semantic expectation.
-      source: TestFailure,
+      source: ConditionFailure,
     },
     /// Exact grouping did not satisfy its required contract.
     #[error("{source}; units: {units:?}; exact groups: {groups:?}")]
@@ -82,7 +82,7 @@ mod tests {
       /// Complete exact groups returned by the owner.
       groups: Vec<DuplicateGroup>,
       /// Failed semantic expectation.
-      source: TestFailure,
+      source: ConditionFailure,
     },
     /// Near grouping did not satisfy its required contract.
     #[error("{source}; units: {units:?}; exact groups: {exact:?}; near groups: {near:?}")]
@@ -94,7 +94,7 @@ mod tests {
       /// Complete near groups returned by the owner.
       near:   Vec<DuplicateGroup>,
       /// Failed semantic expectation.
-      source: Box<TestFailure>,
+      source: Box<ConditionFailure>,
     },
     /// A similarity result violated the fixture's expected relation.
     #[error("{source}; document: {document:?}; expected {expected:?} against {threshold}; units: {units:?}; similarity: {score:?}")]
@@ -110,7 +110,7 @@ mod tests {
       /// Complete calculation outcome, absent only when extraction did not produce a pair.
       score:     Box<Option<Result<SimilarityScore, SimilarityFailure>>>,
       /// Failed semantic expectation.
-      source:    Box<TestFailure>,
+      source:    Box<ConditionFailure>,
     },
     /// Statistics did not satisfy the expected exact-duplication contract.
     #[error(
@@ -131,7 +131,7 @@ mod tests {
       /// Complete statistics returned by the owner.
       stats:     Box<DuplicationStats>,
       /// Failed semantic expectation.
-      source:    Box<TestFailure>,
+      source:    Box<ConditionFailure>,
     },
     /// Test exclusion did not satisfy its contract across both complete analyses.
     #[error("{source}; analysis outcomes: {outcomes:?}")]
@@ -139,7 +139,7 @@ mod tests {
       /// Both native results, including successful or partially failed analyses.
       outcomes: Box<[PythonAnalysisOutcome; 2]>,
       /// Failed semantic expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
   }
 
@@ -207,6 +207,7 @@ def mul(a, b):
       units.len() == 3 && members == [vec!["add", "add2"]],
       "only the two equivalent functions form an exact group",
     )
+    .map(drop)
     .map_err(|source| PipelineTestFailure::Exact {
       units,
       groups,
@@ -234,6 +235,7 @@ def div(a, b):
       units.len() == 3 && groups.is_empty(),
       "different function operators produce no exact group",
     )
+    .map(drop)
     .map_err(|source| PipelineTestFailure::Exact {
       units,
       groups,
@@ -268,6 +270,7 @@ def process_mul(a, b):
       units.len() == 2 && exact.is_empty() && members == [vec!["process_add", "process_mul"]],
       "similar definitions form one near group and no exact group",
     )
+    .map(drop)
     .map_err(|source| PipelineTestFailure::Near {
       units,
       exact,
@@ -316,6 +319,7 @@ def complex(a, b, c):
         matches!(&score, Some(Ok(value)) if value.value.total_cmp(&threshold) == expected),
         "the extracted pair satisfies its required similarity relation",
       )
+      .map(drop)
       .map_err(|source| PipelineTestFailure::Similarity {
         document: document.to_owned(),
         threshold,
@@ -361,8 +365,9 @@ def mul(a, b):
           stats.exact_duplicate_groups, stats.exact_duplicate_units, stats.exact_duplicate_lines,
         ) == (0, 0, 0)
       };
-      ensure(accepts, "exact statistics follow the participating duplicate population").map_err(|source| {
-        PipelineTestFailure::Statistics {
+      ensure(accepts, "exact statistics follow the participating duplicate population")
+        .map(drop)
+        .map_err(|source| PipelineTestFailure::Statistics {
           document: document.to_owned(),
           has_exact,
           units,
@@ -370,8 +375,7 @@ def mul(a, b):
           near,
           stats: Box::new(stats),
           source: Box::new(source),
-        }
-      })?;
+        })?;
     }
     Ok(())
   }
@@ -399,6 +403,7 @@ def regular():
       observed == [("test_something", true), ("regular", false)],
       "the analyzer trait retains positive and negative test-name classification",
     )
+    .map(drop)
     .map_err(|source| PipelineTestFailure::Units {
       units,
       source,
@@ -450,6 +455,7 @@ def test_add2():
       if with_tests.stats.total_code_units == 4 && without_tests.stats.total_code_units == 2),
       "test exclusion removes both test definitions while retaining both ordinary functions",
     )
+    .map(drop)
     .map_err(|source| PipelineTestFailure::Analysis {
       outcomes: Box::new(outcomes),
       source,

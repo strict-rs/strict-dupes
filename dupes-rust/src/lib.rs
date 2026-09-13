@@ -71,7 +71,7 @@ mod tests {
   use dupes_core::ignore::IgnoreFileError;
   use dupes_core::ignore::ignore_file_path;
   use dupes_core::source::SourceReadError;
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use tempfile::TempDir;
 
@@ -96,7 +96,7 @@ mod tests {
     /// Complete native parse results observed by the test.
     outcomes: Vec<Result<Vec<CodeUnit>, RustParseError>>,
     /// Behavioral expectation that failed.
-    source:   TestFailure,
+    source:   ConditionFailure,
   }
 
   /// Native fixture failures or a full pipeline result that violated its contract.
@@ -111,14 +111,14 @@ mod tests {
       /// Complete native pipeline result.
       outcome: Box<PipelineOutcome>,
       /// Failed behavioral expectation.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
   }
 
   /// Preserve native parse results across a failed behavioral assertion.
   fn check_results(
     outcomes: Vec<Result<Vec<CodeUnit>, RustParseError>>,
-    check: impl FnOnce(&[Result<Vec<CodeUnit>, RustParseError>]) -> Result<(), TestFailure>,
+    check: impl FnOnce(&[Result<Vec<CodeUnit>, RustParseError>]) -> Result<(), ConditionFailure>,
   ) -> Result<(), AnalyzerTestFailure> {
     check(&outcomes).map_err(|source| AnalyzerTestFailure {
       outcomes,
@@ -148,7 +148,7 @@ mod tests {
     let path = Path::new("test.rs");
     check_results(vec![analyzer.parse_file(path, source, config)], |outcomes| {
       let [Ok(ref units)] = *outcomes else {
-        return ensure(false, "valid source must parse through the analyzer trait");
+        return ensure(false, "valid source must parse through the analyzer trait").map(drop);
       };
       ensure(
         units
@@ -158,6 +158,7 @@ mod tests {
           == [("foo", false, false), ("test_foo", true, true)],
         "retain production and test functions with consistent native and trait-level test classification",
       )
+      .map(drop)
     })
   }
 
@@ -181,7 +182,7 @@ mod tests {
             matches!(outcome.as_ref(), Err(failure) if failure.input.path == path && failure.input.contents == source && failure.source.span().start().line == 1)
           }),
           "both parse entry points retain the original source and typed syn diagnostic",
-        )
+        ).map(drop)
       },
     )
   }
@@ -191,19 +192,20 @@ mod tests {
     clippy::single_call_fn,
     reason = "The joint source contract stays readable separately from filesystem fixture preparation and repeated registry states."
   )]
-  fn check_pipeline_sources(outcome: &PipelineOutcome, root: &Path, registry_is_invalid: bool) -> Result<(), TestFailure> {
+  fn check_pipeline_sources(outcome: &PipelineOutcome, root: &Path, registry_is_invalid: bool) -> Result<(), ConditionFailure> {
     let (sources, stats) = match outcome.as_ref() {
       Ok(analysis) => {
-        ensure(!registry_is_invalid, "a malformed registry must return a typed analysis failure")?;
+        ensure(!registry_is_invalid, "a malformed registry must return a typed analysis failure").map(drop)?;
         (&analysis.sources, Some(&analysis.stats))
       }
       Err(failure) => {
-        ensure(registry_is_invalid, "source failures remain nonfatal when the registry is readable")?;
+        ensure(registry_is_invalid, "source failures remain nonfatal when the registry is readable").map(drop)?;
         ensure(
           matches!(*failure.source, AnalysisFailure::Ignore(IgnoreFileError::Decode { ref path, ref contents, .. })
                 if *path == ignore_file_path(root) && contents == INVALID_REGISTRY),
           "retain the native registry decoding failure and its exact input",
-        )?;
+        )
+        .map(drop)?;
         (&failure.analysis.sources, failure.analysis.stats.as_ref())
       }
     };
@@ -220,7 +222,7 @@ mod tests {
       })),
     ] = *sources.as_slice()
     else {
-      return ensure(false, "retain all four native file outcomes in request order");
+      return ensure(false, "retain all four native file outcomes in request order").map(drop);
     };
     ensure(
       valid.file.path == root.join("valid.rs")
@@ -228,9 +230,10 @@ mod tests {
         && rejected.file.path == root.join("rejected.rs")
         && rejected.file.contents == REJECTED_SOURCE,
       "retain complete successful source reads even when parsing or later registry loading fails",
-    )?;
+    )
+    .map(drop)?;
     let Ok(parsed) = valid.parsed.as_ref() else {
-      return ensure(false, "the valid source must retain its extracted units");
+      return ensure(false, "the valid source must retain its extracted units").map(drop);
     };
     ensure(
       parsed
@@ -242,12 +245,14 @@ mod tests {
         && matches!(parsed.sub_units.as_ref().map(Result::as_ref), Some(Ok(sub_units)) if sub_units.is_empty())
         && stats.is_some_and(|completed| completed.total_code_units == 1),
       "test exclusion changes the analyzed population while retaining both original units and the completed empty sub-unit parse",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       matches!(rejected.parsed.as_ref(), Err(failure)
             if failure.input == rejected.file && failure.source.span().start().line == 1),
       "retain the typed Rust diagnostic and rejected source without running sub-unit parsing",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       *decoded_path == root.join("bytes.rs")
         && utf8.as_bytes() == INVALID_BYTES
@@ -256,6 +261,7 @@ mod tests {
         && read.raw_os_error().is_some(),
       "retain undecodable bytes and the original operating-system read failure",
     )
+    .map(drop)
   }
 
   #[test]

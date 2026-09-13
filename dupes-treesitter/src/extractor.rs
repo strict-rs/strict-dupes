@@ -327,7 +327,7 @@ mod tests {
   use dupes_core::code_unit::CodeUnitKind;
   use dupes_core::config::AnalysisConfig;
   use dupes_core::node::PlaceholderKind;
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
 
   use super::CodeUnitExtractor;
@@ -381,7 +381,7 @@ mod tests {
       /// Native tree used for both attempts.
       tree:     tree_sitter::Tree,
       /// Failed behavioral expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
   }
 
@@ -406,7 +406,7 @@ mod tests {
   /// Corrupt a required field in the second function and compare the entire completed prefix.
   fn check_interrupted_definition(
     field: &'static str,
-    check: impl FnOnce(&CodeUnit, &mut UnitExtractionError, &[u8]) -> Result<(), TestFailure>,
+    check: impl FnOnce(&CodeUnit, &mut UnitExtractionError, &[u8]) -> Result<(), ConditionFailure>,
   ) -> Result<(), ExtractorTestFailure> {
     let source = "def first(value):\n    return value\n\ndef second(value):\n    return value\n";
     let tree = parse(source)?;
@@ -462,12 +462,14 @@ mod tests {
           && completed.as_slice() == slice::from_ref(first),
         "a failed second definition preserves the complete first unit and the interrupted definition's identity",
       )
+      .map(drop)
       .and_then(|()| check(second, failure.as_mut(), &bytes))
     } else {
       ensure(
         false,
         "the original pair must parse and the second corrupted definition must fail as a unit",
       )
+      .map(drop)
     };
     expectation.map_err(|failure| ExtractorTestFailure::Evidence {
       baseline,
@@ -486,6 +488,7 @@ mod tests {
           if input.as_slice() == bytes && source.valid_up_to() == 0 && source.error_len() == Some(1)),
         "a captured name that cannot be decoded retains the complete input and native UTF-8 cause",
       )
+      .map(drop)
     })
   }
 
@@ -499,7 +502,7 @@ mod tests {
         source: ref normalization,
       } = *failure
       else {
-        return ensure(false, "corrupting a captured parameter must fail during signature normalization");
+        return ensure(false, "corrupting a captured parameter must fail during signature normalization").map(drop);
       };
       ensure(
         *name == second.name
@@ -510,6 +513,7 @@ mod tests {
                 if input.as_slice() == bytes && source.valid_up_to() == 0 && source.error_len() == Some(1))),
         "signature failure retains the known name, untouched placeholder context, and original text failure",
       )
+      .map(drop)
     })
   }
 
@@ -524,7 +528,7 @@ mod tests {
         source: ref normalization,
       } = *failure
       else {
-        return ensure(false, "corrupting the returned identifier must fail during body normalization");
+        return ensure(false, "corrupting the returned identifier must fail during body normalization").map(drop);
       };
       ensure(
         *name == second.name
@@ -538,7 +542,7 @@ mod tests {
                   && matches!(**text_error, NormalizationError::Text(NodeTextError::Utf8 { ref input, source, .. })
                     if input.as_slice() == bytes && source.valid_up_to() == 0 && source.error_len() == Some(1)))),
         "body failure retains the completed signature, its placeholders, and the nested native text failure",
-      )
+      ).map(drop)
     })
   }
 
@@ -567,6 +571,7 @@ mod tests {
               if input == b"def" && range == tree.root_node().range())),
       "a valid predicate query succeeds, while a truncated input retains its full bytes and native containing range",
     )
+    .map(drop)
     .map_err(|failure| ExtractorTestFailure::Evidence {
       baseline,
       outcome: Box::new(outcome),

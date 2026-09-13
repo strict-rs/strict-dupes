@@ -320,7 +320,7 @@ mod tests {
   use std::path::Path;
   use std::path::PathBuf;
 
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use tempfile::TempDir;
   use thiserror::Error;
@@ -357,7 +357,7 @@ mod tests {
       /// Complete result observed at the scanner boundary.
       outcome: Box<Result<SourceScan, ScanError>>,
       /// Assertion explaining the violated contract.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// An exclusion decision differed from the expected policy attribution.
     #[error("path exclusion expectation failed for {}: {source}; outcome: {outcome:?}", path.display())]
@@ -371,7 +371,7 @@ mod tests {
       /// Complete returned decision or pattern-compilation failure.
       outcome:  Box<Result<Option<PathExclusion>, ExclusionError>>,
       /// Failed behavioral expectation.
-      source:   Box<TestFailure>,
+      source:   Box<ConditionFailure>,
     },
   }
 
@@ -421,6 +421,7 @@ mod tests {
         }),
       "discover every visible Rust source and retain the non-source file observation",
     )
+    .map(drop)
     .map_err(|source| ScannerTestFailure::ScanExpectation {
       outcome: Box::new(Ok(scan)),
       source,
@@ -442,6 +443,7 @@ mod tests {
         }),
       "exclude build-output sources while retaining their native observations and exclusion decisions",
     )
+    .map(drop)
     .map_err(|source| ScannerTestFailure::ScanExpectation {
       outcome: Box::new(Ok(scan)),
       source,
@@ -455,10 +457,12 @@ mod tests {
     let config = ScanConfig::new(workspace.path().to_path_buf());
     let scan = scan_files(&config)?;
     let visible = scan.files().all(|path| !path.starts_with(workspace.path().join(".hidden")));
-    ensure(visible, "exclude source files beneath hidden directories").map_err(|source| ScannerTestFailure::ScanExpectation {
-      outcome: Box::new(Ok(scan)),
-      source,
-    })
+    ensure(visible, "exclude source files beneath hidden directories")
+      .map(drop)
+      .map_err(|source| ScannerTestFailure::ScanExpectation {
+        outcome: Box::new(Ok(scan)),
+        source,
+      })
   }
 
   #[test]
@@ -476,6 +480,7 @@ mod tests {
       files == expected,
       "retain unexcluded source files while removing the matched directory",
     )
+    .map(drop)
     .map_err(|source| ScannerTestFailure::ScanExpectation {
       outcome: Box::new(Ok(scan)),
       source,
@@ -495,6 +500,7 @@ mod tests {
         }),
       "an empty source selection retains the successfully observed root directory",
     )
+    .map(drop)
     .map_err(|source| ScannerTestFailure::ScanExpectation {
       outcome: Box::new(Ok(scan)),
       source,
@@ -524,6 +530,7 @@ mod tests {
         outcome.as_ref().is_ok_and(|observed| *observed == expected),
         "classify glob, literal, and build-output exclusions while retaining unmatched paths",
       )
+      .map(drop)
       .map_err(|source| ScannerTestFailure::PathExclusion {
         path,
         patterns,
@@ -547,6 +554,7 @@ mod tests {
       }) if **requested == config && pattern == "[" && variant == "[" && source.glob() == Some("[")),
       "invalid patterns retain the requested scan and exact rejected glob before any traversal",
     )
+    .map(drop)
     .map_err(|source| ScannerTestFailure::ScanExpectation {
       outcome: Box::new(outcome),
       source,
@@ -564,6 +572,7 @@ mod tests {
           && source.io_error().is_some_and(|native| native.kind() == io::ErrorKind::NotFound)),
       "a missing root returns the original traversal failure with the requested scan and no invented observations",
     )
+    .map(drop)
     .map_err(|source| ScannerTestFailure::ScanExpectation {
       outcome: Box::new(outcome),
       source,
@@ -589,6 +598,7 @@ mod tests {
         })),
       "failed link-target metadata retains the native link entry, I/O failure, and earlier root observation",
     )
+    .map(drop)
     .map_err(|source| ScannerTestFailure::ScanExpectation {
       outcome: Box::new(outcome),
       source,
@@ -625,6 +635,7 @@ mod tests {
         }),
       "a link to a source file remains selectable while retaining both link identity and resolved file metadata",
     )
+    .map(drop)
     .map_err(|source| ScannerTestFailure::ScanExpectation {
       outcome: Box::new(Ok(scan)),
       source,
@@ -651,6 +662,7 @@ mod tests {
       scan.config == config && scan.files().collect::<Vec<_>>() == vec![path.as_path()],
       "native path bytes are preserved, replacement-character exclusions do not match them, and extension matching ignores ASCII case",
     )
+    .map(drop)
     .map_err(|source| ScannerTestFailure::ScanExpectation {
       outcome: Box::new(Ok(scan)),
       source,

@@ -745,9 +745,10 @@ fn union(parents: &mut BTreeMap<usize, usize>, first: usize, second: usize) {
 mod tests {
   use std::path::PathBuf;
 
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
+  use strict_test_support::PredicateFailure;
   use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_that;
 
   use super::DuplicateGroup;
   use super::DuplicationStats;
@@ -787,7 +788,7 @@ mod tests {
       /// Results at the requested threshold and its immediate successor.
       outcomes: Box<[NearGroupingOutcome; 2]>,
       /// Failed behavioral expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// An unordered comparison did not retain the original request and score.
     #[error("unordered threshold expectation failed: {source}; outcome: {outcome:?}")]
@@ -795,7 +796,7 @@ mod tests {
       /// Complete grouping result or failure.
       outcome: Box<Result<Vec<DuplicateGroup>, NearGroupingFailure>>,
       /// Failed behavioral expectation.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// Relocating source units changed more than the group members' locations.
     #[error("{match_kind} relocation expectation failed: {source}; inputs: {inputs:?}; outcomes: {outcomes:?}")]
@@ -807,7 +808,7 @@ mod tests {
       /// Complete original and relocated grouping outcomes.
       outcomes:   Box<[NearGroupingOutcome; 2]>,
       /// Native assertion failure.
-      source:     TestFailure,
+      source:     ConditionFailure,
     },
     /// A line-total failure did not retain its exact reached state.
     #[error("line statistics expectation failed: {source}; outcome: {outcome:?}; expected: {expected:?}")]
@@ -817,7 +818,7 @@ mod tests {
       /// Complete expected result or failure.
       expected: Box<Result<DuplicationStats, StatisticsFailure>>,
       /// Failed behavioral expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// Near-group calculation failed with its candidate and pair evidence.
     #[error(transparent)]
@@ -832,14 +833,17 @@ mod tests {
       /// Independently specified exact and near percentages.
       expected: [f64; 2],
       /// Native behavioral assertion failure.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// Statistics calculation retained its completed population measurements.
     #[error(transparent)]
     Statistics(#[from] StatisticsFailure),
     /// A successfully completed operation violated the test's behavioral expectation.
     #[error(transparent)]
-    Assertion(#[from] TestFailure),
+    Assertion(#[from] ConditionFailure),
+    /// A completed near-group population violated its membership or score contract.
+    #[error(transparent)]
+    NearExpectation(#[from] PredicateFailure<Vec<DuplicateGroup>>),
   }
 
   /// Complete inputs and outcomes of a failed group-total expectation.
@@ -855,7 +859,7 @@ mod tests {
     /// Complete expected total or typed overflow.
     expected:   Result<usize, GroupCountOverflow>,
     /// Failed behavioral expectation.
-    source:     TestFailure,
+    source:     ConditionFailure,
   }
 
   /// Compare a complete group-count result and retain its inputs on mismatch.
@@ -869,6 +873,7 @@ mod tests {
       outcome == expected,
       "group totals preserve exact counts or the complete interrupted addition",
     )
+    .map(drop)
     .map_err(|source| {
       Box::new(CountTestFailure {
         stats,
@@ -1016,6 +1021,7 @@ mod tests {
         && rejected.is_empty()),
       "rounded four-fifths score passes the stored 0.8 threshold and fails its immediate successor",
     )
+    .map(drop)
     .map_err(|source| GrouperTestFailure::Threshold {
       outcomes: Box::new(outcomes),
       source,
@@ -1046,6 +1052,7 @@ mod tests {
         && matches!(*failure.source, PairFailure::Unordered { first: 0, second: 1, score } if score == expected_score)),
       "unordered comparison preserves the complete request and original integer score evidence",
     )
+    .map(drop)
     .map_err(|source| GrouperTestFailure::Unordered {
       outcome: Box::new(outcome),
       source,
@@ -1094,6 +1101,7 @@ mod tests {
       outcome == expected,
       "near-line overflow retains earlier corpus and exact totals, original unit, and rejected integer addition",
     )
+    .map(drop)
     .map_err(|source| GrouperTestFailure::LineStatistics {
       outcome: Box::new(outcome),
       expected: Box::new(expected),
@@ -1103,9 +1111,9 @@ mod tests {
 
   /// A corpus without source units produces no exact groups.
   #[test]
-  fn empty_input_no_groups() -> Result<(), TestFailure> {
+  fn empty_input_no_groups() -> Result<(), ConditionFailure> {
     let groups = group_exact_duplicates(&[]);
-    ensure(groups.is_empty(), "an empty corpus has no exact groups")
+    ensure(groups.is_empty(), "an empty corpus has no exact groups").map(drop)
   }
 
   /// Moving exact or near duplicates changes member locations while preserving the complete group
@@ -1144,6 +1152,7 @@ mod tests {
             }).collect::<Vec<_>>()),
         "relocation preserves the complete group identity, measurement, and metadata while retaining the moved members",
       )
+      .map(drop)
       .map_err(|source| GrouperTestFailure::Relocation {
         match_kind,
         inputs: Box::new(inputs),
@@ -1158,21 +1167,28 @@ mod tests {
   #[test]
   fn near_groups_close_transitive_matches() -> Result<(), GrouperTestFailure> {
     let units = similarity_chain();
-    let groups = find_near_duplicates_for(&units, 0.6, &[], DetectionDimension::Ast)?;
-    ensure_eq(&groups.len(), &1, "two qualifying edges produce one connected near group")?;
-    ensure(
-      groups
-        .iter()
-        .flat_map(|group| &group.members)
-        .map(|member| member.name.as_str())
-        .collect::<Vec<_>>()
-        == vec!["first", "bridge", "last"],
+    let mut groups = find_near_duplicates_for(&units, 0.6, &[], DetectionDimension::Ast)?;
+    groups = ensure_that(groups, "two qualifying edges produce one connected near group", |observed| {
+      observed.len() == 1
+    })?;
+    groups = ensure_that(
+      groups,
       "transitive closure retains both endpoints and the connecting unit in source order",
+      |observed| {
+        observed
+          .iter()
+          .flat_map(|group| &group.members)
+          .map(|member| member.name.as_str())
+          .collect::<Vec<_>>()
+          == vec!["first", "bridge", "last"]
+      },
     )?;
-    ensure(
-      groups.iter().all(|group| group.similarity > 0.66 && group.similarity < 0.67),
+    ensure_that(
+      groups,
       "group similarity is the minimum qualifying edge score, excluding the nonmatching endpoint pair",
+      |observed| observed.iter().all(|group| group.similarity > 0.66 && group.similarity < 0.67),
     )
+    .map(drop)
     .map_err(GrouperTestFailure::from)
   }
 
@@ -1181,7 +1197,9 @@ mod tests {
   fn near_groups_reject_edges_below_threshold() -> Result<(), GrouperTestFailure> {
     let units = similarity_chain();
     let groups = find_near_duplicates_for(&units, 0.7, &[], DetectionDimension::Ast)?;
-    ensure(groups.is_empty(), "nonqualifying similarity edges do not connect candidates").map_err(GrouperTestFailure::from)
+    ensure(groups.is_empty(), "nonqualifying similarity edges do not connect candidates")
+      .map(drop)
+      .map_err(GrouperTestFailure::from)
   }
 
   /// Excluded exact members cannot connect otherwise unrelated near candidates.
@@ -1198,6 +1216,7 @@ mod tests {
       groups.is_empty(),
       "excluding an exact member also removes its connecting near-match edges",
     )
+    .map(drop)
     .map_err(GrouperTestFailure::from)
   }
 
@@ -1235,6 +1254,7 @@ mod tests {
           if [exact.to_bits(), near.to_bits()] == expected.map(f64::to_bits)),
         "exact and near percentages use their own line counts and preserve the explicit empty-corpus result",
       )
+      .map(drop)
       .map_err(|source| GrouperTestFailure::Percentages {
         stats: Box::new(stats),
         outcomes: Box::new(outcomes),

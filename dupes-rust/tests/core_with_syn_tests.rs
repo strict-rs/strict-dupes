@@ -28,7 +28,8 @@ mod tests {
   use dupes_rust::parser::CodeUnit;
   use dupes_rust::parser::CodeUnitKind;
   use dupes_rust::parser::RustParseError;
-  use strict_test_support::TestFailure;
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_eq;
 
@@ -61,7 +62,7 @@ mod tests {
       /// Original integer populations and rounded score.
       score:  SimilarityScore,
       /// Failed behavioral expectation.
-      source: TestFailure,
+      source: ConditionFailure,
     },
     /// Grouping returned an unexpected population.
     #[error("group expectation failed: {source}; groups: {groups:?}")]
@@ -69,7 +70,17 @@ mod tests {
       /// Complete grouped result.
       groups: Vec<DuplicateGroup>,
       /// Failed behavioral expectation.
-      source: TestFailure,
+      source: ConditionFailure,
+    },
+    /// Exact grouping returned a different number of independent families.
+    #[error("exact-group count expectation failed: {source}; groups: {groups:?}")]
+    GroupCount {
+      /// Complete source-unit population passed to grouping.
+      units:  Vec<CodeUnit>,
+      /// Complete groups returned by the operation.
+      groups: Vec<DuplicateGroup>,
+      /// Native observed and expected cardinalities.
+      source: ComparisonFailure<usize, usize>,
     },
     /// Function identity differed from the required relation.
     #[error("{source}; inputs: {inputs:?}; parsed: {parsed:?}; normalized: {normalized:?}; expected equality: {expected_equal}")]
@@ -83,7 +94,7 @@ mod tests {
       /// Whether both complete identities must match.
       expected_equal: bool,
       /// Failed behavioral expectation.
-      source:         Box<TestFailure>,
+      source:         Box<ConditionFailure>,
     },
     /// Nested extraction did not retain the requested syntax kinds or descriptions.
     #[error("{source}; input: {input}; body: {body:?}; sub-units: {sub_units:?}; expected: {expected:?}")]
@@ -97,11 +108,11 @@ mod tests {
       /// Expected counts and optional descriptions by syntax kind.
       expected:  Vec<(CodeUnitKind, usize, Option<String>)>,
       /// Failed behavioral expectation.
-      source:    Box<TestFailure>,
+      source:    Box<ConditionFailure>,
     },
     /// Another fixture contract was violated.
     #[error(transparent)]
-    Assertion(#[from] TestFailure),
+    Assertion(#[from] ConditionFailure),
   }
 
   /// Fallible result of a Rust-backed core fixture.
@@ -183,14 +194,16 @@ mod tests {
 
   /// Preserve original counts when a rounded similarity violates a fixture expectation.
   fn check_score(score: &SimilarityScore, accepts: impl FnOnce(f64) -> bool, context: &'static str) -> FixtureResult {
-    ensure(accepts(score.value), context).map_err(|source| FixtureFailure::Score {
-      score: *score,
-      source,
-    })
+    ensure(accepts(score.value), context)
+      .map(drop)
+      .map_err(|source| FixtureFailure::Score {
+        score: *score,
+        source,
+      })
   }
 
   /// Retain complete groups when a public grouping contract is violated.
-  fn check_groups(groups: Vec<DuplicateGroup>, check: impl FnOnce(&[DuplicateGroup]) -> Result<(), TestFailure>) -> FixtureResult {
+  fn check_groups(groups: Vec<DuplicateGroup>, check: impl FnOnce(&[DuplicateGroup]) -> Result<(), ConditionFailure>) -> FixtureResult {
     check(&groups).map_err(|source| FixtureFailure::Groups {
       groups,
       source,
@@ -211,6 +224,7 @@ mod tests {
       matches!(&normalized, [Some((_, _, left)), Some((_, _, right))] if (left == right) == expected_equal),
       "both functions parse and retain the required fingerprint relation",
     )
+    .map(drop)
     .map_err(|source| FixtureFailure::Identity {
       inputs: Box::new(inputs.map(str::to_owned)),
       parsed: Box::new(parsed),
@@ -231,6 +245,7 @@ mod tests {
       }),
       "nested extraction preserves the expected kinds, populations, and descriptions",
     )
+    .map(drop)
     .map_err(|source| FixtureFailure::Extraction {
       input: input.to_owned(),
       body: Box::new(body),
@@ -272,19 +287,14 @@ mod tests {
     let mut ctx = NormalizationContext::new();
     let node = normalize_expr(&expr, &mut ctx);
     let fp = Fingerprint::from_node(&node);
-    Ok(ensure(fp.value() != 0, "normalized expression has a content identity")?)
+    Ok(ensure(fp.value() != 0, "normalized expression has a content identity").map(drop)?)
   }
 
   /// Repeated normalization retains the same content fingerprint.
   #[test]
   fn fingerprint_stability() -> FixtureResult {
     let code = "fn foo(x: i32) -> i32 { x + 1 }";
-    let function = parse_fn(code)?;
-    let (sig1, body1) = normalize_item_fn(&function);
-    let (sig2, body2) = normalize_item_fn(&function);
-    let fp1 = Fingerprint::from_sig_and_body(&sig1, &body1);
-    let fp2 = Fingerprint::from_sig_and_body(&sig2, &body2);
-    Ok(ensure_eq(&fp1, &fp2, "repeated normalization is deterministic")?)
+    check_function_identity(&[code, code], true)
   }
 
   // ── Similarity tests ──────────────────────────────────────────────────────
@@ -410,20 +420,23 @@ mod tests {
   fn similarity_is_symmetric() -> FixtureResult {
     let score1 = fn_body_similarity("fn foo(x: i32) -> i32 { x + 1 }", "fn bar(x: i32) -> i32 { x * 2 + 1 }")?;
     let score2 = fn_body_similarity("fn bar(x: i32) -> i32 { x * 2 + 1 }", "fn foo(x: i32) -> i32 { x + 1 }")?;
-    Ok(ensure(
-      (
-        score1.value.to_bits(),
-        score1.counts.first,
-        score1.counts.second,
-        score1.counts.matching,
-      ) == (
-        score2.value.to_bits(),
-        score2.counts.second,
-        score2.counts.first,
-        score2.counts.matching,
-      ),
-      "similarity is symmetric while preserving the operand population order",
-    )?)
+    Ok(
+      ensure(
+        (
+          score1.value.to_bits(),
+          score1.counts.first,
+          score1.counts.second,
+          score1.counts.matching,
+        ) == (
+          score2.value.to_bits(),
+          score2.counts.second,
+          score2.counts.first,
+          score2.counts.matching,
+        ),
+        "similarity is symmetric while preserving the operand population order",
+      )
+      .map(drop)?,
+    )
   }
 
   /// Distinct branching constructs do not normalize into a high-similarity pair.
@@ -477,6 +490,7 @@ mod tests {
         matches!(observed, [group] if group.members.len() == 2 && group.similarity.to_bits() == 1.0_f64.to_bits()),
         "the duplicate pair forms one exact group with score one",
       )
+      .map(drop)
     })
   }
 
@@ -492,7 +506,7 @@ mod tests {
     )?;
     let groups = grouper::group_exact_duplicates(&units);
     check_groups(groups, |observed| {
-      ensure(observed.is_empty(), "unique functions form no exact groups")
+      ensure(observed.is_empty(), "unique functions form no exact groups").map(drop)
     })
   }
 
@@ -508,9 +522,13 @@ mod tests {
         ",
     )?;
     let groups = grouper::group_exact_duplicates(&units);
-    check_groups(groups, |observed| {
-      ensure_eq(&observed.len(), &2, "independent duplicate families form two groups")
-    })
+    ensure_eq(groups.len(), 2, "independent duplicate families form two groups")
+      .map(drop)
+      .map_err(|source| FixtureFailure::GroupCount {
+        units,
+        groups,
+        source,
+      })
   }
 
   /// Realistic bodies differing locally remain detectable.
@@ -535,10 +553,7 @@ mod tests {
     let exact = grouper::group_exact_duplicates(&units);
     let exact_fps = grouper::member_fingerprints(&exact);
     let near = grouper::find_near_duplicates(&units, 0.7, &exact_fps).map_err(Box::new)?;
-    Ok(ensure(
-      !exact.is_empty() || !near.is_empty(),
-      "locally changed bodies remain detectable",
-    )?)
+    Ok(ensure(!exact.is_empty() || !near.is_empty(), "locally changed bodies remain detectable").map(drop)?)
   }
 
   /// Statistics count the parsed corpus, grouped units, and source lines.
@@ -556,8 +571,9 @@ mod tests {
     ensure(
       (stats.total_code_units, stats.exact_duplicate_groups, stats.exact_duplicate_units) == (3, 1, 2),
       "statistics count the corpus and duplicate pair",
-    )?;
-    Ok(ensure(stats.total_lines > 0, "parsed source contributes lines")?)
+    )
+    .map(drop)?;
+    Ok(ensure(stats.total_lines > 0, "parsed source contributes lines").map(drop)?)
   }
 
   /// A function without a duplicate partner forms no group.
@@ -566,7 +582,7 @@ mod tests {
     let units = make_units("fn solo(x: i32) -> i32 { x + 1 }")?;
     let groups = grouper::group_exact_duplicates(&units);
     check_groups(groups, |observed| {
-      ensure(observed.is_empty(), "a single function has no duplicate partner")
+      ensure(observed.is_empty(), "a single function has no duplicate partner").map(drop)
     })
   }
 
@@ -588,6 +604,7 @@ mod tests {
         matches!(observed, [first, second] if (first.members.len(), second.members.len()) == (3, 2)),
         "exact families appear in descending membership order",
       )
+      .map(drop)
     })
   }
 
@@ -599,7 +616,7 @@ mod tests {
     let exact_fps = grouper::member_fingerprints(&exact);
     let near = grouper::find_near_duplicates(&units, 0.7, &exact_fps).map_err(Box::new)?;
     check_groups(near, |observed| {
-      ensure(observed.is_empty(), "exact members are excluded from near grouping")
+      ensure(observed.is_empty(), "exact members are excluded from near grouping").map(drop)
     })
   }
 
@@ -613,6 +630,7 @@ mod tests {
         matches!(observed, [group] if group.fingerprint.value() != 0),
         "the exact family carries a nonzero fingerprint",
       )
+      .map(drop)
     })
   }
 
@@ -636,10 +654,13 @@ mod tests {
       similarity:  0.85,
     };
     let stats = grouper::compute_stats(&units, &[], &[near_group])?;
-    Ok(ensure(
-      (stats.total_code_units, stats.near_duplicate_groups) == (units.len(), 1),
-      "near groups contribute without altering the corpus size",
-    )?)
+    Ok(
+      ensure(
+        (stats.total_code_units, stats.near_duplicate_groups) == (units.len(), 1),
+        "near groups contribute without altering the corpus size",
+      )
+      .map(drop)?,
+    )
   }
 
   /// Exact and near line counts remain distinct.
@@ -648,10 +669,13 @@ mod tests {
     let units = make_units(MULTILINE_PAIR)?;
     let exact = grouper::group_exact_duplicates(&units);
     let stats = grouper::compute_stats(&units, &exact, &[])?;
-    Ok(ensure(
-      stats.exact_duplicate_lines > 0 && stats.near_duplicate_lines == 0,
-      "exact source lines do not contribute to near totals",
-    )?)
+    Ok(
+      ensure(
+        stats.exact_duplicate_lines > 0 && stats.near_duplicate_lines == 0,
+        "exact source lines do not contribute to near totals",
+      )
+      .map(drop)?,
+    )
   }
 
   /// The corpus denominator includes lines even when no groups are supplied.
@@ -659,10 +683,7 @@ mod tests {
   fn stats_total_lines_computed() -> FixtureResult {
     let units = make_units(MULTILINE_PAIR)?;
     let stats = grouper::compute_stats(&units, &[], &[])?;
-    Ok(ensure(
-      stats.total_lines > 0,
-      "ungrouped source contributes to the corpus denominator",
-    )?)
+    Ok(ensure(stats.total_lines > 0, "ungrouped source contributes to the corpus denominator").map(drop)?)
   }
 
   // ── Extractor tests ───────────────────────────────────────────────────────
@@ -697,10 +718,13 @@ mod tests {
     let body = parse_and_extract_body("fn foo(x: i32) -> i32 { if x > 0 { x + 1 } else { x - 1 } }")?;
     let subs_low = extractor::extract_sub_units(&body, 1);
     let subs_high = extractor::extract_sub_units(&body, 100);
-    Ok(ensure(
-      !subs_low.is_empty() && subs_high.is_empty(),
-      "minimum size admits and rejects the same candidate population at the requested thresholds",
-    )?)
+    Ok(
+      ensure(
+        !subs_low.is_empty() && subs_high.is_empty(),
+        "minimum size admits and rejects the same candidate population at the requested thresholds",
+      )
+      .map(drop)?,
+    )
   }
 
   /// Equivalent branch content normalizes independently of parent parameters.
@@ -714,10 +738,13 @@ mod tests {
 
     let then1 = subs1.iter().find(|sub| sub.description == "if-then branch");
     let then2 = subs2.iter().find(|sub| sub.description == "if-then branch");
-    Ok(ensure(
-      matches!((then1, then2), (Some(first), Some(second)) if first.node == second.node),
-      "both extracted then branches exist and normalize identically",
-    )?)
+    Ok(
+      ensure(
+        matches!((then1, then2), (Some(first), Some(second)) if first.node == second.node),
+        "both extracted then branches exist and normalize identically",
+      )
+      .map(drop)?,
+    )
   }
 
   /// An extracted branch matches a freshly indexed equivalent expression.
@@ -730,10 +757,13 @@ mod tests {
     let mut ctx = NormalizationContext::new();
     let fresh_expr = normalize_expr(&parse_expr("{ let d = c + 1; d }")?, &mut ctx);
     let reindexed_fresh = reindex_placeholders(&fresh_expr);
-    Ok(ensure(
-      then_branch.is_some_and(|branch| branch.node == reindexed_fresh),
-      "the extracted branch uses fresh placeholder indices",
-    )?)
+    Ok(
+      ensure(
+        then_branch.is_some_and(|branch| branch.node == reindexed_fresh),
+        "the extracted branch uses fresh placeholder indices",
+      )
+      .map(drop)?,
+    )
   }
 
   /// Nested loops and surrounding branches both remain discoverable.

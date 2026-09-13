@@ -1,7 +1,7 @@
 //! Native Rust normalization contracts, with complete values retained on assertion failure.
 
 use dupes_core::fingerprint::Fingerprint;
-use strict_test_support::TestFailure;
+use strict_test_support::ConditionFailure;
 use strict_test_support::ensure;
 use syn::parse::Parse;
 
@@ -36,7 +36,7 @@ enum NormalizerTestFailure {
     /// Complete observed nodes in comparison order.
     nodes:  Vec<NormalizedNode>,
     /// Failed behavioral assertion.
-    source: TestFailure,
+    source: ConditionFailure,
   },
   /// Implementation methods differed from their expected names and order.
   #[error("method expectation failed: {source}; methods: {methods:?}")]
@@ -44,7 +44,7 @@ enum NormalizerTestFailure {
     /// Complete normalized methods, including signatures and bodies.
     methods: Vec<NormalizedMethod>,
     /// Failed behavioral assertion.
-    source:  TestFailure,
+    source:  ConditionFailure,
   },
   /// The fixture's normalized body lacked the required conditional branch.
   #[error("the normalized function lacks its conditional branch: {body:?}")]
@@ -77,7 +77,7 @@ fn normalize_function(input: &str) -> Result<(NormalizedNode, NormalizedNode), N
 /// Assert a semantic contract without losing any observed normalized values.
 fn check_nodes<const COUNT: usize>(
   nodes: [NormalizedNode; COUNT],
-  check: impl FnOnce([&NormalizedNode; COUNT]) -> Result<(), TestFailure>,
+  check: impl FnOnce([&NormalizedNode; COUNT]) -> Result<(), ConditionFailure>,
 ) -> Result<(), NormalizerTestFailure> {
   check(nodes.each_ref()).map_err(|source| NormalizerTestFailure::Nodes {
     nodes: Vec::from(nodes),
@@ -92,6 +92,7 @@ fn check_relation(original: NormalizedNode, compared: NormalizedNode, equal: boo
       (first == second) == equal,
       "normalized values preserve the expected semantic relation",
     )
+    .map(drop)
   })
 }
 
@@ -102,6 +103,7 @@ fn check_shape(input: &str, kind: &NodeKind, children: usize) -> Result<(), Norm
       (&node.kind, node.children.len()) == (kind, children),
       "the expression retains its semantic kind and ordered child slots",
     )
+    .map(drop)
   })
 }
 
@@ -116,6 +118,7 @@ fn check_function_renaming(first: &str, second: &str) -> Result<(), NormalizerTe
         (original_signature, original_body) == (renamed_signature, renamed_body),
         "renaming preserves the complete signature and body",
       )
+      .map(drop)
     },
   )
 }
@@ -161,6 +164,7 @@ fn literal_kind_preserved_but_value_erased() -> Result<(), NormalizerTestFailure
         first == second && first != floating,
         "literal normalization erases values while preserving their kinds",
       )
+      .map(drop)
     },
   )
 }
@@ -192,6 +196,7 @@ fn multi_segment_type_paths_are_type_path_nodes() -> Result<(), NormalizerTestFa
       node.kind == NodeKind::TypePath && node.children.len() == 3,
       "type paths preserve their segment structure",
     )
+    .map(drop)
   })
 }
 
@@ -219,6 +224,7 @@ fn method_name_preserved_as_token() -> Result<(), NormalizerTestFailure> {
           .is_some_and(|method| method.kind == NodeKind::Token("foo".to_owned())),
       "the method name remains a semantic token in its established slot",
     )
+    .map(drop)
   })
 }
 
@@ -235,6 +241,7 @@ fn different_method_names_get_different_fingerprints() -> Result<(), NormalizerT
         first != second && Fingerprint::from_node(first) != Fingerprint::from_node(second),
         "method identity remains part of the fingerprint",
       )
+      .map(drop)
     },
   )
 }
@@ -248,6 +255,7 @@ fn method_call_fingerprint_pin() -> Result<(), NormalizerTestFailure> {
       Fingerprint::from_node(observed).to_hex() == "80a3bfe1fbf90075",
       "preserve the recorded method-call fingerprint",
     )
+    .map(drop)
   })
 }
 
@@ -302,6 +310,7 @@ fn node_counting_works() -> Result<(), NormalizerTestFailure> {
       count_nodes(signature) > 0 && count_nodes(body) > 0,
       "both function parts contain normalized syntax",
     )
+    .map(drop)
   })
 }
 
@@ -329,6 +338,7 @@ fn impl_block_methods_normalized() -> Result<(), NormalizerTestFailure> {
     methods.iter().map(|method| method.0.as_str()).eq(["bar", "baz"]),
     "both methods retain their names and source order",
   )
+  .map(drop)
   .map_err(|source| NormalizerTestFailure::Methods {
     methods,
     source,
@@ -367,6 +377,7 @@ fn range_expression_normalized() -> Result<(), NormalizerTestFailure> {
       node.kind == NodeKind::Range && node.children.len() == 2 && node.children.iter().all(|child| !child.is_none()),
       "bounded ranges preserve both endpoints",
     )
+    .map(drop)
   })
 }
 
@@ -445,7 +456,7 @@ fn multi_segment_macro_path_uses_last_segment() -> Result<(), NormalizerTestFail
 #[test]
 fn macro_call_node_count() -> Result<(), NormalizerTestFailure> {
   check_nodes([normalize_code_expr("println!(\"a\", \"b\")")?], |[node]| {
-    ensure(count_nodes(node) == 3, "count the macro and both argument nodes")
+    ensure(count_nodes(node) == 3, "count the macro and both argument nodes").map(drop)
   })
 }
 
@@ -469,6 +480,7 @@ fn unparseable_macro_differs_from_no_args() -> Result<(), NormalizerTestFailure>
         empty == &macro_node("my_macro", vec![]) && opaque == &macro_node("vec", vec![NormalizedNode::leaf(NodeKind::Opaque)]),
         "empty arguments stay empty while unsupported arguments retain an opaque child",
       )
+      .map(drop)
     },
   )
 }
@@ -478,7 +490,7 @@ fn unparseable_macro_differs_from_no_args() -> Result<(), NormalizerTestFailure>
 fn type_position_macro_normalized() -> Result<(), NormalizerTestFailure> {
   let (signature, _) = normalize_function("fn foo() -> my_type!(i32) {}")?;
   check_nodes([signature], |[observed]| {
-    ensure(count_nodes(observed) > 0, "a parsed type macro contributes signature syntax")
+    ensure(count_nodes(observed) > 0, "a parsed type macro contributes signature syntax").map(drop)
   })
 }
 
@@ -487,7 +499,7 @@ fn type_position_macro_normalized() -> Result<(), NormalizerTestFailure> {
 fn pat_macro_normalized() -> Result<(), NormalizerTestFailure> {
   let (_, body) = normalize_function("fn foo(x: i32) { match x { my_pat!(x) => {} _ => {} } }")?;
   check_nodes([body], |[observed]| {
-    ensure(count_nodes(observed) > 0, "a parsed pattern macro contributes body syntax")
+    ensure(count_nodes(observed) > 0, "a parsed pattern macro contributes body syntax").map(drop)
   })
 }
 
@@ -526,6 +538,7 @@ fn struct_init_normalized() -> Result<(), NormalizerTestFailure> {
         first.kind == NodeKind::StructInit && second.kind == NodeKind::StructInit && first.children.len() == second.children.len(),
         "both struct initializers retain their field population",
       )
+      .map(drop)
     },
   )
 }
@@ -569,6 +582,7 @@ fn empty_block_normalized() -> Result<(), NormalizerTestFailure> {
       observed.kind == NodeKind::Block && observed.children.is_empty(),
       "empty bodies remain empty blocks",
     )
+    .map(drop)
   })
 }
 
@@ -586,6 +600,7 @@ fn break_expression_normalized() -> Result<(), NormalizerTestFailure> {
         first != empty && first == second,
         "break retains payload presence and erases integer values",
       )
+      .map(drop)
     },
   )
 }
@@ -617,6 +632,7 @@ fn or_and_slice_patterns_normalized() -> Result<(), NormalizerTestFailure> {
         alternatives != rest && first_slice == second_slice,
         "pattern kinds remain distinct while binding names erase",
       )
+      .map(drop)
     },
   )
 }
@@ -632,6 +648,7 @@ fn type_reference_and_slice_normalized() -> Result<(), NormalizerTestFailure> {
       original == renamed && original != changed,
       "type erasure preserves the direction of reference mutability",
     )
+    .map(drop)
   })
 }
 
@@ -658,5 +675,6 @@ fn reindex_from_real_function_subtrees() -> Result<(), NormalizerTestFailure> {
       original != renamed && reindex_placeholders(original) == reindex_placeholders(renamed),
       "reindexing preserves subtree structure while removing enclosing index offsets",
     )
+    .map(drop)
   })
 }

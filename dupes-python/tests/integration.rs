@@ -14,7 +14,7 @@ mod tests {
   use dupes_python::PythonAnalyzer;
   use dupes_python::PythonAnalyzerError;
   use dupes_treesitter::analyzer::TreeSitterParseError;
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
 
   /// The fingerprint relation required by a pair of source fixtures.
@@ -41,7 +41,7 @@ mod tests {
       /// Complete extracted units, including kinds, spans, and normalized syntax.
       units:  Vec<CodeUnit>,
       /// Failed semantic expectation.
-      source: TestFailure,
+      source: ConditionFailure,
     },
     /// Extraction changed expected category identities or test-code tags.
     #[error("extraction identity expectation failed: {source}; input: {input:?}; expected: {expected:?}; units: {units:?}")]
@@ -53,7 +53,7 @@ mod tests {
       /// Complete extraction result across all categories.
       units:    Vec<CodeUnit>,
       /// Native assertion failure.
-      source:   Box<TestFailure>,
+      source:   Box<ConditionFailure>,
     },
     /// A node or line admission floor violated its complete before-and-after contract.
     #[error(
@@ -69,7 +69,7 @@ mod tests {
       /// Complete results or native parser failures from both attempts.
       outcomes: Box<[PythonParseResult; 2]>,
       /// Native assertion failure.
-      source:   Box<TestFailure>,
+      source:   Box<ConditionFailure>,
     },
   }
 
@@ -91,7 +91,7 @@ mod tests {
   }
 
   /// Check a unit population without discarding it when an assertion fails.
-  fn check_units(units: Vec<CodeUnit>, check: impl FnOnce(&[CodeUnit]) -> Result<(), TestFailure>) -> Result<(), PythonTestFailure> {
+  fn check_units(units: Vec<CodeUnit>, check: impl FnOnce(&[CodeUnit]) -> Result<(), ConditionFailure>) -> Result<(), PythonTestFailure> {
     check(&units).map_err(|source| PythonTestFailure::Units {
       units,
       source,
@@ -114,6 +114,7 @@ mod tests {
         }),
       "extraction retains every independently named unit and its test-code tag in source order within its category",
     )
+    .map(drop)
     .map_err(|error| PythonTestFailure::Identities {
       input: Box::new(SourceFile {
         path:     Path::new("test.py").to_path_buf(),
@@ -136,7 +137,7 @@ mod tests {
   ) -> Result<(), PythonTestFailure> {
     check_units(parse(source)?, |units| {
       let [ref left, ref right] = *units else {
-        return ensure(false, "the fingerprint fixture must produce exactly two code units");
+        return ensure(false, "the fingerprint fixture must produce exactly two code units").map(drop);
       };
       assert_fingerprint_expectation(left, right, expectation, message)
     })
@@ -152,7 +153,7 @@ mod tests {
     check_units(parse(source)?, |units| {
       let selected: Vec<_> = units.iter().filter(|unit| unit.kind == kind).collect();
       let [left, right] = *selected.as_slice() else {
-        return ensure(false, "the fixture must produce exactly two units of the selected kind");
+        return ensure(false, "the fixture must produce exactly two units of the selected kind").map(drop);
       };
       assert_fingerprint_expectation(left, right, expectation, message)
     })
@@ -164,10 +165,10 @@ mod tests {
     right: &CodeUnit,
     expectation: FingerprintExpectation,
     message: &'static str,
-  ) -> Result<(), TestFailure> {
+  ) -> Result<(), ConditionFailure> {
     match expectation {
-      FingerprintExpectation::Same => ensure(left.fingerprint == right.fingerprint, message),
-      FingerprintExpectation::Different => ensure(left.fingerprint != right.fingerprint, message),
+      FingerprintExpectation::Same => ensure(left.fingerprint == right.fingerprint, message).map(drop),
+      FingerprintExpectation::Different => ensure(left.fingerprint != right.fingerprint, message).map(drop),
     }
   }
 
@@ -295,6 +296,7 @@ class Adder:
         fingerprints == ["9ee8e92bc616589a"],
         "the Python method-call fingerprint remains stable",
       )
+      .map(drop)
     })
   }
 
@@ -477,6 +479,7 @@ def make_list(a, b):
             && rejected.is_empty()),
         "the permissive configuration retains the complete named unit and the selected higher floor excludes it",
       )
+      .map(drop)
       .map_err(|source| PythonTestFailure::Admission {
         input: Box::new(input),
         configs,
@@ -494,7 +497,7 @@ def make_list(a, b):
   #[test]
   fn empty_file_returns_no_units() -> Result<(), PythonTestFailure> {
     check_units(parse("")?, |units| {
-      ensure(units.is_empty(), "empty source has no extractable code units")
+      ensure(units.is_empty(), "empty source has no extractable code units").map(drop)
     })
   }
 
@@ -502,7 +505,7 @@ def make_list(a, b):
   #[test]
   fn comments_only_file_returns_no_units() -> Result<(), PythonTestFailure> {
     check_units(parse("# This is a comment\n# Another comment\n")?, |units| {
-      ensure(units.is_empty(), "comments alone do not form code units")
+      ensure(units.is_empty(), "comments alone do not form code units").map(drop)
     })
   }
 
@@ -514,6 +517,7 @@ def make_list(a, b):
         units.is_empty(),
         "malformed syntax without a function body has no extractable units",
       )
+      .map(drop)
     })
   }
 
@@ -549,6 +553,7 @@ def plain(x):
         observed == [("foo", CodeUnitKind::Function, path), ("bar", CodeUnitKind::Function, path)],
         "stub definitions preserve their source path and function identities",
       )
+      .map(drop)
     })
   }
 

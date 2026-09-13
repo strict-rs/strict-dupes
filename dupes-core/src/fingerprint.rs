@@ -177,32 +177,46 @@ impl fmt::Display for Fingerprint {
 mod tests {
   use std::num::IntErrorKind;
 
-  use strict_test_support::TestFailure;
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_ne;
   use thiserror::Error;
 
   use super::Fingerprint;
   use super::FingerprintParseError;
   use super::RecordedFingerprint;
 
-  /// A fingerprint expectation failed with the full parser result retained.
+  /// Native fingerprint parsing, identity, and spelling expectations.
   #[derive(Debug, Error)]
-  #[error("fingerprint parsing expectation failed: {source}; outcome: {outcome:?}")]
-  struct FingerprintTestFailure {
-    /// Complete successful identity or failed parsing operation.
-    outcome: Result<Fingerprint, FingerprintParseError>,
-    /// Failed behavioral expectation.
-    source:  TestFailure,
+  enum FingerprintTestFailure {
+    /// A parsing expectation failed with the full parser result retained.
+    #[error("fingerprint parsing expectation failed: {source}; outcome: {outcome:?}")]
+    Parse {
+      /// Complete successful identity or failed parsing operation.
+      outcome: Result<Fingerprint, FingerprintParseError>,
+      /// Failed behavioral expectation.
+      source:  ConditionFailure,
+    },
+    /// Complete rendered and expected fingerprint spellings differed.
+    #[error(transparent)]
+    Spelling(#[from] ComparisonFailure<String, &'static str>),
+    /// Recorded text and its interpreted identity differed from the expected pair.
+    #[error(transparent)]
+    Recorded(#[from] Box<ComparisonFailure<RecordedFingerprint, RecordedFingerprint>>),
+    /// Native content identities violated an equality or inequality expectation.
+    #[error(transparent)]
+    Identity(#[from] ComparisonFailure<Fingerprint, Fingerprint>),
   }
 
   /// Compare a parser result without discarding a successful identity or native error.
   fn check_parse(
     input: &str,
-    check: impl FnOnce(&Result<Fingerprint, FingerprintParseError>) -> Result<(), TestFailure>,
+    check: impl FnOnce(&Result<Fingerprint, FingerprintParseError>) -> Result<(), ConditionFailure>,
   ) -> Result<(), FingerprintTestFailure> {
     let outcome = Fingerprint::from_hex(input);
-    check(&outcome).map_err(|source| FingerprintTestFailure {
+    check(&outcome).map_err(|source| FingerprintTestFailure::Parse {
       outcome,
       source,
     })
@@ -212,10 +226,9 @@ mod tests {
   #[test]
   fn hex_roundtrip() -> Result<(), FingerprintTestFailure> {
     let fp = Fingerprint(0xdead_beef_1234_5678);
-    let hex = fp.to_hex();
+    let (hex, _) = ensure_eq(fp.to_hex(), "deadbeef12345678", "hexadecimal content identity")?;
     check_parse(&hex, |outcome| {
-      ensure_eq(&hex.as_str(), &"deadbeef12345678", "hexadecimal content identity")?;
-      ensure(*outcome == Ok(fp), "hexadecimal parsing preserves all fingerprint bits")
+      ensure(*outcome == Ok(fp), "hexadecimal parsing preserves all fingerprint bits").map(drop)
     })
   }
 
@@ -230,7 +243,7 @@ mod tests {
       ("ffffffffffffffff", Fingerprint(u64::MAX)),
     ] {
       check_parse(input, |outcome| {
-        ensure(*outcome == Ok(expected), "supported spelling preserves its native identity")
+        ensure(*outcome == Ok(expected), "supported spelling preserves its native identity").map(drop)
       })?;
     }
     Ok(())
@@ -238,13 +251,15 @@ mod tests {
 
   /// Display includes all sixteen hexadecimal digits, including leading zeroes.
   #[test]
-  fn display_format() -> Result<(), TestFailure> {
+  fn display_format() -> Result<(), FingerprintTestFailure> {
     let fp = Fingerprint(0x0000_0000_0000_0042);
     ensure_eq(
-      &format!("{fp}").as_str(),
-      &"0000000000000042",
+      format!("{fp}"),
+      "0000000000000042",
       "display pads the complete hexadecimal identity",
     )
+    .map(drop)
+    .map_err(FingerprintTestFailure::from)
   }
 
   /// Rejected hexadecimal text retains both its original spelling and native error.
@@ -262,6 +277,7 @@ mod tests {
           matches!(outcome, Err(failure) if failure.input == input && *failure.source.kind() == kind),
           "rejected text retains its complete input and native integer failure",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -269,55 +285,51 @@ mod tests {
 
   /// Recorded spellings remain distinct even when they describe the same identity.
   #[test]
-  fn recorded_fingerprint_preserves_original_spelling() -> Result<(), TestFailure> {
-    let recorded = RecordedFingerprint::parse("+00AB".to_owned());
-    ensure_eq(
-      &recorded,
-      &RecordedFingerprint::Parsed {
+  fn recorded_fingerprint_preserves_original_spelling() -> Result<(), FingerprintTestFailure> {
+    let (recorded, _) = ensure_eq(
+      RecordedFingerprint::parse("+00AB".to_owned()),
+      RecordedFingerprint::Parsed {
         input:       "+00AB".to_owned(),
         fingerprint: Fingerprint(0xAB),
       },
       "recorded text retains its spelling and parsed identity together",
-    )?;
-    ensure_eq(
-      &recorded.to_string(),
-      &"+00AB".to_owned(),
-      "display preserves the recorded spelling",
     )
+    .map_err(Box::new)?;
+    ensure_eq(recorded.to_string(), "+00AB", "display preserves the recorded spelling")
+      .map(drop)
+      .map_err(FingerprintTestFailure::from)
   }
 
-  /// Reordering members leaves a composite content identity unchanged.
+  /// Reordering members preserves identity, while changing members changes it.
   #[test]
-  fn composite_fingerprint_order_independent() -> Result<(), TestFailure> {
+  fn composite_fingerprints_track_members_independently_of_order() -> Result<(), FingerprintTestFailure> {
     let fp1 = Fingerprint(1);
     let fp2 = Fingerprint(2);
     let fp3 = Fingerprint(3);
     ensure_eq(
-      &Fingerprint::from_fingerprints(&[fp1, fp2, fp3]),
-      &Fingerprint::from_fingerprints(&[fp3, fp1, fp2]),
+      Fingerprint::from_fingerprints(&[fp1, fp2, fp3]),
+      Fingerprint::from_fingerprints(&[fp3, fp1, fp2]),
       "composite identity is independent of member order",
     )
-  }
-
-  /// Changing members changes the composite content identity.
-  #[test]
-  fn composite_fingerprint_different_sets_differ() -> Result<(), TestFailure> {
-    let fp1 = Fingerprint(1);
-    let fp2 = Fingerprint(2);
-    let fp3 = Fingerprint(3);
-    ensure(
-      Fingerprint::from_fingerprints(&[fp1, fp2]) != Fingerprint::from_fingerprints(&[fp2, fp3]),
+    .map(drop)?;
+    ensure_ne(
+      Fingerprint::from_fingerprints(&[fp1, fp2]),
+      Fingerprint::from_fingerprints(&[fp2, fp3]),
       "changing members changes the composite identity",
     )
+    .map(drop)
+    .map_err(FingerprintTestFailure::from)
   }
 
   /// Repeated composition of the same identities is deterministic.
   #[test]
-  fn composite_fingerprint_deterministic() -> Result<(), TestFailure> {
+  fn composite_fingerprint_deterministic() -> Result<(), FingerprintTestFailure> {
     let fp1 = Fingerprint(42);
     let fp2 = Fingerprint(99);
     let first = Fingerprint::from_fingerprints(&[fp1, fp2]);
     let repeated = Fingerprint::from_fingerprints(&[fp1, fp2]);
-    ensure_eq(&first, &repeated, "repeated composition preserves content identity")
+    ensure_eq(first, repeated, "repeated composition preserves content identity")
+      .map(drop)
+      .map_err(FingerprintTestFailure::from)
   }
 }

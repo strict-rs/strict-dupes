@@ -472,7 +472,8 @@ pub fn count_nodes(node: &NormalizedNode) -> usize {
 
 #[cfg(test)]
 mod tests {
-  use strict_test_support::TestFailure;
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_eq;
 
@@ -496,18 +497,20 @@ mod tests {
     /// Actual complete canonical tree.
     actual:   Box<NormalizedNode>,
     /// Native assertion failure.
-    source:   TestFailure,
+    source:   ConditionFailure,
   }
 
   /// Compare the complete canonical tree while retaining its original input.
   fn check_reindexing(input: NormalizedNode, expected: NormalizedNode) -> Result<(), ReindexFailure> {
     let actual = reindex_placeholders(&input);
-    ensure(actual == expected, "canonicalization preserves the expected tree and identities").map_err(|source| ReindexFailure {
-      input: Box::new(input),
-      expected: Box::new(expected),
-      actual: Box::new(actual),
-      source,
-    })
+    ensure(actual == expected, "canonicalization preserves the expected tree and identities")
+      .map(drop)
+      .map_err(|source| ReindexFailure {
+        input: Box::new(input),
+        expected: Box::new(expected),
+        actual: Box::new(actual),
+        source,
+      })
   }
 
   /// Both original and canonical trees at a rejected equivalence check.
@@ -519,7 +522,7 @@ mod tests {
     /// The corresponding canonical trees in the same order.
     canonical: Box<[NormalizedNode; 2]>,
     /// Native distinct-input or equivalent-output assertion failure.
-    source:    TestFailure,
+    source:    ConditionFailure,
   }
 
   /// Complete assignment requests, context, and results at a failed expectation.
@@ -535,7 +538,7 @@ mod tests {
     /// The context holding every assignment made by the operation.
     context:  Box<NormalizationContext>,
     /// Native assertion failure.
-    source:   TestFailure,
+    source:   ConditionFailure,
   }
 
   /// Execute one complete assignment sequence and compare every returned index.
@@ -545,38 +548,36 @@ mod tests {
   ) -> Result<(), ContextFailure<COUNT>> {
     let mut context = NormalizationContext::default();
     let actual = requests.map(|(name, kind)| context.placeholder(name, kind));
-    ensure(actual == expected, "placeholder assignments match the complete request sequence").map_err(|source| ContextFailure {
-      requests: Box::new(requests),
-      expected: Box::new(expected),
-      actual: Box::new(actual),
-      context: Box::new(context),
-      source,
-    })
+    ensure(actual == expected, "placeholder assignments match the complete request sequence")
+      .map(drop)
+      .map_err(|source| ContextFailure {
+        requests: Box::new(requests),
+        expected: Box::new(expected),
+        actual: Box::new(actual),
+        context: Box::new(context),
+        source,
+      })
   }
 
   /// Complete source tree and its rejected node-count expectation.
   #[derive(Debug, thiserror::Error)]
-  #[error("counting {input:?} produced {actual}, expected {expected}: {source}")]
+  #[error("counting {input:?} violated its node-count expectation: {source}")]
   struct CountFailure {
     /// Original tree whose non-sentinel nodes were counted.
-    input:    Box<NormalizedNode>,
-    /// Expected number of syntax nodes.
-    expected: usize,
-    /// Actual number of syntax nodes.
-    actual:   usize,
-    /// Native assertion failure.
-    source:   TestFailure,
+    input:  Box<NormalizedNode>,
+    /// Native comparison retaining the observed and expected counts.
+    source: ComparisonFailure<usize, usize>,
   }
 
   /// Count a complete tree without discarding it if the expectation fails.
   fn check_count(input: NormalizedNode, expected: usize) -> Result<(), CountFailure> {
     let actual = count_nodes(&input);
-    ensure_eq(&actual, &expected, "only present syntax nodes contribute to the count").map_err(|source| CountFailure {
-      input: Box::new(input),
-      expected,
-      actual,
-      source,
-    })
+    ensure_eq(actual, expected, "only present syntax nodes contribute to the count")
+      .map(drop)
+      .map_err(|source| CountFailure {
+        input: Box::new(input),
+        source,
+      })
   }
 
   #[test]
@@ -626,7 +627,8 @@ mod tests {
       subtree1 != subtree2,
       "the source subtrees begin with different placeholder identities",
     )
-    .and_then(|()| ensure(first == second, "canonicalization equates structurally equivalent subtrees"))
+    .map(drop)
+    .and_then(|()| ensure(first == second, "canonicalization equates structurally equivalent subtrees").map(drop))
     .map_err(|source| EquivalentSubtreesFailure {
       inputs: Box::new([subtree1, subtree2]),
       canonical: Box::new([first, second]),

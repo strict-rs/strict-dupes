@@ -566,9 +566,10 @@ fn is_trivial_boolean_projection(node: &NormalizedNode) -> bool {
 
 #[cfg(test)]
 mod tests {
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
+  use strict_test_support::PredicateFailure;
   use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_that;
 
   use super::SubUnit;
   use super::classify_closure_body;
@@ -611,15 +612,16 @@ mod tests {
   }
 
   #[test]
-  fn reportable_sub_unit_rejects_placeholder_only_blocks() -> Result<(), TestFailure> {
+  fn reportable_sub_unit_rejects_placeholder_only_blocks() -> Result<(), ConditionFailure> {
     ensure(
       classify_sub_unit(&block(vec![variable(0)]), &policy()) == Some(RuleId::SubNoStructure),
       "a bare placeholder has no standalone behavior",
     )
+    .map(drop)
   }
 
   #[test]
-  fn reportable_sub_unit_rejects_simple_predicates() -> Result<(), TestFailure> {
+  fn reportable_sub_unit_rejects_simple_predicates() -> Result<(), ConditionFailure> {
     let field_access = NormalizedNode::with_children(NodeKind::FieldAccess, vec![variable(0), variable(1)]);
     let predicate = binary(BinOpKind::Eq, field_access, variable(2));
 
@@ -629,25 +631,28 @@ mod tests {
     ensure(
       classify_sub_unit(&predicate, &policy()) == Some(RuleId::SubNoStructure),
       "simple comparisons have no reportable structure",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       classify_sub_unit(&block(vec![predicate]), &policy()) == Some(RuleId::SubNoStructure),
       "a transparent block preserves comparison classification",
     )
+    .map(drop)
   }
 
   #[test]
-  fn reportable_sub_unit_keeps_arithmetic_branch_body() -> Result<(), TestFailure> {
+  fn reportable_sub_unit_keeps_arithmetic_branch_body() -> Result<(), ConditionFailure> {
     let arithmetic = block(vec![binary(BinOpKind::Add, variable(0), literal_int())]);
 
     ensure(
       classify_sub_unit(&arithmetic, &policy()).is_none(),
       "arithmetic branches remain visible",
     )
+    .map(drop)
   }
 
   #[test]
-  fn reportable_sub_unit_keeps_binding_branch_body() -> Result<(), TestFailure> {
+  fn reportable_sub_unit_keeps_binding_branch_body() -> Result<(), ConditionFailure> {
     let binding = NormalizedNode::with_children(NodeKind::LetBinding, vec![
       variable(0),
       NormalizedNode::none(),
@@ -659,10 +664,11 @@ mod tests {
       classify_sub_unit(&block(vec![binding]), &policy()).is_none(),
       "binding branches remain visible",
     )
+    .map(drop)
   }
 
   #[test]
-  fn direct_extraction_still_respects_only_node_threshold() -> Result<(), TestFailure> {
+  fn direct_extraction_still_respects_only_node_threshold() -> Result<(), ConditionFailure> {
     let body = NormalizedNode::with_children(NodeKind::If, vec![variable(0), block(vec![variable(1)]), NormalizedNode::none()]);
 
     let sub_units = extract_sub_units(&body, 1);
@@ -678,17 +684,20 @@ mod tests {
     ensure(
       sub_units == vec![expected],
       "extraction retains and reindexes even a low-information branch",
-    )?;
+    )
+    .map(drop)?;
     for unit in sub_units {
       ensure(
         classify_sub_unit(&unit.node, &policy()) == Some(RuleId::SubNoStructure),
         "presentation classifies the retained branch",
-      )?;
+      )
+      .map(drop)?;
     }
     ensure(
       extract_sub_units(&body, 3).is_empty(),
       "the node floor excludes an undersized branch",
     )
+    .map(drop)
   }
 
   /// Construct a call with its callee followed by its arguments.
@@ -697,7 +706,7 @@ mod tests {
   }
 
   #[test]
-  fn reportable_sub_unit_rejects_forwarding_call_bodies() -> Result<(), TestFailure> {
+  fn reportable_sub_unit_rejects_forwarding_call_bodies() -> Result<(), ConditionFailure> {
     // `normalize_pat(&p.inner, ctx)`-style delegation: a call whose
     // arguments are all simple projections or placeholders.
     let field_access = NormalizedNode::with_children(NodeKind::FieldAccess, vec![variable(0), variable(1)]);
@@ -712,15 +721,17 @@ mod tests {
     ensure(
       classify_sub_unit(&forwarding, &policy()) == Some(RuleId::SubValuePlumbing),
       "a forwarding call is value plumbing",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       classify_sub_unit(&block(vec![forwarding]), &policy()) == Some(RuleId::SubValuePlumbing),
       "a transparent block preserves forwarding classification",
     )
+    .map(drop)
   }
 
   #[test]
-  fn reportable_sub_unit_keeps_structured_constructor_bodies() -> Result<(), TestFailure> {
+  fn reportable_sub_unit_keeps_structured_constructor_bodies() -> Result<(), ConditionFailure> {
     // `NormalizedNode::with_children(kind, items.iter().map(...).collect())`
     // carries a nested closure pipeline and stays reportable.
     let closure = NormalizedNode::with_children(NodeKind::Closure, vec![variable(0)]);
@@ -736,6 +747,7 @@ mod tests {
       classify_sub_unit(&constructor, &policy()).is_none(),
       "constructors with callback pipelines remain visible",
     )
+    .map(drop)
   }
 
   /// Construct a method call from its receiver, method, and arguments.
@@ -749,7 +761,7 @@ mod tests {
   }
 
   #[test]
-  fn guard_returns_of_empty_defaults_are_not_reported() -> Result<(), TestFailure> {
+  fn guard_returns_of_empty_defaults_are_not_reported() -> Result<(), ConditionFailure> {
     // `if shorted { return Vec::new(); }`-style bail-out guards.
     let empty_default = call(vec![NormalizedNode::leaf(NodeKind::Path)]);
     let guard = block(vec![semi(NormalizedNode::with_children(NodeKind::Return, vec![empty_default]))]);
@@ -758,10 +770,11 @@ mod tests {
       classify_sub_unit(&guard, &policy()) == Some(RuleId::SubEmptyDefaultReturn),
       "a guard returning empty construction is attributed to its rule",
     )
+    .map(drop)
   }
 
   #[test]
-  fn guard_returns_wrapping_values_stay_reported() -> Result<(), TestFailure> {
+  fn guard_returns_wrapping_values_stay_reported() -> Result<(), ConditionFailure> {
     // `if !text.is_empty() { return Some(text); }` stays a reportable
     // shape: the return carries a constructed value, not a bare default.
     let some_value = call(vec![NormalizedNode::leaf(NodeKind::Path), variable(0)]);
@@ -771,20 +784,22 @@ mod tests {
       classify_sub_unit(&guard, &policy()).is_none(),
       "a guard returning a wrapped value remains visible",
     )
+    .map(drop)
   }
 
   #[test]
-  fn computed_returns_stay_reported() -> Result<(), TestFailure> {
+  fn computed_returns_stay_reported() -> Result<(), ConditionFailure> {
     let computed = NormalizedNode::with_children(NodeKind::Return, vec![binary(BinOpKind::Add, variable(0), variable(1))]);
 
     ensure(
       classify_sub_unit(&block(vec![semi(computed)]), &policy()).is_none(),
       "a computed return remains visible through statement wrappers",
     )
+    .map(drop)
   }
 
   #[test]
-  fn error_returns_with_payloads_stay_reported() -> Result<(), TestFailure> {
+  fn error_returns_with_payloads_stay_reported() -> Result<(), ConditionFailure> {
     let error_value = call(vec![NormalizedNode::leaf(NodeKind::Path), variable(0)]);
     let return_error = NormalizedNode::with_children(NodeKind::Return, vec![error_value]);
 
@@ -792,10 +807,11 @@ mod tests {
       classify_sub_unit(&block(vec![semi(return_error)]), &policy()).is_none(),
       "a return carrying an error payload remains visible",
     )
+    .map(drop)
   }
 
   #[test]
-  fn plumbing_dispatch_return_is_tagged_value_plumbing() -> Result<(), TestFailure> {
+  fn plumbing_dispatch_return_is_tagged_value_plumbing() -> Result<(), ConditionFailure> {
     // `return normalize_if(node, source, mapping, ctx)`: one call with a
     // callee and >= 2 plumbing arguments is dispatch, not logic.
     let dispatch = call(vec![
@@ -811,10 +827,11 @@ mod tests {
       classify_sub_unit(&body, &policy()) == Some(RuleId::SubValuePlumbing),
       "a dispatch call forwarding at least two arguments is value plumbing",
     )
+    .map(drop)
   }
 
   #[test]
-  fn return_some_value_stays_reportable() -> Result<(), TestFailure> {
+  fn return_some_value_stays_reportable() -> Result<(), ConditionFailure> {
     // `return Some(x)`: a two-child call (callee + one argument) is a
     // wrapped value, never dispatch plumbing.
     let some_value = call(vec![NormalizedNode::leaf(NodeKind::Path), variable(0)]);
@@ -824,10 +841,11 @@ mod tests {
       classify_sub_unit(&wrapped, &policy()).is_none(),
       "a single wrapped argument does not become dispatch plumbing",
     )
+    .map(drop)
   }
 
   #[test]
-  fn return_with_computed_argument_stays_reportable() -> Result<(), TestFailure> {
+  fn return_with_computed_argument_stays_reportable() -> Result<(), ConditionFailure> {
     // `return f(a + b, c)`: a computed argument makes the call logic,
     // however many arguments it forwards.
     let computed_argument = binary(BinOpKind::Add, variable(0), variable(1));
@@ -838,10 +856,11 @@ mod tests {
       classify_sub_unit(&body, &policy()).is_none(),
       "computed dispatch arguments remain visible",
     )
+    .map(drop)
   }
 
   #[test]
-  fn message_only_macro_branches_are_not_reported() -> Result<(), TestFailure> {
+  fn message_only_macro_branches_are_not_reported() -> Result<(), ConditionFailure> {
     // `{ writeln!(writer, "No stale entries found.")?; }`
     let message = NormalizedNode::with_children(
       NodeKind::MacroCall {
@@ -855,10 +874,11 @@ mod tests {
       classify_sub_unit(&branch, &policy()) == Some(RuleId::SubMessageOnlyMacro),
       "message-only macros retain their suppression attribution",
     )
+    .map(drop)
   }
 
   #[test]
-  fn assertion_macro_branches_stay_reported() -> Result<(), TestFailure> {
+  fn assertion_macro_branches_stay_reported() -> Result<(), ConditionFailure> {
     let oracle = NormalizedNode::with_children(
       NodeKind::MacroCall {
         name: "assert_eq".to_owned(),
@@ -870,10 +890,11 @@ mod tests {
       classify_sub_unit(&block(vec![semi(oracle)]), &policy()).is_none(),
       "assertion macros encode observable invariants",
     )
+    .map(drop)
   }
 
   #[test]
-  fn panic_macro_branches_stay_reported() -> Result<(), TestFailure> {
+  fn panic_macro_branches_stay_reported() -> Result<(), ConditionFailure> {
     let panic_expression = NormalizedNode::with_children(
       NodeKind::MacroCall {
         name: "panic".to_owned()
@@ -885,10 +906,11 @@ mod tests {
       classify_sub_unit(&block(vec![semi(panic_expression)]), &policy()).is_none(),
       "panic expressions remain visible detector input",
     )
+    .map(drop)
   }
 
   #[test]
-  fn constructor_dispatch_arms_are_not_reported() -> Result<(), TestFailure> {
+  fn constructor_dispatch_arms_are_not_reported() -> Result<(), ConditionFailure> {
     // `Language::Rust => Box::new(RustAnalyzer::new())`
     let new_call = call(vec![NormalizedNode::leaf(NodeKind::Path)]);
     let dispatch = call(vec![NormalizedNode::leaf(NodeKind::Path), new_call]);
@@ -897,10 +919,11 @@ mod tests {
       classify_sub_unit(&dispatch, &policy()) == Some(RuleId::SubValuePlumbing),
       "nested constructor dispatch is value plumbing",
     )
+    .map(drop)
   }
 
   #[test]
-  fn constructor_assembly_arms_are_not_reported() -> Result<(), TestFailure> {
+  fn constructor_assembly_arms_are_not_reported() -> Result<(), ConditionFailure> {
     // `NormalizedNode::with_children(KIND, vec![norm(a), norm(b)])`
     let assembly = call(vec![
       NormalizedNode::leaf(NodeKind::Path),
@@ -917,10 +940,11 @@ mod tests {
       classify_sub_unit(&assembly, &policy()) == Some(RuleId::SubValuePlumbing),
       "assembling simple constructor values is value plumbing",
     )
+    .map(drop)
   }
 
   #[test]
-  fn collection_mutation_branches_are_not_reported() -> Result<(), TestFailure> {
+  fn collection_mutation_branches_are_not_reported() -> Result<(), ConditionFailure> {
     // `{ files.push(path.to_path_buf()); }`
     let projection = method_call(vec![variable(0), variable(1)]);
     let push = method_call(vec![variable(2), variable(3), projection]);
@@ -929,10 +953,11 @@ mod tests {
       classify_sub_unit(&block(vec![semi(push)]), &policy()) == Some(RuleId::SubValuePlumbing),
       "a collection mutation forwarding simple projections is value plumbing",
     )
+    .map(drop)
   }
 
   #[test]
-  fn projection_only_method_predicates_are_not_reported() -> Result<(), TestFailure> {
+  fn projection_only_method_predicates_are_not_reported() -> Result<(), ConditionFailure> {
     // `node.children.iter().any(is_simple_value_or_projection)`
     let field = NormalizedNode::with_children(NodeKind::FieldAccess, vec![variable(0), variable(1)]);
     let iterator = method_call(vec![field, variable(2)]);
@@ -942,10 +967,11 @@ mod tests {
       classify_sub_unit(&predicate, &policy()) == Some(RuleId::SubValuePlumbing),
       "a projection-only method chain is value plumbing",
     )
+    .map(drop)
   }
 
   #[test]
-  fn value_plumbing_with_nested_closures_stays_reported() -> Result<(), TestFailure> {
+  fn value_plumbing_with_nested_closures_stays_reported() -> Result<(), ConditionFailure> {
     let callback = NormalizedNode::with_children(NodeKind::Closure, vec![binary(BinOpKind::Add, variable(0), literal_int())]);
     let pipeline = method_call(vec![variable(1), variable(2), callback]);
 
@@ -953,10 +979,11 @@ mod tests {
       classify_sub_unit(&block(vec![pipeline]), &policy()).is_none(),
       "nested callback computation keeps a chain visible",
     )
+    .map(drop)
   }
 
   #[test]
-  fn top_level_builder_setters_are_not_reportable() -> Result<(), TestFailure> {
+  fn top_level_builder_setters_are_not_reportable() -> Result<(), ConditionFailure> {
     // `self.kind_resolver = Some(resolver); self`
     let assign = NormalizedNode::with_children(NodeKind::Assign, vec![
       NormalizedNode::with_children(NodeKind::FieldAccess, vec![variable(0), variable(1)]),
@@ -968,10 +995,11 @@ mod tests {
       classify_top_level_body(&body, &policy()) == Some(RuleId::AstSetterReturningSelf),
       "a setter followed by self receives the setter rule",
     )
+    .map(drop)
   }
 
   #[test]
-  fn top_level_accessor_forwarding_is_not_reportable() -> Result<(), TestFailure> {
+  fn top_level_accessor_forwarding_is_not_reportable() -> Result<(), ConditionFailure> {
     // `self.percent_of_total(self.exact_duplicate_lines)`
     let projection = NormalizedNode::with_children(NodeKind::FieldAccess, vec![variable(0), variable(1)]);
     let body = method_call(vec![variable(0), variable(2), projection]);
@@ -980,10 +1008,11 @@ mod tests {
       classify_top_level_body(&block(vec![body]), &policy()) == Some(RuleId::AstForwardingAccessor),
       "simple accessor forwarding receives the accessor rule",
     )
+    .map(drop)
   }
 
   #[test]
-  fn top_level_boolean_projections_are_not_reportable() -> Result<(), TestFailure> {
+  fn top_level_boolean_projections_are_not_reportable() -> Result<(), ConditionFailure> {
     // `ch == '_' || ch.is_ascii_alphanumeric()`
     let equality = binary(BinOpKind::Eq, variable(0), literal_int());
     let predicate_call = method_call(vec![variable(0), variable(1)]);
@@ -993,10 +1022,11 @@ mod tests {
       classify_top_level_body(&block(vec![body]), &policy()) == Some(RuleId::AstBooleanProjection),
       "a simple boolean combination receives the projection rule",
     )
+    .map(drop)
   }
 
   #[test]
-  fn top_level_constant_binding_wrappers_stay_reportable() -> Result<(), TestFailure> {
+  fn top_level_constant_binding_wrappers_stay_reportable() -> Result<(), ConditionFailure> {
     // `fixture_path("cargo-dupes", name)`: a Call-rooted wrapper that
     // binds a constant is a deliberate named specialization.
     let body = call(vec![
@@ -1009,10 +1039,11 @@ mod tests {
       classify_top_level_body(&block(vec![body]), &policy()).is_none(),
       "top-level call wrappers remain visible",
     )
+    .map(drop)
   }
 
   #[test]
-  fn top_level_struct_constructors_stay_reportable() -> Result<(), TestFailure> {
+  fn top_level_struct_constructors_stay_reportable() -> Result<(), ConditionFailure> {
     // `Self { root }`
     let field = NormalizedNode::with_children(NodeKind::FieldValue, vec![variable(0), variable(0)]);
     let init = NormalizedNode::with_children(NodeKind::StructInit, vec![NormalizedNode::none(), field]);
@@ -1021,10 +1052,11 @@ mod tests {
       classify_top_level_body(&block(vec![init]), &policy()).is_none(),
       "top-level struct construction remains visible",
     )
+    .map(drop)
   }
 
   #[test]
-  fn closure_comparator_adapters_are_not_reportable() -> Result<(), TestFailure> {
+  fn closure_comparator_adapters_are_not_reportable() -> Result<(), ConditionFailure> {
     // `|| group_start_key(a).cmp(&group_start_key(b))`
     let first_key = call(vec![variable(0), variable(1)]);
     let second_key = call(vec![variable(0), variable(2)]);
@@ -1043,10 +1075,11 @@ mod tests {
       classify_closure_body(&comparison, &policy()) == Some(RuleId::AstComparatorAdapter),
       "call-based comparator closures receive the comparator rule",
     )
+    .map(drop)
   }
 
   #[test]
-  fn closures_with_callback_pipelines_stay_reportable() -> Result<(), TestFailure> {
+  fn closures_with_callback_pipelines_stay_reportable() -> Result<(), ConditionFailure> {
     // `path.segments.iter().map(|s| s.ident.to_string()).join("::")`:
     // the inner closure carries logic, so the chain stays reportable.
     let projection = NormalizedNode::with_children(NodeKind::FieldAccess, vec![variable(0), variable(1)]);
@@ -1056,11 +1089,13 @@ mod tests {
     ensure(
       classify_closure_body(&block(vec![chain.clone()]), &policy()).is_none(),
       "callback-bearing closures remain visible",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       classify_sub_unit(&block(vec![chain]), &policy()).is_none(),
       "the same callback chain remains visible as a sub-unit",
     )
+    .map(drop)
   }
 
   /// Construct an if-guarded assignment using distinct source placeholders.
@@ -1103,7 +1138,7 @@ mod tests {
     /// Complete extracted population and its ownership metadata.
     actual:   Vec<SubUnit>,
     /// Native assertion failure.
-    source:   TestFailure,
+    source:   ConditionFailure,
   }
 
   /// Check complete canonical units without projecting away body or chain evidence.
@@ -1113,6 +1148,7 @@ mod tests {
       actual == expected,
       "extraction preserves exact canonical bodies, ordering, and chain ownership",
     )
+    .map(drop)
     .map_err(|source| {
       Box::new(ExtractionTestFailure {
         body,
@@ -1125,34 +1161,39 @@ mod tests {
   }
 
   #[test]
-  fn consecutive_setter_ifs_extract_as_one_chain() -> Result<(), TestFailure> {
+  fn consecutive_setter_ifs_extract_as_one_chain() -> Result<(), PredicateFailure<Vec<SubUnit>>> {
     let body = block(vec![setter_if(0, 1), setter_if(2, 3), setter_if(4, 5)]);
-
-    let sub_units = extract_sub_units(&body, 1);
-
-    let chains: Vec<_> = sub_units.iter().filter(|unit| unit.kind == CodeUnitKind::IfChain).collect();
-    ensure_eq(&chains.len(), &1, "consecutive setters form one chain")?;
-    let branches: Vec<_> = sub_units.iter().filter(|unit| unit.kind == CodeUnitKind::IfBranch).collect();
-    ensure_eq(&branches.len(), &3, "chained branches stay extracted, linked to their owning chain")?;
-    for chain in chains {
-      ensure_eq(
-        &chain.description.as_str(),
-        &"if chain (3 branches)",
-        "the chain describes its complete membership",
-      )?;
-      let chain_fingerprint = Fingerprint::from_node(&chain.node);
-      for branch in &branches {
-        ensure(
-          branch.parent_chain == Some(chain_fingerprint),
-          "each branch retains its owning chain identity",
-        )?;
-      }
-      ensure(
-        classify_sub_unit(&chain.node, &policy()).is_none(),
-        "the complete assignment chain is reportable",
-      )?;
-    }
-    Ok(())
+    let mut sub_units = extract_sub_units(&body, 1);
+    sub_units = ensure_that(sub_units, "consecutive setters form one chain", |units| {
+      units.iter().filter(|unit| unit.kind == CodeUnitKind::IfChain).count() == 1
+    })?;
+    sub_units = ensure_that(
+      sub_units,
+      "chained branches stay extracted, linked to their owning chain",
+      |units| units.iter().filter(|unit| unit.kind == CodeUnitKind::IfBranch).count() == 3,
+    )?;
+    sub_units = ensure_that(sub_units, "the chain describes its complete membership", |units| {
+      units
+        .iter()
+        .filter(|unit| unit.kind == CodeUnitKind::IfChain)
+        .all(|chain| chain.description == "if chain (3 branches)")
+    })?;
+    sub_units = ensure_that(sub_units, "each branch retains its owning chain identity", |units| {
+      units.iter().filter(|unit| unit.kind == CodeUnitKind::IfChain).all(|chain| {
+        let fingerprint = Fingerprint::from_node(&chain.node);
+        units
+          .iter()
+          .filter(|unit| unit.kind == CodeUnitKind::IfBranch)
+          .all(|branch| branch.parent_chain == Some(fingerprint))
+      })
+    })?;
+    ensure_that(sub_units, "the complete assignment chain is reportable", |units| {
+      units
+        .iter()
+        .filter(|unit| unit.kind == CodeUnitKind::IfChain)
+        .all(|chain| classify_sub_unit(&chain.node, &policy()).is_none())
+    })
+    .map(drop)
   }
 
   #[test]
@@ -1211,7 +1252,7 @@ mod tests {
   }
 
   #[test]
-  fn chain_members_still_extract_nested_structures() -> Result<(), TestFailure> {
+  fn chain_members_still_extract_nested_structures() -> Result<(), ConditionFailure> {
     let inner_loop = NormalizedNode::with_children(NodeKind::While, vec![
       binary(BinOpKind::Gt, variable(0), literal_int()),
       block(vec![binary(BinOpKind::Add, variable(1), literal_int())]),
@@ -1228,10 +1269,12 @@ mod tests {
     ensure(
       sub_units.iter().any(|unit| unit.kind == CodeUnitKind::IfChain),
       "consecutive conditional statements retain their chain",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       sub_units.iter().any(|unit| unit.kind == CodeUnitKind::LoopBody),
       "structures nested inside chain branches are still extracted",
     )
+    .map(drop)
   }
 }

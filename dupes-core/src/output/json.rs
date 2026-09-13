@@ -345,6 +345,7 @@ mod tests {
         matches!(*observed, Err(ReportError::Json(_))) && bytes == b"existing output",
         "an unsupported object key returns its native encoding failure before any destination write",
       )
+      .map(drop)
     })
   }
 
@@ -354,26 +355,26 @@ mod tests {
     let reporter = JsonReporter::new(None);
     let statistics = with_duplicate_lines(stats(50, 500, 3, 8, 2, 5), 30, 20);
     let document = render_json(|writer| reporter.report_stats(&statistics, writer))?;
-    check_json(document, |parsed| {
-      ensure_eq(
-        parsed,
-        &json!({
-          "total_code_units": 50,
-          "total_lines": 500,
-          "exact_duplicate_groups": 3,
-          "exact_duplicate_units": 8,
-          "near_duplicate_groups": 2,
-          "near_duplicate_units": 5,
-          "exact_duplicate_lines": 30,
-          "near_duplicate_lines": 20,
-          "exact_duplicate_percent": 6.0,
-          "near_duplicate_percent": 4.0,
-          "suppressed_unit_count": 0,
-          "suppressed_group_count": 0
-        }),
-        "preserve the complete statistics schema while omitting empty optional dimensions",
-      )
-    })
+    ensure_eq(
+      document,
+      json!({
+        "total_code_units": 50,
+        "total_lines": 500,
+        "exact_duplicate_groups": 3,
+        "exact_duplicate_units": 8,
+        "near_duplicate_groups": 2,
+        "near_duplicate_units": 5,
+        "exact_duplicate_lines": 30,
+        "near_duplicate_lines": 20,
+        "exact_duplicate_percent": 6.0,
+        "near_duplicate_percent": 4.0,
+        "suppressed_unit_count": 0,
+        "suppressed_group_count": 0
+      }),
+      "preserve the complete statistics schema while omitting empty optional dimensions",
+    )
+    .map(drop)
+    .map_err(ReportTestFailure::from)
   }
 
   /// An empty exact-duplicate population renders a valid empty group array.
@@ -381,9 +382,9 @@ mod tests {
   fn json_report_exact_empty() -> Result<(), ReportTestFailure> {
     let reporter = JsonReporter::new(None);
     let document = render_json(|writer| reporter.report_exact(&[], writer))?;
-    check_json(document, |parsed| {
-      ensure_eq(parsed, &json!([]), "empty exact groups render as an empty JSON array")
-    })
+    ensure_eq(document, json!([]), "empty exact groups render as an empty JSON array")
+      .map(drop)
+      .map_err(ReportTestFailure::from)
   }
 
   /// Exact reports retain both members, complete similarity, and the group identity.
@@ -396,19 +397,22 @@ mod tests {
     ]);
     let document = render_json(|writer| reporter.report_exact(&[group], writer))?;
     check_json(document, |parsed| {
-      ensure(parsed.as_array().map(Vec::len) == Some(1), "render one exact group")?;
+      ensure(parsed.as_array().map(Vec::len) == Some(1), "render one exact group").map(drop)?;
       ensure(
         parsed.pointer("/0/members").and_then(Value::as_array).map(Vec::len) == Some(2),
         "retain both exact members",
-      )?;
+      )
+      .map(drop)?;
       ensure(
         parsed.pointer("/0/similarity") == Some(&json!(1.0)),
         "exact groups have complete similarity",
-      )?;
+      )
+      .map(drop)?;
       ensure(
         parsed.pointer("/0/fingerprint").is_some_and(Value::is_string),
         "group identity is serialized as hexadecimal text",
       )
+      .map(drop)
     })
   }
 
@@ -423,15 +427,17 @@ mod tests {
     ]);
     let document = render_json(|writer| reporter.report_near(&[group], writer))?;
     check_json(document, |parsed| {
-      ensure(parsed.as_array().map(Vec::len) == Some(1), "render one near group")?;
+      ensure(parsed.as_array().map(Vec::len) == Some(1), "render one near group").map(drop)?;
       ensure(
         parsed.pointer("/0/fingerprint") == Some(&json!(fp.to_hex())),
         "retain the near-group content identity",
-      )?;
+      )
+      .map(drop)?;
       ensure(
         parsed.pointer("/0/similarity") == Some(&json!(0.85)),
         "retain the computed near similarity",
       )
+      .map(drop)
     })
   }
 
@@ -442,7 +448,7 @@ mod tests {
     let group = exact_group(vec![make_unit("foo", "/project/src/a.rs", 10, 20)]);
     let document = render_json(|writer| reporter.report_exact(&[group], writer))?;
     check_json(document, |parsed| {
-      ensure(parsed.is_array(), "the group document is valid JSON with an array root")
+      ensure(parsed.is_array(), "the group document is valid JSON with an array root").map(drop)
     })
   }
 
@@ -458,6 +464,7 @@ mod tests {
         parsed.pointer("/0/members/0/file") == Some(&json!("src/main.rs")),
         "strip the configured base from the member path",
       )
+      .map(drop)
     })
   }
 
@@ -489,7 +496,8 @@ mod tests {
       ensure(
         parsed.get("groups").and_then(Value::as_array).map(Vec::len) == Some(2),
         "include exact and near groups in the complete report",
-      )?;
+      )
+      .map(drop)?;
       ensure(
         parsed.get("warnings")
           == Some(&json!([
@@ -503,6 +511,7 @@ mod tests {
             ])),
         "retain each complete requested rule action alongside the existing warning message format",
       )
+      .map(drop)
     })
   }
 
@@ -518,6 +527,7 @@ mod tests {
         parsed.get("warnings") == Some(&json!([])) && parsed.get("rule_warnings").is_none(),
         "an empty warning population does not fabricate rule failures or an optional rule-warning section",
       )
+      .map(drop)
     })
   }
 }

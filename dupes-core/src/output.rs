@@ -285,6 +285,7 @@ mod tests {
             && source.result.to_bits() == f64::INFINITY.to_bits()),
           "the renderer preserves the native non-finite value, scale, result, and complete group",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -305,6 +306,7 @@ mod tests {
           matches!(*observed, Err(ReportError::Write(ref source)) if source.kind() == ErrorKind::WriteZero) && output.is_empty(),
           "renderer dispatch preserves the native exhausted-writer failure and writes no bytes",
         )
+        .map(drop)
       })?;
     }
     Ok(())

@@ -69,7 +69,7 @@ pub enum TreeSitterParseError {
 /// #     Query(#[from] tree_sitter::QueryError),
 /// #     /// The configured extensions did not match the example contract.
 /// #     #[error(transparent)]
-/// #     Expectation(#[from] strict_test_support::TestFailure),
+/// #     Expectation(#[from] strict_test_support::ConditionFailure),
 /// # }
 /// # /// Construct and inspect a configured analyzer.
 /// # fn main() -> Result<(), ExampleError> {
@@ -84,7 +84,8 @@ pub enum TreeSitterParseError {
 /// strict_test_support::ensure(
 ///   analyzer.file_extensions() == ["py"],
 ///   "the configured analyzer supports Python files",
-/// )?;
+/// )
+/// .map(drop)?;
 /// # Ok(())
 /// # }
 /// ```
@@ -228,7 +229,7 @@ mod tests {
   use dupes_core::code_unit::CodeUnit;
   use dupes_core::code_unit::CodeUnitKind;
   use dupes_core::config::AnalysisConfig;
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
 
   use super::TreeSitterAnalyzer;
@@ -250,7 +251,7 @@ mod tests {
       /// Complete code units returned by the analyzer.
       units:  Vec<CodeUnit>,
       /// Failed semantic expectation.
-      source: TestFailure,
+      source: ConditionFailure,
     },
     /// Query rejection lost the native diagnostic or unexpectedly constructed an analyzer.
     #[error("{source}; query construction result: {outcome:?}")]
@@ -258,7 +259,7 @@ mod tests {
       /// Complete construction result for the invalid query.
       outcome: Box<Result<TreeSitterAnalyzer, tree_sitter::QueryError>>,
       /// Failed semantic expectation.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
   }
 
@@ -299,6 +300,7 @@ mod tests {
         observed == expected,
         "configured callbacks retain captured kinds and test membership while defaults remain unchanged",
       )
+      .map(drop)
       .map_err(|failure| AnalyzerTestFailure::Units {
         units,
         source: failure,
@@ -315,6 +317,7 @@ mod tests {
       matches!(outcome, Err(ref source) if source.kind == tree_sitter::QueryErrorKind::Syntax),
       "an incomplete query returns its native syntax error without constructing an analyzer",
     )
+    .map(drop)
     .map_err(|source| AnalyzerTestFailure::QueryExpectation {
       outcome: Box::new(outcome),
       source,

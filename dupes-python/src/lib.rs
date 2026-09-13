@@ -234,7 +234,7 @@ pub fn python_mapping() -> NodeMapping {
 #[cfg(test)]
 mod tests {
   use dupes_core::analyzer::LanguageAnalyzer as _;
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
 
   use super::PythonAnalyzer;
@@ -248,7 +248,7 @@ mod tests {
     Initialization(#[from] PythonAnalyzerError),
     /// The analyzer did not expose its expected file extensions.
     #[error(transparent)]
-    Expectation(#[from] TestFailure),
+    Expectation(#[from] ConditionFailure),
   }
 
   /// Fallible construction preserves support for Python modules and stubs.
@@ -258,7 +258,8 @@ mod tests {
     ensure(
       analyzer.file_extensions() == ["py", "pyi"],
       "new analyzer supports Python modules and stubs",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 }

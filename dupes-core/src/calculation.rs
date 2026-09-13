@@ -347,7 +347,7 @@ pub const fn scale(operand: f64, multiplier: f64) -> Result<f64, ScalingFailure>
 
 #[cfg(test)]
 mod tests {
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
 
   use super::LineRangeFailure;
@@ -374,7 +374,7 @@ mod tests {
       /// Complete expected length or interval failure.
       expected: Box<Result<usize, LineRangeFailure>>,
       /// Failed behavioral expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// A count ratio differed from its required binary64 outcome.
     #[error("ratio {numerator}/{denominator} differed: {observed:?}; expected {expected:?}: {source}")]
@@ -388,7 +388,7 @@ mod tests {
       /// Expected binary64 bits or complete typed failure.
       expected:    Box<Result<u64, RatioFailure>>,
       /// Failed behavioral expectation.
-      source:      TestFailure,
+      source:      ConditionFailure,
     },
     /// Multiplication differed from its required value or typed failure.
     #[error("scaling {operand} by {multiplier} differed: {observed:?}: {source}")]
@@ -400,7 +400,7 @@ mod tests {
       /// Complete returned value or rejected native calculation.
       observed:   Result<f64, ScalingFailure>,
       /// Failed behavioral expectation.
-      source:     TestFailure,
+      source:     ConditionFailure,
     },
   }
 
@@ -411,6 +411,7 @@ mod tests {
       observed.as_ref().map(|score| score.to_bits()) == expected.as_ref().copied(),
       "count conversion and division preserve the required rounded binary64 result",
     )
+    .map(drop)
     .map_err(|source| CalculationTestFailure::Ratio {
       numerator,
       denominator,
@@ -505,6 +506,7 @@ mod tests {
         observed == expected,
         "inclusive measurements retain exact counts or the complete failed interval operation",
       )
+      .map(drop)
       .map_err(|source| CalculationTestFailure::LineRange {
         start,
         end,
@@ -529,6 +531,7 @@ mod tests {
         observed.as_ref().is_ok_and(|result| result.to_bits() == expected.to_bits()),
         "finite scaling keeps its native rounded result, including signed zero and underflow",
       )
+      .map(drop)
       .map_err(|source| CalculationTestFailure::Scaling {
         operand,
         multiplier,
@@ -552,6 +555,7 @@ mod tests {
         }),
         "rejected scaling preserves both original operands and its non-finite native result",
       )
+      .map(drop)
       .map_err(|source| CalculationTestFailure::Scaling {
         operand,
         multiplier,

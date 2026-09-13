@@ -1713,7 +1713,7 @@ mod tests {
   use std::process::ExitCode;
   use std::string::FromUtf8Error;
 
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use tempfile::TempDir;
   use thiserror::Error;
@@ -1795,7 +1795,7 @@ mod tests {
     Utf8(#[from] FromUtf8Error),
     /// A behavioral assertion failed.
     #[error(transparent)]
-    Assertion(#[from] TestFailure),
+    Assertion(#[from] ConditionFailure),
     /// A malformed fingerprint unexpectedly completed registration instead of yielding a native
     /// failure.
     #[error("invalid fingerprint registration unexpectedly succeeded: {outcome:?}; output: {output:?}")]
@@ -1813,7 +1813,7 @@ mod tests {
       /// Bytes observed in the output destination after the command returned.
       output:  Vec<u8>,
       /// Failed behavioral expectation.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// Registration lost its decision, native failure, persisted document, or output.
     #[error("registry preservation failed: {source}; outcome: {outcome:?}; output: {output:?}; contents: {contents:?}")]
@@ -1825,7 +1825,7 @@ mod tests {
       /// Registry bytes observed after the command returned.
       contents: Vec<u8>,
       /// Assertion explaining the violated contract.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// Cleanup lost its original registry, selected entries, persisted document, or output.
     #[error("cleanup expectation failed: {source}; outcome: {outcome:?}; output: {output:?}; contents: {contents:?}")]
@@ -1837,7 +1837,7 @@ mod tests {
       /// Registry bytes observed after cleanup returned.
       contents: Vec<u8>,
       /// Failed behavioral expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// A command lost its completed analysis, source observations, or report output.
     #[error("command outcome expectation failed: {source}; outcome: {outcome:?}; output: {output:?}")]
@@ -1847,7 +1847,7 @@ mod tests {
       /// Bytes observed in the output destination after the command returned.
       output:  Vec<u8>,
       /// Assertion explaining the violated contract.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// Dispatch lost its native action result or emitted incorrect output.
     #[error("dispatch expectation failed: {source}; outcome: {outcome:?}; output: {output:?}")]
@@ -1857,7 +1857,7 @@ mod tests {
       /// Complete bytes emitted by the dispatched action.
       output:  Vec<u8>,
       /// Failed behavioral expectation.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// Gate evaluation returned an unexpected complete result.
     #[error("check evaluation expectation failed: {source}; outcome: {outcome:?}")]
@@ -1865,7 +1865,7 @@ mod tests {
       /// Complete gate result or native count failure observed by the test.
       outcome: Box<Result<CheckOutcome, CheckEvaluationFailure>>,
       /// Failed behavioral expectation.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// Successor classification changed a complete group or its line-drift decision.
     #[error("successor boundary expectation failed: {source}; recorded: {recorded:?}; observed: {observed:?}; expected: {expected:?}")]
@@ -1877,7 +1877,7 @@ mod tests {
       /// Independently expected classifications and complete groups.
       expected: Box<[SuccessorCandidate; 2]>,
       /// Failed behavioral expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// A count failure lost its native evidence or rendered a misleading check report.
     #[error("count-check expectation failed: {source}; outcome: {outcome:?}; output: {output:?}")]
@@ -1887,7 +1887,7 @@ mod tests {
       /// Complete report bytes emitted before the command returned.
       output:  Vec<u8>,
       /// Failed behavioral expectation.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// Error rendering failed with its original operation failure retained.
     #[error(transparent)]
@@ -1900,7 +1900,7 @@ mod tests {
       /// File contents observed after the attempted write.
       contents: Vec<u8>,
       /// Failed semantic expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// Lazy preparation changed callback execution or the caller's error family.
     #[error("preparation callback expectation failed: {source}; outcome: {outcome:?}; invoked: {invoked}; output: {output:?}")]
@@ -1912,7 +1912,7 @@ mod tests {
       /// Bytes observed in the command's output destination after it returned.
       output:  Vec<u8>,
       /// Failed semantic expectation.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
   }
 
@@ -1927,7 +1927,7 @@ mod tests {
     outcome: PreparedCommandResult,
     invoked: bool,
     output: Vec<u8>,
-    assertion: Result<(), TestFailure>,
+    assertion: &Result<(), ConditionFailure>,
   ) -> Result<(), CommandTestFailure> {
     assertion.map_err(|source| CommandTestFailure::CallbackExpectation {
       outcome: Box::new(outcome),
@@ -1983,7 +1983,8 @@ mod tests {
     ensure(
       explicit.root()? == explicit_path && CommonCliArgs::default().root()? == current_directory,
       "explicit roots retain their native spelling while an omitted root uses the observed working directory",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -2044,8 +2045,9 @@ mod tests {
       let assertion = ensure(
         expected_outcome && invoked.get() == should_invoke,
         "preparation failure retains the full unapplied request and native error while ignored listings do not initialize",
-      );
-      retain_preparation_evidence(outcome, invoked.get(), output, assertion)?;
+      )
+      .map(drop);
+      retain_preparation_evidence(outcome, invoked.get(), output, &assertion)?;
     }
     Ok(())
   }
@@ -2113,8 +2115,9 @@ mod tests {
       let assertion = ensure(
         retained && !invoked.get() && output == expected_output,
         "listing preserves native registry evidence and output status without invoking analysis",
-      );
-      retain_preparation_evidence(outcome, invoked.get(), output, assertion)?;
+      )
+      .map(drop);
+      retain_preparation_evidence(outcome, invoked.get(), output, &assertion)?;
     }
     Ok(())
   }
@@ -2141,8 +2144,9 @@ mod tests {
         && !invoked.get()
         && output.is_empty(),
       "registry loading retains the requested root, original document, and native decoding failure before analysis or output",
-    );
-    retain_preparation_evidence(outcome, invoked.get(), output, assertion)
+    )
+    .map(drop);
+    retain_preparation_evidence(outcome, invoked.get(), output, &assertion)
   }
 
   /// Direct dispatch performs registry listing without using the supplied analysis renderer.
@@ -2166,6 +2170,7 @@ mod tests {
         ) == (0, 0, Vec::new()),
       "direct ignored dispatch returns the native registry load and listing without rendering analysis",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::DispatchExpectation {
       outcome: Box::new(outcome),
       output,
@@ -2196,7 +2201,8 @@ mod tests {
     ensure(
       status == ExitCode::from(2) && output == b"Error: Invalid fingerprint: invalid: invalid digit found in string\n",
       "operational errors retain status two and their complete shared diagnostic",
-    )?;
+    )
+    .map(drop)?;
 
     let before = output.clone();
     let thresholds = CheckThresholds {
@@ -2210,7 +2216,8 @@ mod tests {
     ensure(
       check_status == ExitCode::from(1) && output == before,
       "check failure retains status one without repeating its already-rendered diagnostic",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -2233,6 +2240,7 @@ mod tests {
         && contents == b"existing contents",
       "failed reporting preserves the original typed failure and native writing error without changing the file",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::ReportingExpectation {
       outcome: Box::new(outcome),
       contents,
@@ -2311,7 +2319,7 @@ mod tests {
     root: &Path,
     statistics: DuplicationStats,
     thresholds: &CheckThresholds,
-    check: impl FnOnce(&RenderedCommandResult, &[u8]) -> Result<(), TestFailure>,
+    check: impl FnOnce(&RenderedCommandResult, &[u8]) -> Result<(), ConditionFailure>,
   ) -> Result<(), CommandTestFailure> {
     let prepared = command_analysis_output(root, statistics)?;
     let mut output = Vec::new();
@@ -2404,6 +2412,7 @@ mod tests {
         outcome == Ok(expected),
         "the check retains both count decisions and both measurements with no percentage threshold",
       )
+      .map(drop)
       .map_err(|source| CommandTestFailure::Evaluation {
         outcome: Box::new(outcome),
         source,
@@ -2448,6 +2457,7 @@ mod tests {
       outcome == Err(expected),
       "a near-count overflow retains the completed exact-count comparison and complete native overflow evidence",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::Evaluation {
       outcome: Box::new(outcome),
       source,
@@ -2519,6 +2529,7 @@ mod tests {
         && output == b"\nCheck passed.\n",
       "passing checks retain all measurements, native comparisons, and thresholds after one statistics report",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::Check {
       outcome: Box::new(outcome),
       output,
@@ -2550,6 +2561,7 @@ mod tests {
         && output.is_empty(),
       "an unordered threshold retains its native values and comparison result before any verdict is rendered",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::Check {
       outcome: Box::new(outcome),
       output,
@@ -2582,6 +2594,7 @@ mod tests {
           && output == b"existing contents",
         "an output-write failure retains the complete prior check and native I/O cause without altering the destination",
       )
+      .map(drop)
       .map_err(|source| CommandTestFailure::Check {
         outcome: Box::new(outcome),
         output,
@@ -2617,6 +2630,7 @@ mod tests {
         && output.is_empty(),
       "count overflow preserves its native calculation evidence and status two without printing a check verdict",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::CountCheck {
       outcome: Box::new(outcome),
       output,
@@ -2645,6 +2659,7 @@ mod tests {
         && sink == b"\nCheck FAILED: 1 exact duplicate groups (max: 0)\n\nCheck FAILED: 1 near duplicate groups (max: 0)\n",
       "the complete failed check survives one full report and exactly one summary for each breached gate",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::Check {
       outcome: Box::new(outcome),
       output: sink,
@@ -2685,6 +2700,7 @@ mod tests {
         && output == format!("Added {} to ignore list.\n", group.fingerprint).as_bytes(),
       "registration preserves the complete matched group, native absence, insertion decision, write input, and success diagnostic",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::RegistryPreservation {
       outcome: Box::new(outcome),
       output,
@@ -2736,6 +2752,7 @@ mod tests {
           .as_bytes(),
       "an unmatched registration retains the original registry and adds an identity-only entry with an explicit missing-group diagnostic",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::RegistryPreservation {
       outcome: Box::new(outcome),
       output,
@@ -2785,6 +2802,7 @@ mod tests {
         && output == format!("{} is already in the ignore list.\n", group.fingerprint).as_bytes(),
       "repeated registration retains the original metadata and full unapplied request without claiming that an entry was added",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::RegistryPreservation {
       outcome: Box::new(outcome),
       output,
@@ -2831,6 +2849,7 @@ mod tests {
         && output == b"existing output",
       "reporting failure retains the completed registration, successful write, and native output error",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::RegistryPreservation {
       outcome: Box::new(outcome),
       output,
@@ -2864,6 +2883,7 @@ mod tests {
           && output.is_empty(),
         "invalid identity input preserves the root, reason, original spelling, native error, and untouched registry",
       )
+      .map(drop)
       .map_err(|source| CommandTestFailure::RegistryPreservation {
         outcome: Box::new(outcome),
         output,
@@ -2897,6 +2917,7 @@ mod tests {
         && output.is_empty(),
       "registration preserves a malformed registry and returns its decoding failure before saving or reporting success",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::RegistryPreservation {
       outcome: Box::new(outcome),
       output,
@@ -2933,6 +2954,7 @@ mod tests {
           && output.ends_with(b"\nCheck passed.\n"),
         "successful dispatch returns the complete analysis and every check decision with the original requested command",
       )
+      .map(drop)
     })
   }
 
@@ -2973,6 +2995,7 @@ mod tests {
         "threshold rejection preserves passing, failing, and unconfigured decisions with the request, native preparation, renderer, and \
          status",
       )
+      .map(drop)
     })
   }
 
@@ -2998,7 +3021,7 @@ mod tests {
           && matches!(**source, CliError::Report(ReportError::Write(ref native)) if native.raw_os_error().is_some()))
         && after == contents.as_bytes(),
       "a report-write failure retains the original request, renderer, complete analysis, and native cause without changing the input file",
-    )
+    ).map(drop)
     .map_err(|source| CommandTestFailure::CommandExpectation {
       outcome: Box::new(outcome),
       output: after,
@@ -3061,6 +3084,7 @@ mod tests {
           .as_bytes(),
       "a cleanup preview retains the full registry and stale entries, reports successors, and preserves the original document",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::CleanupExpectation {
       outcome: Box::new(outcome),
       output,
@@ -3103,6 +3127,7 @@ mod tests {
       observed == expected,
       "successor classification preserves both complete groups at and beyond the allowed line drift",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::SuccessorExpectation {
       recorded,
       observed: Box::new(observed),
@@ -3182,6 +3207,7 @@ mod tests {
         && output.ends_with(b"\n1 stale entries would be removed.\n"),
       "cleanup retains malformed location evidence and both candidate outcomes without confusing a filename suffix with a path component",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::CleanupExpectation {
       outcome: Box::new(outcome),
       output,
@@ -3225,6 +3251,7 @@ mod tests {
         && output.ends_with(b"\n1 stale entries would be removed.\n"),
       "cleanup returns the complete unusable location and an unattempted search while retaining the registry and successful preview",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::CleanupExpectation {
       outcome: Box::new(outcome),
       output,
@@ -3261,7 +3288,7 @@ mod tests {
         && output == prefix.as_bytes()
         && contents == previous_write.contents.as_bytes(),
       "a native bounded-writer failure retains the reached successor search, every parsed member outcome, and the unchanged registry",
-    ).map_err(|source| CommandTestFailure::CleanupExpectation {
+    ).map(drop).map_err(|source| CommandTestFailure::CleanupExpectation {
       outcome: Box::new(outcome), output, contents, source,
     })
   }
@@ -3302,6 +3329,7 @@ mod tests {
           .as_bytes(),
       "applying cleanup returns the complete original registry, removed entry, and successful write while retaining the live entry",
     )
+    .map(drop)
     .map_err(|source| CommandTestFailure::CleanupExpectation {
       outcome: Box::new(outcome),
       output,
@@ -3359,6 +3387,7 @@ mod tests {
           && output == b"No stale entries found.\n",
         "an empty cleanup selection returns the correct mode and full native load without rewriting the original registry document",
       )
+      .map(drop)
       .map_err(|source| CommandTestFailure::CleanupExpectation {
         outcome: Box::new(outcome),
         output,
@@ -3429,6 +3458,7 @@ mod tests {
           && output == b"existing output",
         "cleanup reporting failure retains its completed preview or persisted removal, original registry, and native output error",
       )
+      .map(drop)
       .map_err(|source| CommandTestFailure::CleanupExpectation {
         outcome: Box::new(outcome),
         output,

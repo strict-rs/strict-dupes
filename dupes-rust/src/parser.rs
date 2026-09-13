@@ -661,7 +661,7 @@ mod tests {
   use dupes_core::code_unit::CodeUnitKind;
   use dupes_core::source::SourceFile;
   use dupes_core::source::SourceReadError;
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use tempfile::TempDir;
 
@@ -690,7 +690,7 @@ mod tests {
       /// Complete units produced by the parser.
       units:  Vec<CodeUnit>,
       /// Failed behavioral expectation.
-      source: Box<TestFailure>,
+      source: Box<ConditionFailure>,
     },
     /// Declaration extraction did not preserve its expected identities and test contexts.
     #[error("declaration identity expectation failed: {source}; input: {input:?}; expected: {expected:?}; units: {units:?}")]
@@ -702,7 +702,7 @@ mod tests {
       /// Complete units produced by parsing.
       units:    Vec<CodeUnit>,
       /// Native assertion failure.
-      source:   Box<TestFailure>,
+      source:   Box<ConditionFailure>,
     },
     /// Function fingerprints did not preserve the declared equivalence relationship.
     #[error("function fingerprint expectation failed: {source}; input: {input:?}; expected equal: {equal}; units: {units:?}")]
@@ -714,7 +714,7 @@ mod tests {
       /// Complete parser output, including both normalized signatures and bodies.
       units:  Vec<CodeUnit>,
       /// Native assertion failure.
-      source: TestFailure,
+      source: ConditionFailure,
     },
     /// An assertion failed with every attempted file outcome retained.
     #[error("file parsing did not satisfy the expected contract: {source}; outcomes: {outcomes:?}")]
@@ -722,7 +722,7 @@ mod tests {
       /// Ordered successful and failed file operations.
       outcomes: Vec<Result<ParsedRustFile, RustFileError>>,
       /// Failed behavioral expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
   }
 
@@ -735,7 +735,7 @@ mod tests {
   fn check_units(
     code: &str,
     units: Vec<CodeUnit>,
-    check: impl FnOnce(&[CodeUnit]) -> Result<(), TestFailure>,
+    check: impl FnOnce(&[CodeUnit]) -> Result<(), ConditionFailure>,
   ) -> Result<(), ParserTestFailure> {
     check(&units).map_err(|source| ParserTestFailure::Units {
       input: Box::new(SourceFile {
@@ -748,7 +748,7 @@ mod tests {
   }
 
   /// Exercise the nested-source parser with the same retained input as its behavioral assertion.
-  fn check_sub_units(code: &str, check: impl FnOnce(&[CodeUnit]) -> Result<(), TestFailure>) -> Result<(), ParserTestFailure> {
+  fn check_sub_units(code: &str, check: impl FnOnce(&[CodeUnit]) -> Result<(), ConditionFailure>) -> Result<(), ParserTestFailure> {
     check_units(code, parse_sub_units(Path::new("test.rs"), code, 1)?, check)
   }
 
@@ -767,6 +767,7 @@ mod tests {
         && units.iter().all(|unit| unit.suppressed.is_none() && unit.file == input.path),
       "declaration extraction preserves source order, complete names, kinds, test contexts, and file identity before pipeline tagging",
     )
+    .map(drop)
     .map_err(|source| ParserTestFailure::Identities {
       input: Box::new(input),
       expected: expected
@@ -781,7 +782,7 @@ mod tests {
   /// Keep native file successes and failures together when a contract assertion fails.
   fn check_files(
     outcomes: Vec<Result<ParsedRustFile, RustFileError>>,
-    check: impl FnOnce(&[Result<ParsedRustFile, RustFileError>]) -> Result<(), TestFailure>,
+    check: impl FnOnce(&[Result<ParsedRustFile, RustFileError>]) -> Result<(), ConditionFailure>,
   ) -> Result<(), ParserTestFailure> {
     check(&outcomes).map_err(|source| ParserTestFailure::Files {
       outcomes,
@@ -851,17 +852,19 @@ mod tests {
       .cloned()
       .collect::<Vec<_>>();
     check_units(source, units_low, |parsed| {
-      ensure(parsed.len() == 2, "the lower node floor admits both functions")?;
+      ensure(parsed.len() == 2, "the lower node floor admits both functions").map(drop)?;
       ensure(
         parsed.iter().any(|unit| unit.node_count < 20),
         "the higher floor excludes an actually smaller function",
       )
+      .map(drop)
     })?;
     check_units(source, parse_test_source(source, 20)?, |parsed| {
       ensure(
         parsed == expected_high,
         "the higher node floor retains exactly the eligible complete units",
       )
+      .map(drop)
     })
   }
 
@@ -897,6 +900,7 @@ mod tests {
             && (first.fingerprint == second.fingerprint) == equal),
         "renaming bindings preserves function identity while different arithmetic behavior changes it",
       )
+      .map(drop)
       .map_err(|source| ParserTestFailure::Fingerprints {
         input: Box::new(input),
         equal,
@@ -915,12 +919,13 @@ mod tests {
     fs::write(&file, contents)?;
     check_files(vec![parse_file(&file, 1, 0)], |outcomes| {
       let [Err(RustFileError::Parse(ref failure))] = *outcomes else {
-        return ensure(false, "invalid Rust must return its typed parse failure");
+        return ensure(false, "invalid Rust must return its typed parse failure").map(drop);
       };
       ensure(
         failure.input.path == file && failure.input.contents == contents && failure.source.span().start().line == 1,
         "the parse failure retains the source identity, complete contents, and native diagnostic span",
       )
+      .map(drop)
     })
   }
 
@@ -961,7 +966,7 @@ mod tests {
           Ok(ref final_file),
         ] = *outcomes
         else {
-          return ensure(false, "retain the five file outcomes in request order and continue after failures");
+          return ensure(false, "retain the five file outcomes in request order and continue after failures").map(drop);
         };
         ensure(
           first.file.path == good
@@ -971,19 +976,23 @@ mod tests {
             && final_file.file.contents == last_source
             && final_file.units.iter().map(|unit| unit.name.as_str()).collect::<Vec<_>>() == ["last"],
           "retain complete source reads and extracted units on both sides of the failures",
-        )?;
+        )
+        .map(drop)?;
         ensure(
           syntax.input.path == bad && syntax.input.contents == bad_source && syntax.source.span().start().line == 1,
           "retain the original parse failure and rejected source",
-        )?;
+        )
+        .map(drop)?;
         ensure(
           utf8_path == &invalid_utf8 && utf8.as_bytes() == invalid_bytes,
           "retain every byte from the file that is not valid UTF-8",
-        )?;
+        )
+        .map(drop)?;
         ensure(
           missing_path == &missing && read.kind() == io::ErrorKind::NotFound && read.raw_os_error().is_some(),
           "retain the native missing-file failure with its operating-system error code",
         )
+        .map(drop)
       },
     )
   }
@@ -1008,16 +1017,18 @@ fn second() {
           == [("first", 2, 4), ("second", 6, 8)],
         "retain precise inclusive function spans",
       )
+      .map(drop)
     })
   }
 
   #[test]
-  fn code_unit_kind_display() -> Result<(), TestFailure> {
+  fn code_unit_kind_display() -> Result<(), ConditionFailure> {
     ensure(
       [CodeUnitKind::Function, CodeUnitKind::Method, CodeUnitKind::Closure].map(|kind| kind.to_string())
         == ["function", "method", "closure"],
       "render the public function, method, and closure labels",
     )
+    .map(drop)
   }
 
   #[test]
@@ -1055,6 +1066,7 @@ fn second() {
             == [(CodeUnitKind::Function, None), (CodeUnitKind::Closure, None)],
           "arithmetic, comparator, and structured closures remain separate units with their containing function before pipeline tagging",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -1080,12 +1092,13 @@ fn second() {
             ",
       |parsed| {
         let [ref chain, ref first, ref second, ref third] = *parsed else {
-          return ensure(false, "extract one complete chain and all three constituent branches");
+          return ensure(false, "extract one complete chain and all three constituent branches").map(drop);
         };
         ensure(
           (chain.kind, chain.name.as_str(), chain.line_start, chain.line_end) == (CodeUnitKind::IfChain, "if chain (3 branches)", 3, 11),
           "the chain spans all consecutive branches",
-        )?;
+        )
+        .map(drop)?;
         ensure(
           [first, second, third].iter().all(|branch| {
             branch.kind == CodeUnitKind::IfBranch
@@ -1094,6 +1107,7 @@ fn second() {
           }),
           "retain every branch with the owning chain fingerprint and function identity",
         )
+        .map(drop)
       },
     )
   }
@@ -1114,6 +1128,7 @@ fn second() {
           parsed.iter().map(|unit| (unit.kind, unit.parent_chain)).collect::<Vec<_>>() == [(CodeUnitKind::IfBranch, None)],
           "a standalone branch remains extracted without an owning chain",
         )
+        .map(drop)
       },
     )
   }
@@ -1145,13 +1160,14 @@ fn second() {
           .filter(|unit| unit.kind == CodeUnitKind::IfChain)
           .collect::<Vec<_>>();
         let [first, second] = *chains.as_slice() else {
-          return ensure(false, "extract both renamed chains");
+          return ensure(false, "extract both renamed chains").map(drop);
         };
         ensure(
           first.fingerprint == second.fingerprint
             && (first.parent_name.as_deref(), second.parent_name.as_deref()) == (Some("apply_first"), Some("apply_second")),
           "chain fingerprints survive renaming while parent identities remain distinct",
         )
+        .map(drop)
       },
     )
   }
@@ -1182,6 +1198,7 @@ fn second() {
             ],
           "extract loop, while, and for bodies in source order",
         )
+        .map(drop)
       },
     )
   }
@@ -1206,14 +1223,15 @@ fn longer(x: i32) -> i32 {
     fs::write(&file, code)?;
     check_files(vec![parse_file(&file, 1, 0), parse_file(&file, 1, 5)], |outcomes| {
       let [Ok(ref unfiltered), Ok(ref filtered)] = *outcomes else {
-        return ensure(false, "both file parses must succeed");
+        return ensure(false, "both file parses must succeed").map(drop);
       };
       ensure(
         unfiltered.file.path == file && filtered.file.path == file && unfiltered.file.contents == code && filtered.file.contents == code,
         "both runs retain the complete file read",
-      )?;
+      )
+      .map(drop)?;
       let [ref short, ref longer] = *unfiltered.units.as_slice() else {
-        return ensure(false, "the unrestricted run must retain both functions");
+        return ensure(false, "the unrestricted run must retain both functions").map(drop);
       };
       ensure(
         (short.name.as_str(), short.line_start, short.line_end) == ("short", 2, 4)
@@ -1221,6 +1239,7 @@ fn longer(x: i32) -> i32 {
           && filtered.units.as_slice() == [longer.clone()],
         "the five-line floor removes the short function and preserves the complete longer unit",
       )
+      .map(drop)
     })
   }
 
@@ -1320,6 +1339,7 @@ fn longer(x: i32) -> i32 {
           == [("foo", path)],
         "parse in-memory source with its supplied source identity",
       )
+      .map(drop)
     })
   }
 

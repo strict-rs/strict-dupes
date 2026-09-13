@@ -105,7 +105,8 @@ fn consolidated_sites_stay_consolidated() -> Result<(), CorpusFailure> {
       ensure(
         !(group_has_closure_in(group, "dupes-core/src/grouper.rs")? && group_has_closure_in(group, "dupes-core/src/lib.rs")?),
         "closures re-grouped across grouper.rs and lib.rs",
-      )?;
+      )
+      .map(drop)?;
     }
     Ok(())
   })

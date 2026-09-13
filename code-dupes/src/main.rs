@@ -475,7 +475,7 @@ mod tests {
   use dupes_core::ignore::IgnoreFile;
   use dupes_core::ignore::IgnoreFileObservation;
   use dupes_core::output::ReportRenderer;
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use tempfile::TempDir;
 
@@ -508,7 +508,7 @@ mod tests {
       /// Complete result observed at the selection boundary.
       outcome: Box<Result<LanguageSelection, LanguageDetectionError>>,
       /// Failed behavioral expectation.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// A command lost its language selection or complete shared outcome.
     #[error("command selection expectation failed: {source}; arguments: {arguments:?}; outcome: {outcome:?}")]
@@ -518,14 +518,14 @@ mod tests {
       /// Complete result returned by the frontend.
       outcome:   Box<CommandResult>,
       /// Failed behavioral expectation.
-      source:    TestFailure,
+      source:    ConditionFailure,
     },
   }
 
   /// Preserve the whole discovery result when a native-evidence expectation fails.
   fn check_discovery(
     outcome: Result<LanguageSelection, LanguageDetectionError>,
-    check: impl FnOnce(&Result<LanguageSelection, LanguageDetectionError>) -> Result<(), TestFailure>,
+    check: impl FnOnce(&Result<LanguageSelection, LanguageDetectionError>) -> Result<(), ConditionFailure>,
   ) -> Result<(), LanguageTestFailure> {
     check(&outcome).map_err(|source| LanguageTestFailure::Discovery {
       outcome: Box::new(outcome),
@@ -553,7 +553,7 @@ mod tests {
   }
 
   /// Check the frontend boundary while retaining the complete request and native outcome.
-  fn check_command(arguments: Cli, check: impl FnOnce(&CommandResult) -> Result<(), TestFailure>) -> Result<(), LanguageTestFailure> {
+  fn check_command(arguments: Cli, check: impl FnOnce(&CommandResult) -> Result<(), ConditionFailure>) -> Result<(), LanguageTestFailure> {
     let outcome = run(&arguments);
     check(&outcome).map_err(|source| LanguageTestFailure::Command {
       arguments: Box::new(arguments),
@@ -581,6 +581,7 @@ mod tests {
               && discovery.entries.iter().any(|entry| entry.entry.path() == path && entry.metadata.is_file() && entry.excluded.is_none())),
           "selection preserves the requested root and complete native file observation, including case-insensitive extensions",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -599,6 +600,7 @@ mod tests {
             && discovery.has_extension(&["rs"]) && discovery.has_extension(&["py"])),
         "ambiguity retains both language values and the native observations that support them",
       )
+      .map(drop)
     })
   }
 
@@ -615,6 +617,7 @@ mod tests {
             && discovery.entries.iter().any(|entry| entry.entry.path() == path && entry.metadata.is_file())),
         "unrecognized source selection retains the successfully observed unsupported file",
       )
+      .map(drop)
     })
   }
 
@@ -639,6 +642,7 @@ mod tests {
                 entry.entry.path() == workspace.path().join(name) && entry.metadata.is_dir() && entry.excluded == Some(reason)))),
         "excluded directories retain native metadata and their reasons while their Python files cannot affect Rust selection",
       )
+      .map(drop)
     })
   }
 
@@ -654,6 +658,7 @@ mod tests {
             && source.io_error().is_some_and(|native| native.kind() == io::ErrorKind::NotFound)),
         "failed traversal preserves its native path and cause without inventing a completed scan",
       )
+      .map(drop)
     })
   }
 
@@ -675,6 +680,7 @@ mod tests {
             && entry.path() == link && entry.path_is_symlink() && source.kind() == io::ErrorKind::NotFound),
         "failed target metadata preserves the native link entry, I/O cause, and completed root observation",
       )
+      .map(drop)
     })
   }
 
@@ -709,7 +715,7 @@ mod tests {
             && discovery.entries.iter().any(|entry| entry.entry.path() == file_link && entry.entry.path_is_symlink() && entry.metadata.is_file())
             && discovery.entries.iter().any(|entry| entry.entry.path() == directory_link && entry.entry.path_is_symlink() && entry.metadata.is_dir())),
         "file-link metadata enables language selection without traversing directory links or losing either link identity",
-      )
+      ).map(drop)
     })
   }
 
@@ -748,6 +754,7 @@ mod tests {
             if reporter.base_path.as_deref() == Some(workspace.path()))),
           "successful frontend dispatch retains the selection source, native preparation, command outcome, and renderer",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -766,6 +773,7 @@ mod tests {
             if source.kind() == io::ErrorKind::NotFound)),
         "a registry-only command returns native absence evidence without requiring a discoverable source language",
       )
+      .map(drop)
     })
   }
 
@@ -793,6 +801,7 @@ mod tests {
           "failed language discovery preserves the requested dry run and native observations without claiming a completed language \
            selection",
         )
+        .map(drop)
       },
     )
   }
@@ -811,6 +820,7 @@ mod tests {
           if root == workspace.path() && matches!(**source, AnalysisPreparationError::Analysis(CliError::Config(_))))),
         "configuration failure retains the prior Rust selection and every native discovery observation",
       )
+      .map(drop)
     })
   }
 
@@ -828,6 +838,7 @@ mod tests {
         if root == workspace.path() && matches!(**source, AnalysisPreparationError::Analysis(CliError::NoSourceFiles { .. })))),
           "an explicit language remains caller-selected after a later missing-source failure",
         )
+        .map(drop)
       },
     )
   }

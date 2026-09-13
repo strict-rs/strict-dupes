@@ -560,7 +560,7 @@ mod tests {
   use std::path::Path;
   use std::path::PathBuf;
 
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
   use tempfile::TempDir;
   use thiserror::Error;
@@ -613,14 +613,14 @@ mod tests {
     Encode(#[from] TomlEncodeError),
     /// A registry behavior assertion failed.
     #[error(transparent)]
-    Assertion(#[from] TestFailure),
+    Assertion(#[from] ConditionFailure),
     /// A rejected load did not preserve the expected native failure evidence.
     #[error("registry load expectation failed: {source}")]
     LoadExpectation {
       /// Complete result observed at the loader boundary.
       outcome: Box<Result<IgnoreFileLoad, IgnoreFileError>>,
       /// Assertion explaining the violated contract.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// Malformed documents lost their original bytes or native decoding outcomes.
     #[error("registry document expectations failed for {path:?}: {source}; inputs: {inputs:?}; outcomes: {outcomes:?}")]
@@ -632,7 +632,7 @@ mod tests {
       /// Complete load outcomes in document order.
       outcomes: Vec<Result<IgnoreFileLoad, IgnoreFileError>>,
       /// Native assertion failure.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// A rejected write did not preserve its model and native failure evidence.
     #[error("registry save expectation failed: {source}")]
@@ -640,7 +640,7 @@ mod tests {
       /// Complete result observed at the persistence boundary.
       outcome: Box<Result<IgnoreFileWrite, IgnoreFileError>>,
       /// Assertion explaining the violated contract.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// Persistence and subsequent loading disagree about the complete registry document.
     #[error("registry roundtrip expectation failed: {source}; write: {write:?}; loaded: {loaded:?}")]
@@ -650,7 +650,7 @@ mod tests {
       /// Complete native load used to observe the persisted registry.
       loaded: Box<IgnoreFileLoad>,
       /// Failed behavioral expectation.
-      source: TestFailure,
+      source: ConditionFailure,
     },
     /// Registration changed existing metadata or lost a complete insertion decision.
     #[error("registry registration expectation failed: {source}; registry: {registry:?}; registrations: {registrations:?}")]
@@ -660,7 +660,7 @@ mod tests {
       /// Complete decisions returned by the insertion operations, in order.
       registrations: Vec<IgnoreEntryRegistration>,
       /// Failed behavioral expectation.
-      source:        TestFailure,
+      source:        ConditionFailure,
     },
     /// Removal changed unrelated entries or discarded a matching entry's metadata.
     #[error(
@@ -681,7 +681,7 @@ mod tests {
       /// Complete expected retained population, in registry order.
       expected_retained: Vec<IgnoreEntry>,
       /// Failed behavioral expectation.
-      source:            Box<TestFailure>,
+      source:            Box<ConditionFailure>,
     },
     /// Member-location parsing lost input descriptions, parsed fields, or native failures.
     #[error("member location expectation failed: {source}; entry: {entry:?}; observations: {observations:?}")]
@@ -691,7 +691,7 @@ mod tests {
       /// Every successful or failed member interpretation, in registry order.
       observations: Vec<IgnoreMemberObservation>,
       /// Failed behavioral expectation.
-      source:       TestFailure,
+      source:       ConditionFailure,
     },
     /// Registry matching lost its original parsing evidence or changed the recorded-member policy.
     #[error(
@@ -708,7 +708,7 @@ mod tests {
       /// Complete entries whose recorded identities did not match.
       stale:    Vec<IgnoreEntry>,
       /// Failed behavioral expectation.
-      source:   Box<TestFailure>,
+      source:   Box<ConditionFailure>,
     },
   }
 
@@ -732,7 +732,7 @@ mod tests {
     /// Independently specified ignored groups in order.
     expected_ignored: Vec<DuplicateGroup>,
     /// Native assertion failure.
-    source:           TestFailure,
+    source:           ConditionFailure,
   }
 
   /// Supply a repeatable content identity for registry examples.
@@ -753,7 +753,7 @@ mod tests {
   /// Check location behavior while retaining every original member description and outcome.
   fn check_member_locations(
     members: Vec<String>,
-    check: impl FnOnce(&[IgnoreMemberObservation]) -> Result<(), TestFailure>,
+    check: impl FnOnce(&[IgnoreMemberObservation]) -> Result<(), ConditionFailure>,
   ) -> Result<(), IgnoreTestFailure> {
     let entry = IgnoreEntry {
       members,
@@ -767,6 +767,7 @@ mod tests {
         .eq(entry.members.iter()),
       "every original member description remains attached to its parsing outcome in registry order",
     )
+    .map(drop)
     .and_then(|()| check(&observations))
     .map_err(|source| IgnoreTestFailure::MemberLocations {
       entry: Box::new(entry),
@@ -822,6 +823,7 @@ mod tests {
         observations == expected,
         "both registry grammars preserve the full path and independently specified line interval",
       )
+      .map(drop)
     })
   }
 
@@ -854,6 +856,7 @@ mod tests {
         observations == expected,
         "unusable member syntax retains each typed failure and any path or endpoints already parsed",
       )
+      .map(drop)
     })
   }
 
@@ -883,6 +886,7 @@ mod tests {
             && last_path == first_path && *first_error.kind() == kind && *last_error.kind() == kind),
           "each endpoint retains its native failure and full path, and an end failure retains the parsed start",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -899,6 +903,7 @@ mod tests {
         && matches!(loaded.observation, IgnoreFileObservation::Absent { ref source } if source.kind() == ErrorKind::NotFound),
       "an absent optional registry retains its native observation and supplies the empty model",
     )
+    .map(drop)
     .map_err(|source| IgnoreTestFailure::LoadExpectation {
       outcome: Box::new(Ok(loaded)),
       source,
@@ -930,6 +935,7 @@ mod tests {
         && matches!(loaded.observation, IgnoreFileObservation::Read { ref contents } if *contents == expected_contents),
       "registry roundtrip preserves every entry together with the exact read path and document",
     )
+    .map(drop)
     .map_err(|source| IgnoreTestFailure::RoundtripExpectation {
       write: Box::new(write),
       loaded: Box::new(loaded),
@@ -960,6 +966,7 @@ mod tests {
         && source.utf8_error().valid_up_to() == 0 && source.utf8_error().error_len() == Some(1)),
       "each rejected document retains its exact bytes, registry path, and the native decoder failure for that input",
     )
+    .map(drop)
     .map_err(|source| IgnoreTestFailure::DocumentLoads {
       path,
       inputs: Box::new(inputs),
@@ -980,6 +987,7 @@ mod tests {
         if *observed_path == path && source.kind() != ErrorKind::NotFound),
       "a directory occupying the registry path returns its native read failure",
     )
+    .map(drop)
     .map_err(|source| IgnoreTestFailure::LoadExpectation {
       outcome: Box::new(outcome),
       source,
@@ -1002,6 +1010,7 @@ mod tests {
         if write.path == path && write.registry == registry && write.contents == expected_contents && source.kind() != ErrorKind::NotFound),
       "write failure preserves the full model, encoded document, destination, and native I/O cause",
     )
+    .map(drop)
     .map_err(|source| IgnoreTestFailure::SaveExpectation {
       outcome: Box::new(outcome),
       source,
@@ -1049,6 +1058,7 @@ mod tests {
           ],
       "repeated registration preserves the original entry and returns all unapplied requested metadata",
     )
+    .map(drop)
     .map_err(|source| IgnoreTestFailure::RegistrationExpectation {
       registry,
       registrations,
@@ -1093,6 +1103,7 @@ mod tests {
         removed == expected_removed && registry.ignore == expected_retained,
         "removal returns all matching entries in order and preserves every unmatched entry",
       )
+      .map(drop)
       .map_err(|source| IgnoreTestFailure::RemovalExpectation {
         fingerprint: requested,
         original: Box::new(original),
@@ -1111,7 +1122,7 @@ mod tests {
   fn is_ignored_works() -> Result<(), IgnoreTestFailure> {
     let fingerprint = test_fingerprint();
     let mut registry = IgnoreFile::default();
-    ensure(!is_ignored(&registry, fingerprint), "an unregistered fingerprint remains visible")?;
+    ensure(!is_ignored(&registry, fingerprint), "an unregistered fingerprint remains visible").map(drop)?;
     let registration = add_ignore(&mut registry, fingerprint, None, Vec::new());
     ensure(
       registration
@@ -1122,6 +1133,7 @@ mod tests {
         && is_ignored(&registry, fingerprint),
       "a successful insertion retains its complete entry and makes its identity ignored",
     )
+    .map(drop)
     .map_err(|source| IgnoreTestFailure::RegistrationExpectation {
       registry,
       registrations: vec![registration],
@@ -1160,6 +1172,7 @@ mod tests {
           visible == expected_visible && ignored == expected_ignored,
           "registry filtering preserves complete matching and unmatched groups, including members, similarity, and population order",
         )
+        .map(drop)
         .map_err(|source| GroupFilterFailure {
           registry: registry.clone(),
           input,
@@ -1177,7 +1190,7 @@ mod tests {
 
   /// Stale-entry discovery returns only entries whose identity is no longer live.
   #[test]
-  fn find_stale_entries_identifies_stale_vs_live() -> Result<(), TestFailure> {
+  fn find_stale_entries_identifies_stale_vs_live() -> Result<(), ConditionFailure> {
     let live_fingerprint = test_fingerprint();
     let stale_fingerprint = Fingerprint::from_node(&NormalizedNode::with_children(NodeKind::Block, Vec::new()));
     let stale_entry = IgnoreEntry {
@@ -1194,12 +1207,12 @@ mod tests {
     };
     registry.ignore.push(stale_entry.clone());
     let stale = find_stale_entries(&registry, &HashSet::from([live_fingerprint]), &[]);
-    ensure(stale == vec![&stale_entry], "stale detection returns only the full unmatched entry")
+    ensure(stale == vec![&stale_entry], "stale detection returns only the full unmatched entry").map(drop)
   }
 
   /// Cleanup returns complete stale entries while preserving all live registrations.
   #[test]
-  fn remove_stale_entries_removes_only_stale() -> Result<(), TestFailure> {
+  fn remove_stale_entries_removes_only_stale() -> Result<(), ConditionFailure> {
     let live_fingerprint = test_fingerprint();
     let stale_fingerprint = Fingerprint::from_node(&NormalizedNode::with_children(NodeKind::Block, Vec::new()));
     let mut registry = IgnoreFile {
@@ -1217,18 +1230,19 @@ mod tests {
     };
     registry.ignore.push(stale_entry.clone());
     let removed = remove_stale_entries(&mut registry, &HashSet::from([live_fingerprint]), &[]);
-    ensure(removed == vec![stale_entry], "cleanup returns the complete removed entries")?;
-    ensure(registry == expected_live, "cleanup retains the complete live entries")
+    ensure(removed == vec![stale_entry], "cleanup returns the complete removed entries").map(drop)?;
+    ensure(registry == expected_live, "cleanup retains the complete live entries").map(drop)
   }
 
   /// Registry lookup uses the declared filename beneath the supplied project root.
   #[test]
-  fn ignore_file_path_is_correct() -> Result<(), TestFailure> {
+  fn ignore_file_path_is_correct() -> Result<(), ConditionFailure> {
     let path = ignore_file_path(Path::new("/project"));
     ensure(
       path == Path::new("/project/.dupes-ignore.toml"),
       "the registry is rooted at the project directory",
     )
+    .map(drop)
   }
 
   /// Construct a line window whose content identity comes from the supplied seed.
@@ -1249,7 +1263,7 @@ mod tests {
 
   /// Recorded member identities keep a near-group relationship live when new members join.
   #[test]
-  fn member_subset_matching_survives_membership_drift() -> Result<(), TestFailure> {
+  fn member_subset_matching_survives_membership_drift() -> Result<(), ConditionFailure> {
     // The group gained a member, so its composite fingerprint no longer
     // matches the entry; the recorded members still appear together, so
     // the entry keeps suppressing the group and stays live.
@@ -1270,20 +1284,23 @@ mod tests {
     ensure(
       filter_ignored(vec![drifted_group.clone()], &registry, &mut ignored).is_empty(),
       "registered members remain ignored after membership growth",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       ignored == vec![drifted_group],
       "membership matching preserves the whole expanded group",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       find_stale_entries(&registry, &HashSet::new(), &[member_set]).is_empty(),
       "the retained member relationship keeps its registry entry live",
     )
+    .map(drop)
   }
 
   /// Editing recorded member content restores the finding and makes its prior registration stale.
   #[test]
-  fn member_subset_matching_resurfaces_edited_members() -> Result<(), TestFailure> {
+  fn member_subset_matching_resurfaces_edited_members() -> Result<(), ConditionFailure> {
     // One recorded member's content changed, so the registered
     // relationship must come back for review: the group is reported and
     // the entry is stale.
@@ -1304,15 +1321,18 @@ mod tests {
     ensure(
       filter_ignored(vec![edited_group.clone()], &registry, &mut ignored) == vec![edited_group],
       "edited registered content resurfaces as a complete group",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       ignored.is_empty(),
       "an edited recorded member is no longer hidden by the prior relationship",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       find_stale_entries(&registry, &HashSet::new(), &[member_set]) == vec![&entry],
       "editing a recorded member makes the complete prior entry stale",
     )
+    .map(drop)
   }
 
   /// Malformed identities retain their causes while usable recorded members keep their existing
@@ -1355,7 +1375,7 @@ mod tests {
         && visible.is_empty() && ignored == vec![group]
         && matches!(registry.observation, IgnoreFileObservation::Read { ref contents } if *contents == document),
       "matching retains each native parse failure, permits the existing nonempty usable-member fallback, and rejects an all-invalid member set",
-    ).map_err(|source| IgnoreTestFailure::FingerprintMatching { registry: Box::new(registry), visible, ignored, stale, source: Box::new(source) })
+    ).map(drop).map_err(|source| IgnoreTestFailure::FingerprintMatching { registry: Box::new(registry), visible, ignored, stale, source: Box::new(source) })
   }
 
   /// Registry persistence preserves recorded member content identities and their metadata.
@@ -1386,6 +1406,7 @@ mod tests {
         && matches!(loaded.observation, IgnoreFileObservation::Read { ref contents } if *contents == write.contents),
       "registry roundtrip preserves original spellings, successful identities, native parsing failures, and metadata",
     )
+    .map(drop)
     .map_err(|source| IgnoreTestFailure::RoundtripExpectation {
       write: Box::new(write),
       loaded: Box::new(loaded),

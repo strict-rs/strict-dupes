@@ -486,9 +486,10 @@ mod tests {
   use std::io;
   use std::path::PathBuf;
 
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
+  use strict_test_support::PredicateFailure;
   use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_that;
   use tempfile::TempDir;
   use thiserror::Error;
 
@@ -528,11 +529,14 @@ mod tests {
       /// Complete successful or failed configuration load.
       outcome: Box<Result<Config, ConfigLoadError>>,
       /// Assertion explaining the violated contract.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
     /// The loaded policy violated its expected behavior.
     #[error(transparent)]
-    Expectation(#[from] TestFailure),
+    Expectation(#[from] ConditionFailure),
+    /// A loaded setting violated its contract, retaining the complete configuration.
+    #[error(transparent)]
+    LoadedSetting(#[from] Box<PredicateFailure<Config>>),
   }
 
   /// Load a dedicated configuration file through the production file loader.
@@ -615,6 +619,7 @@ min_lines = 3
               ConfigSource::Read { contents, document: ConfigDocument::Dedicated(_), .. }] if contents == document)),
         "explicit toggles can disable or re-enable dimensions while omitted dimensions and window settings retain their earlier values",
       )
+      .map(drop)
       .map_err(|source| ConfigTestFailure::LoadExpectation {
         outcome: Box::new(outcome),
         source,
@@ -651,8 +656,9 @@ min_lines = 3
         config.suppression.is_enabled(RuleId::SubValuePlumbing),
       ] == [true, false, false],
       "dedicated-file rule overrides win while retaining unrelated Cargo rule settings",
-    )?;
-    ensure(config.load_warnings.is_empty(), "recognized rule overrides produce no warnings")?;
+    )
+    .map(drop)?;
+    ensure(config.load_warnings.is_empty(), "recognized rule overrides produce no warnings").map(drop)?;
     Ok(())
   }
 
@@ -678,6 +684,7 @@ min_lines = 3
         ],
       "retain both unknown suppression requests without rejecting the configuration",
     )
+    .map(drop)
     .map_err(|source| ConfigTestFailure::LoadExpectation {
       outcome: Box::new(Ok(config)),
       source,
@@ -686,13 +693,14 @@ min_lines = 3
 
   /// Defaults establish the documented detector sizes, thresholds, and source policy.
   #[test]
-  fn default_config() -> Result<(), TestFailure> {
+  fn default_config() -> Result<(), ConditionFailure> {
     let config = Config::default();
     ensure(
       (config.min_nodes, config.line_min_lines, config.exclude, config.sub_function) == (10, 5, Vec::<String>::new(), false)
         && config.similarity_threshold.total_cmp(&0.8) == Ordering::Equal,
       "preserve the default detector sizes, similarity threshold, and source-selection policy",
     )
+    .map(drop)
   }
 
   /// The dedicated document supplies detector settings and path exclusions.
@@ -709,7 +717,8 @@ min_lines = 3
       (config.min_nodes, &config.exclude) == (20, &vec!["tests".to_owned()])
         && config.similarity_threshold.total_cmp(&0.9) == Ordering::Equal,
       "load detector settings and path exclusions from the dedicated configuration file",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -729,7 +738,8 @@ min_lines = 3
     ensure(
       config.min_nodes == 15 && config.similarity_threshold.total_cmp(&0.75) == Ordering::Equal,
       "load package metadata when the dedicated configuration file is absent",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -746,11 +756,13 @@ min_lines = 3
     )?;
     write_config(&workspace, "dupes.toml", "min_nodes = 25\n")?;
     let config = Config::load(workspace.path())?;
-    ensure_eq(
-      &config.min_nodes,
-      &25,
+    ensure_that(
+      config,
       "dedicated configuration replaces the same Cargo metadata setting",
-    )?;
+      |observed| observed.min_nodes == 25,
+    )
+    .map(drop)
+    .map_err(Box::new)?;
     Ok(())
   }
 
@@ -758,12 +770,12 @@ min_lines = 3
   #[test]
   fn load_no_config_files() -> Result<(), ConfigTestFailure> {
     let workspace = TempDir::new()?;
-    let config = Config::load(workspace.path())?;
-    ensure_eq(
-      &config.min_nodes,
-      &10,
+    let config = ensure_that(
+      Config::load(workspace.path())?,
       "absence of both configuration files retains the default AST size",
-    )?;
+      |observed| observed.min_nodes == 10,
+    )
+    .map_err(Box::new)?;
     let paths = [workspace.path().join("Cargo.toml"), workspace.path().join("dupes.toml")];
     ensure(
       config.sources.len() == paths.len()
@@ -773,6 +785,7 @@ min_lines = 3
         }),
       "default configuration retains both native absence observations in precedence order",
     )
+    .map(drop)
     .map_err(|source| ConfigTestFailure::LoadExpectation {
       outcome: Box::new(Ok(config)),
       source,
@@ -825,6 +838,7 @@ min_lines = 3
           }),
       "resolved settings retain both complete file-format models, paths, and source documents in application order",
     )
+    .map(drop)
     .map_err(|source| ConfigTestFailure::LoadExpectation {
       outcome: Box::new(Ok(config)),
       source,
@@ -848,6 +862,7 @@ min_lines = 3
         }),
       "a Cargo document without package settings is observed successfully and supplies no overrides",
     )
+    .map(drop)
     .map_err(|source| ConfigTestFailure::LoadExpectation {
       outcome: Box::new(Ok(config)),
       source,
@@ -883,6 +898,7 @@ min_lines = 3
         })),
       "a higher-precedence decoding failure preserves the native cause, rejected document, and completed Cargo layer",
     )
+    .map(drop)
     .map_err(|source| ConfigTestFailure::LoadExpectation {
       outcome: Box::new(outcome),
       source,
@@ -906,6 +922,7 @@ min_lines = 3
         && config.min_nodes == Config::default().min_nodes && config.sources.is_empty()),
       "invalid Cargo configuration returns its complete decoding failure before applying later layers",
     )
+    .map(drop)
     .map_err(|source| ConfigTestFailure::LoadExpectation {
       outcome: Box::new(outcome),
       source,
@@ -930,6 +947,7 @@ min_lines = 3
       }) if *observed_path == path && source.as_bytes() == bytes && config.sources.is_empty()),
       "invalid configuration text retains its native UTF-8 failure, exact path, and complete bytes",
     )
+    .map(drop)
     .map_err(|source| ConfigTestFailure::LoadExpectation {
       outcome: Box::new(outcome),
       source,
@@ -953,6 +971,7 @@ min_lines = 3
       }) if *observed_path == path && source.kind() != io::ErrorKind::NotFound && config.sources.is_empty()),
       "an occupied configuration path returns its native read failure instead of default settings",
     )
+    .map(drop)
     .map_err(|source| ConfigTestFailure::LoadExpectation {
       outcome: Box::new(outcome),
       source,
@@ -966,7 +985,8 @@ min_lines = 3
     ensure(
       (config.max_exact_duplicates, config.max_near_duplicates) == (Some(0), Some(5)),
       "load exact and near group-count limits independently",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -974,7 +994,7 @@ min_lines = 3
   #[test]
   fn config_with_exclude_tests() -> Result<(), ConfigTestFailure> {
     let config = load_with_dupes_toml("exclude_tests = true\n")?;
-    ensure(config.exclude_tests, "load the explicit test-code exclusion")?;
+    ensure(config.exclude_tests, "load the explicit test-code exclusion").map(drop)?;
     Ok(())
   }
 
@@ -982,8 +1002,9 @@ min_lines = 3
   #[test]
   fn config_with_min_lines() -> Result<(), ConfigTestFailure> {
     let config = load_with_dupes_toml("min_lines = 5\n")?;
-    ensure_eq(&config.min_lines, &5, "load the AST source-span floor")?;
-    Ok(())
+    ensure_that(config, "load the AST source-span floor", |observed| observed.min_lines == 5)
+      .map(drop)
+      .map_err(|source| ConfigTestFailure::LoadedSetting(Box::new(source)))
   }
 
   /// Exact and near percentage limits preserve their configured values.
@@ -996,7 +1017,8 @@ min_lines = 3
         .zip(config.max_near_percent)
         .is_some_and(|(exact, near)| exact.total_cmp(&5.0) == Ordering::Equal && near.total_cmp(&10.5) == Ordering::Equal),
       "preserve both configured percentage limits",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -1007,18 +1029,20 @@ min_lines = 3
     ensure(
       (config.token_min_tokens, config.token_min_lines) == (25, 3),
       "load both token-count and source-span floors",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
   /// Explicit dimension selection replaces the default enabled set.
   #[test]
-  fn enable_only_dimensions_replaces_default_dimensions() -> Result<(), TestFailure> {
+  fn enable_only_dimensions_replaces_default_dimensions() -> Result<(), ConditionFailure> {
     let mut config = Config::default();
     config.enable_only_dimensions([DetectionDimension::Line]);
     ensure(
       config.enabled_dimensions.iter().copied().eq([DetectionDimension::Line]),
       "enabling only line detection replaces every default dimension",
     )
+    .map(drop)
   }
 }

@@ -151,7 +151,7 @@ fn count_matching(first: &NormalizedNode, second: &NormalizedNode) -> usize {
 
 #[cfg(test)]
 mod tests {
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
 
   use super::SimilarityCounts;
@@ -176,7 +176,7 @@ mod tests {
       /// Complete expected failure, including original counts.
       expected: SimilarityFailure,
       /// Failed behavioral expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// A score or its original integer evidence differed from the expected calculation.
     #[error("similarity expectation failed: {source}; observed: {observed:?}; expected: {expected:?}")]
@@ -186,7 +186,7 @@ mod tests {
       /// Expected original counts and rounded score.
       expected: SimilarityScore,
       /// Failed behavioral expectation.
-      source:   TestFailure,
+      source:   ConditionFailure,
     },
     /// Reversing the input trees changed their score or matching population.
     #[error("similarity symmetry failed: {source}; forward: {forward:?}; reverse: {reverse:?}")]
@@ -196,7 +196,7 @@ mod tests {
       /// Complete reverse calculation.
       reverse: Box<Result<SimilarityScore, SimilarityFailure>>,
       /// Failed behavioral expectation.
-      source:  TestFailure,
+      source:  ConditionFailure,
     },
   }
 
@@ -224,6 +224,7 @@ mod tests {
         .is_ok_and(|score| score.counts == expected.counts && score.value.to_bits() == expected.value.to_bits()),
       contract,
     )
+    .map(drop)
     .map_err(|source| SimilarityTestFailure::Score {
       observed: Box::new(observed),
       expected: *expected,
@@ -270,6 +271,7 @@ mod tests {
         observed.as_ref().err() == Some(&expected),
         "failed Dice calculations retain original counts and the exact rejected step",
       )
+      .map(drop)
       .map_err(|source| SimilarityTestFailure::CountFailure {
         observed: Box::new(observed),
         expected,
@@ -463,6 +465,7 @@ mod tests {
           == (reversed.value.to_bits(), reversed.counts.second, reversed.counts.first, reversed.counts.matching)),
       "swapping the compared trees preserves the similarity score",
     )
+    .map(drop)
     .map_err(|source| SimilarityTestFailure::Symmetry {
       forward: Box::new(forward),
       reverse: Box::new(reverse),

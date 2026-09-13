@@ -1301,13 +1301,17 @@ mod tests {
   use std::collections::BTreeSet;
   use std::fmt::Debug;
   use std::path::PathBuf;
+  use std::vec::IntoIter;
 
-  use strict_test_support::TestFailure;
+  use strict_test_support::CheckBatchFailure;
+  use strict_test_support::ConditionFailure;
+  use strict_test_support::PredicateFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_all;
-  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_that;
 
   use super::*;
+  use crate::suppression::SuppressionWarning;
 
   /// A complete match table whose opening arm rows can be cut by a token minimum.
   const MATCH_TABLE: &str = "\
@@ -1373,7 +1377,7 @@ fn normalize_construct(
     "window expectation failed for {path:?}: {source}; document: {document:?}; config: {config:?}; expected: {expected:?}; units: \
      {units:?}"
   )]
-  struct WindowTestFailure<Expected> {
+  struct WindowTestFailure<Expected, Failure = ConditionFailure> {
     /// Source path selecting the lexer profile and window identity.
     path:     PathBuf,
     /// Complete original source text supplied to extraction.
@@ -1385,21 +1389,28 @@ fn normalize_construct(
     /// Complete extracted population across every text dimension.
     units:    TextUnits,
     /// Native assertion failure.
-    source:   TestFailure,
+    source:   Failure,
   }
 
   /// A checked window scenario retaining its complete extraction evidence on failure.
-  type WindowTestResult<Expected> = Result<(), Box<WindowTestFailure<Expected>>>;
+  type WindowTestResult<Expected, Failure = ConditionFailure> = Result<(), Box<WindowTestFailure<Expected, Failure>>>;
+
+  /// A declaration-policy check batch retains its accepted prefix and unattempted checks.
+  type DeclarationChecksFailure = CheckBatchFailure<(bool, &'static str), ConditionFailure, IntoIter<(bool, &'static str)>>;
+
+  /// A declaration-policy comparison retains both configurations, populations, and resolution
+  /// warnings.
+  type DeclarationWindowTestResult = WindowTestResult<(TextUnits, Config, Vec<SuppressionWarning>), DeclarationChecksFailure>;
 
   /// Run an extraction scenario without losing unprojected units or inputs when its assertion
   /// fails.
-  fn check_windows<Expected: Debug>(
+  fn check_windows<Expected: Debug, Failure>(
     source_path: &str,
     document: &str,
     config: Config,
     expected: Expected,
-    check: impl FnOnce(&TextUnits, &Expected) -> Result<(), TestFailure>,
-  ) -> WindowTestResult<Expected> {
+    check: impl FnOnce(&TextUnits, &Expected) -> Result<(), Failure>,
+  ) -> WindowTestResult<Expected, Failure> {
     let path = Path::new(source_path);
     let units = extract(path, document, &config);
     check(&units, &expected).map_err(|source| {
@@ -1435,6 +1446,7 @@ fn normalize_construct(
           && units.lines.iter().all(|unit| unit.suppressed.is_none()),
         "line extraction retains every expected visible span in source order",
       )
+      .map(drop)
     })
   }
 
@@ -1463,7 +1475,7 @@ fn normalize_construct(
     /// Complete tokens returned by the lexer.
     actual:   Vec<Token>,
     /// Native failed expectation.
-    source:   TestFailure,
+    source:   ConditionFailure,
   }
 
   /// Compare complete token sequences while retaining the lexer inputs and outputs.
@@ -1473,6 +1485,7 @@ fn normalize_construct(
       actual == expected,
       "tokenization preserves raw and normalized spellings with their source spans",
     )
+    .map(drop)
     .map_err(|source| {
       Box::new(TokenizationTestFailure {
         document: document.to_owned(),
@@ -1516,7 +1529,7 @@ fn normalize_construct(
   }
 
   #[test]
-  fn rust_character_literal_tails_require_a_bounded_same_line_close() -> Result<(), TestFailure> {
+  fn rust_character_literal_tails_require_a_bounded_same_line_close() -> Result<(), ConditionFailure> {
     for (tail, expected) in [
       ("\u{96ea}'", Some(2)),
       ("\\u{10FFFF}'", Some(11)),
@@ -1531,28 +1544,30 @@ fn normalize_construct(
       ensure(
         char_literal_tail(tail.chars()) == expected,
         "Rust character-literal recognition requires the supported body and a same-line closing tick",
-      )?;
+      )
+      .map(drop)?;
     }
     Ok(())
   }
 
   #[test]
-  fn rust_ticks_lex_char_literals_and_leave_lifetimes_as_punctuation() -> Result<(), TestFailure> {
+  fn rust_ticks_lex_char_literals_and_leave_lifetimes_as_punctuation() -> Result<(), PredicateFailure<Vec<Token>>> {
     let rust = QuoteProfile {
       rust_ticks: true
     };
-    let tokens = tokenize("fn f<'a>(x: &'a str) -> char { 'x' }", rust);
-    let strings: Vec<&str> = tokens
-      .iter()
-      .filter(|token| token.normalized == "STRING")
-      .map(|token| token.raw.as_str())
-      .collect();
-    ensure(strings == vec!["'x'"], "only the character literal forms a quoted token")?;
-    ensure_eq(
-      &tokens.iter().filter(|token| token.raw == "'").count(),
-      &2,
-      "both lifetime ticks remain punctuation",
-    )
+    let mut tokens = tokenize("fn f<'a>(x: &'a str) -> char { 'x' }", rust);
+    tokens = ensure_that(tokens, "only the character literal forms a quoted token", |observed| {
+      observed
+        .iter()
+        .filter(|token| token.normalized == "STRING")
+        .map(|token| token.raw.as_str())
+        .collect::<Vec<_>>()
+        == vec!["'x'"]
+    })?;
+    ensure_that(tokens, "both lifetime ticks remain punctuation", |observed| {
+      observed.iter().filter(|token| token.raw == "'").count() == 2
+    })
+    .map(drop)
   }
 
   #[test]
@@ -1567,27 +1582,25 @@ fn normalize_construct(
   }
 
   #[test]
-  fn comment_apostrophes_do_not_bridge_token_segments() -> Result<(), TestFailure> {
+  fn comment_apostrophes_do_not_bridge_token_segments() -> Result<(), PredicateFailure<Vec<Token>>> {
     // The defect the Rust profile fixes: an unpaired tick (lifetime or
     // prose apostrophe) used to open a phantom multi-line string that
     // bridged blank lines and swallowed all later segments.
     let rust = QuoteProfile {
       rust_ticks: true
     };
-    let tokens = tokenize("// doesn't pair\nlet a = 1;\n\nlet b = 2;\n", rust);
-    ensure(
-      tokens.iter().all(|token| token.line == token.end_line),
-      "a prose apostrophe must not open a multiline token",
-    )?;
-    ensure_eq(
-      &token_segments(&tokens).len(),
-      &2,
-      "the blank line remains a token-segment boundary",
-    )
+    let mut tokens = tokenize("// doesn't pair\nlet a = 1;\n\nlet b = 2;\n", rust);
+    tokens = ensure_that(tokens, "a prose apostrophe must not open a multiline token", |observed| {
+      observed.iter().all(|token| token.line == token.end_line)
+    })?;
+    ensure_that(tokens, "the blank line remains a token-segment boundary", |observed| {
+      token_segments(observed).len() == 2
+    })
+    .map(drop)
   }
 
   #[test]
-  fn lifetime_ticks_do_not_blind_token_windows() -> Result<(), TestFailure> {
+  fn lifetime_ticks_do_not_blind_token_windows() -> Result<(), ConditionFailure> {
     // Three ticks (two lifetimes, one comment apostrophe) precede the
     // duplicated segments; the old naive pairing left one tick unpaired
     // and swallowed everything after it out of token segmentation.
@@ -1616,10 +1629,11 @@ fn beta(items: &[u32]) -> Vec<u32> {
       starts.contains(&6) && starts.contains(&10),
       "windows must cover both segments after the lifetime and prose ticks",
     )
+    .map(drop)
   }
 
   #[test]
-  fn wordish_parts_split_on_non_word_characters() -> Result<(), TestFailure> {
+  fn wordish_parts_split_on_non_word_characters() -> Result<(), ConditionFailure> {
     let parts: Vec<_> = wordish_parts("alpha_one,beta.two(three)")
       .filter(|part| !part.is_empty())
       .collect();
@@ -1627,10 +1641,11 @@ fn beta(items: &[u32]) -> Vec<u32> {
       parts == vec!["alpha_one", "beta", "two", "three"],
       "punctuation splits terms while underscores remain in identifiers",
     )
+    .map(drop)
   }
 
   #[test]
-  fn structured_data_counts_the_final_window_line() -> Result<(), TestFailure> {
+  fn structured_data_counts_the_final_window_line() -> Result<(), ConditionFailure> {
     // The last line of a window participates in per-line aggregation
     // exactly like interior lines.
     let tokens = tokenize("alpha: 1\nbeta: 2", QuoteProfile::default());
@@ -1638,10 +1653,11 @@ fn beta(items: &[u32]) -> Vec<u32> {
       token_window_has_structured_data(&tokens),
       "the final token line contributes a complete structured row",
     )
+    .map(drop)
   }
 
   #[test]
-  fn structured_token_rows_require_content_on_both_sides_of_the_colon() -> Result<(), TestFailure> {
+  fn structured_token_rows_require_content_on_both_sides_of_the_colon() -> Result<(), ConditionFailure> {
     for (source, expected) in [
       ("alpha: 42", true),
       ("alpha: :beta", true),
@@ -1654,13 +1670,14 @@ fn beta(items: &[u32]) -> Vec<u32> {
       ensure(
         line_has_structured_tokens(&tokens) == expected,
         "a separator alone or a missing key or value cannot form a structured row",
-      )?;
+      )
+      .map(drop)?;
     }
     Ok(())
   }
 
   #[test]
-  fn empty_source_and_zero_window_minimums_produce_no_candidates() -> Result<(), TestFailure> {
+  fn empty_source_and_zero_window_minimums_produce_no_candidates() -> Result<(), ConditionFailure> {
     let disabled = Config {
       token_min_tokens: 0,
       line_min_lines: 0,
@@ -1669,15 +1686,17 @@ fn beta(items: &[u32]) -> Vec<u32> {
     ensure(
       extract(Path::new("empty.rs"), "", &Config::default()) == TextUnits::default(),
       "empty source produces no candidates in any text dimension",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       extract(Path::new("disabled.rs"), COMPUTATION_BLOCK, &disabled) == TextUnits::default(),
       "zero window minimums disable extraction without slicing an empty window",
     )
+    .map(drop)
   }
 
   #[test]
-  fn disabled_token_dimensions_produce_no_token_windows() -> Result<(), TestFailure> {
+  fn disabled_token_dimensions_produce_no_token_windows() -> Result<(), ConditionFailure> {
     let config = Config {
       token_min_tokens: 8,
       token_min_lines: 1,
@@ -1689,17 +1708,19 @@ fn beta(items: &[u32]) -> Vec<u32> {
       units.normalized_tokens.is_empty() && units.raw_tokens.is_empty(),
       "disabled token dimensions emit no candidates",
     )
+    .map(drop)
   }
 
   /// Require actual candidates and the expected rule on every retained unit.
   #[track_caller]
-  fn ensure_all_tagged(units: &[CodeUnit], rule: RuleId) -> Result<(), TestFailure> {
-    ensure(!units.is_empty(), "windows must exist to carry the tag")?;
+  fn ensure_all_tagged(units: &[CodeUnit], rule: RuleId) -> Result<(), ConditionFailure> {
+    ensure(!units.is_empty(), "windows must exist to carry the tag").map(drop)?;
     for unit in units {
       ensure(
         unit.suppressed == Some(rule),
         "every retained window carries the expected suppression rule",
-      )?;
+      )
+      .map(drop)?;
     }
     Ok(())
   }
@@ -1746,6 +1767,7 @@ fn beta(items: &[u32]) -> Vec<u32> {
               if normalized.suppressed == Some(RuleId::TokenLowSignal)),
           "raw vocabulary below the distinct-value floor remains suppressed while normalized identifier-only windows stay low-signal",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -1753,18 +1775,26 @@ fn beta(items: &[u32]) -> Vec<u32> {
 
   /// Extract both token dimensions over the complete supplied declaration or body.
   fn declaration_window_units(source: &str, suppression: SuppressionPolicy) -> TextUnits {
-    let config = Config {
+    extract(
+      Path::new("declarations.rs"),
+      source,
+      &declaration_window_config(source, suppression),
+    )
+  }
+
+  /// Configure both token dimensions over one complete declaration with the selected rule policy.
+  fn declaration_window_config(source: &str, suppression: SuppressionPolicy) -> Config {
+    Config {
       token_min_tokens: 1,
       token_min_lines: source.lines().count(),
       enabled_dimensions: BTreeSet::from([DetectionDimension::TokenNormalized, DetectionDimension::TokenRaw]),
       suppression,
       ..Config::default()
-    };
-    extract(Path::new("declarations.rs"), source, &config)
+    }
   }
 
   #[test]
-  fn declaration_windows_recognize_visibility_and_ignore_comment_behavior_words() -> Result<(), TestFailure> {
+  fn declaration_windows_recognize_visibility_and_ignore_comment_behavior_words() -> Result<(), ConditionFailure> {
     for visibility in ["", "pub ", "pub(crate) ", "pub(super) ", "pub(in crate::owner) "] {
       let source = format!(
         "/// Values for callers; fn, if, let, and return describe their use.\n#[derive(Debug)]\npub struct State {{\n/// First value for \
@@ -1775,64 +1805,78 @@ fn beta(items: &[u32]) -> Vec<u32> {
       ensure(
         (units.normalized_tokens.len(), units.raw_tokens.len()) == (1, 1),
         "classification must retain the complete candidate in both token dimensions",
-      )?;
+      )
+      .map(drop)?;
       for unit in units.normalized_tokens.iter().chain(&units.raw_tokens) {
         ensure(
           unit.suppressed == Some(RuleId::TokenDeclarationScaffold),
           "field visibility and documentation must not turn declaration scaffolding into executable behavior",
-        )?;
+        )
+        .map(drop)?;
       }
     }
     Ok(())
   }
 
   #[test]
-  fn declaration_suppression_preserves_tokens_fingerprints_and_source_identity() -> Result<(), TestFailure> {
+  fn declaration_suppression_preserves_tokens_fingerprints_and_source_identity() -> DeclarationWindowTestResult {
     let source = "/// State for callers.\npub struct State {\n    pub first: u8,\n    pub(crate) second: u16,\n}";
     let (disabled, warnings) = SuppressionPolicy::resolve(&["token.declaration-scaffold".to_owned()], &[]);
-    ensure(warnings.is_empty(), "the declaration rule must resolve without warnings")?;
-    let tagged = declaration_window_units(source, SuppressionPolicy::default());
-    let visible = declaration_window_units(source, disabled);
-    ensure(
-      (
-        tagged.normalized_tokens.len(),
-        tagged.raw_tokens.len(),
-        visible.normalized_tokens.len(),
-        visible.raw_tokens.len(),
-      ) == (1, 1, 1, 1),
-      "both policies must retain one candidate per token dimension",
-    )?;
-    for (suppressed, unsuppressed) in tagged
-      .normalized_tokens
-      .iter()
-      .chain(&tagged.raw_tokens)
-      .zip(visible.normalized_tokens.iter().chain(&visible.raw_tokens))
-    {
-      ensure_all(&[
-        (
-          suppressed.suppressed == Some(RuleId::TokenDeclarationScaffold) && unsuppressed.suppressed.is_none(),
-          "the rule toggle must change presentation classification",
-        ),
-        (
-          (suppressed.fingerprint, suppressed.node_count, window_values(suppressed))
-            == (unsuppressed.fingerprint, unsuppressed.node_count, window_values(unsuppressed)),
-          "classification must preserve all window tokens and their content identity",
-        ),
-        (
+    let disabled_config = declaration_window_config(source, disabled);
+    let visible = extract(Path::new("declarations.rs"), source, &disabled_config);
+    check_windows(
+      "declarations.rs",
+      source,
+      declaration_window_config(source, SuppressionPolicy::default()),
+      (visible, disabled_config, warnings),
+      |tagged, expected| {
+        let visible_units = &expected.0;
+        let resolution_warnings = &expected.2;
+        let mut checks = vec![
+          (resolution_warnings.is_empty(), "the declaration rule must resolve without warnings"),
           (
-            &suppressed.file, &suppressed.name, &suppressed.kind, suppressed.line_start, suppressed.line_end,
-          ) == (
-            &unsuppressed.file, &unsuppressed.name, &unsuppressed.kind, unsuppressed.line_start, unsuppressed.line_end,
+            (
+              tagged.normalized_tokens.len(),
+              tagged.raw_tokens.len(),
+              visible_units.normalized_tokens.len(),
+              visible_units.raw_tokens.len(),
+            ) == (1, 1, 1, 1),
+            "both policies must retain one candidate per token dimension",
           ),
-          "classification must preserve the complete window location and identity",
-        ),
-      ])?;
-    }
-    Ok(())
+        ];
+        for (suppressed, unsuppressed) in tagged
+          .normalized_tokens
+          .iter()
+          .chain(&tagged.raw_tokens)
+          .zip(visible_units.normalized_tokens.iter().chain(&visible_units.raw_tokens))
+        {
+          checks.extend([
+            (
+              suppressed.suppressed == Some(RuleId::TokenDeclarationScaffold) && unsuppressed.suppressed.is_none(),
+              "the rule toggle must change presentation classification",
+            ),
+            (
+              (suppressed.fingerprint, suppressed.node_count, window_values(suppressed))
+                == (unsuppressed.fingerprint, unsuppressed.node_count, window_values(unsuppressed)),
+              "classification must preserve all window tokens and their content identity",
+            ),
+            (
+              (
+                &suppressed.file, &suppressed.name, &suppressed.kind, suppressed.line_start, suppressed.line_end,
+              ) == (
+                &unsuppressed.file, &unsuppressed.name, &unsuppressed.kind, unsuppressed.line_start, unsuppressed.line_end,
+              ),
+              "classification must preserve the complete window location and identity",
+            ),
+          ]);
+        }
+        ensure_all(checks).map(drop)
+      },
+    )
   }
 
   #[test]
-  fn declaration_windows_keep_executable_counterexamples_visible() -> Result<(), TestFailure> {
+  fn declaration_windows_keep_executable_counterexamples_visible() -> Result<(), ConditionFailure> {
     for source in [
       "pub struct State {\n    pub first: u8,\n    pub second: u16,\n}\nimpl State {\n    fn total(&self) -> u16 {\n        \
        u16::from(self.first) + self.second\n    }\n}",
@@ -1845,12 +1889,14 @@ fn beta(items: &[u32]) -> Vec<u32> {
       ensure(
         (units.normalized_tokens.len(), units.raw_tokens.len()) == (1, 1),
         "counterexample windows must exist in both dimensions",
-      )?;
+      )
+      .map(drop)?;
       for unit in units.normalized_tokens.iter().chain(&units.raw_tokens) {
         ensure(
           unit.suppressed.is_none(),
           "runtime code, computed fields, comment-only type headers, and incomplete visibility must remain reportable",
-        )?;
+        )
+        .map(drop)?;
       }
     }
     Ok(())
@@ -1911,13 +1957,14 @@ fn collect_names(items: &[Item]) -> Vec<String> {
           !units.normalized_tokens.is_empty() && units.normalized_tokens.iter().all(|unit| unit.suppressed == expected),
           label,
         )
+        .map(drop)
       })?;
     }
     Ok(())
   }
 
   #[test]
-  fn line_windows_split_declaration_and_impl_signatures() -> Result<(), TestFailure> {
+  fn line_windows_split_declaration_and_impl_signatures() -> Result<(), ConditionFailure> {
     // Rust forces implementors to restate trait signatures, so only the
     // declaration side (terminated by `;`) loses its window; the
     // implementation side (a `{` body follows) keeps deliberate parity
@@ -1954,7 +2001,8 @@ fn parse_file(
         .iter()
         .any(|unit| unit.line_start == 2 && unit.suppressed == Some(RuleId::LineDeclarationSignaturePrefix)),
       "the declaration's `fn` row window must exist and carry the prefix tag",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       implementation_units
         .lines
@@ -1962,6 +2010,7 @@ fn parse_file(
         .any(|unit| unit.line_start == 1 && unit.suppressed.is_none()),
       "implementation signature rows keep their window visible",
     )
+    .map(drop)
   }
 
   #[test]
@@ -1999,13 +2048,14 @@ fn parse_file(
           !units.normalized_tokens.is_empty() && units.normalized_tokens.iter().all(|unit| unit.suppressed == expected),
           "complete code stanzas keep their candidate windows visible",
         )
+        .map(drop)
       })?;
     }
     Ok(())
   }
 
   #[test]
-  fn normalized_tokens_ignore_identifier_names() -> Result<(), TestFailure> {
+  fn normalized_tokens_ignore_identifier_names() -> Result<(), ConditionFailure> {
     let first = tokenize("fn alpha(x: i32) { let beta = x + 1; }", QuoteProfile::default());
     let second = tokenize("fn gamma(y: i32) { let delta = y + 1; }", QuoteProfile::default());
     let first_norm: Vec<_> = first.iter().map(|token| token.normalized.as_str()).collect();
@@ -2014,6 +2064,7 @@ fn parse_file(
       first_norm == second_norm,
       "identifier renaming preserves the normalized token stream",
     )
+    .map(drop)
   }
 
   #[test]
@@ -2053,13 +2104,14 @@ let scaled = shifted * factor;
               .eq(expected.iter().copied()),
           "token windows retain their source spans without crossing blank segments or admitting an insufficient line span",
         )
+        .map(drop)
       })?;
     }
     Ok(())
   }
 
   #[test]
-  fn line_windows_normalize_whitespace() -> Result<(), TestFailure> {
+  fn line_windows_normalize_whitespace() -> Result<(), ConditionFailure> {
     let config = Config {
       line_min_lines: 2,
       ..Config::default()
@@ -2083,6 +2135,7 @@ let scaled = shifted * factor;
         )],
       "line windows preserve source spans and normalize the complete line contents",
     )
+    .map(drop)
   }
 
   #[test]
@@ -2151,7 +2204,7 @@ struct Settings {
     /// Complete result returned by coalescing.
     actual:   LineSegments,
     /// Native assertion failure.
-    source:   TestFailure,
+    source:   ConditionFailure,
   }
 
   /// Compare coalescing results without dropping the source segments or rejected result.
@@ -2161,6 +2214,7 @@ struct Settings {
       actual == expected,
       "coalescing preserves every source row and only joins the expected declaration segments",
     )
+    .map(drop)
     .map_err(|source| {
       Box::new(StanzaCoalescingFailure {
         segments,
@@ -2172,7 +2226,7 @@ struct Settings {
   }
 
   #[test]
-  fn stanza_segment_accepts_attribute_prelude_before_header() -> Result<(), TestFailure> {
+  fn stanza_segment_accepts_attribute_prelude_before_header() -> Result<(), ConditionFailure> {
     // The real clap/derive shape: doc and derive rows sit above the type
     // header.
     let segment = numbered_lines(1, &[
@@ -2182,29 +2236,32 @@ struct Settings {
       segment_is_declaration_stanza(&segment),
       "attributes and documentation can precede a declaration header",
     )
+    .map(drop)
   }
 
   #[test]
-  fn stanza_segment_accepts_trailing_close_brace_row() -> Result<(), TestFailure> {
+  fn stanza_segment_accepts_trailing_close_brace_row() -> Result<(), ConditionFailure> {
     // The final stanza of a declaration block carries the block's `}`.
     let segment = numbered_lines(10, &["/// Final option.", "#[arg(long)]", "pub omega: bool,", "}"]);
     ensure(
       segment_is_declaration_stanza(&segment),
       "a final declaration stanza can include its closing brace",
     )
+    .map(drop)
   }
 
   #[test]
-  fn stanza_segment_rejects_lone_close_brace() -> Result<(), TestFailure> {
+  fn stanza_segment_rejects_lone_close_brace() -> Result<(), ConditionFailure> {
     let segment = numbered_lines(20, &["}"]);
     ensure(
       !segment_is_declaration_stanza(&segment),
       "a closing brace alone is not a declaration stanza",
     )
+    .map(drop)
   }
 
   #[test]
-  fn stanza_segment_rejects_comment_banner_without_rows() -> Result<(), TestFailure> {
+  fn stanza_segment_rejects_comment_banner_without_rows() -> Result<(), ConditionFailure> {
     let segment = numbered_lines(1, &[
       "// ------------------------------------",
       "// Configuration",
@@ -2214,15 +2271,17 @@ struct Settings {
       !segment_is_declaration_stanza(&segment),
       "a comment banner needs declaration rows to form a stanza",
     )
+    .map(drop)
   }
 
   #[test]
-  fn stanza_segment_rejects_import_rows() -> Result<(), TestFailure> {
+  fn stanza_segment_rejects_import_rows() -> Result<(), ConditionFailure> {
     let segment = numbered_lines(1, &["use std::collections::BTreeMap;", "use std::path::PathBuf;"]);
     ensure(
       !segment_is_declaration_stanza(&segment),
       "import rows remain outside declaration stanzas",
     )
+    .map(drop)
   }
 
   #[test]
@@ -2260,7 +2319,7 @@ struct Settings {
   }
 
   #[test]
-  fn builder_steps_require_balanced_arguments_and_a_complete_terminator() -> Result<(), TestFailure> {
+  fn builder_steps_require_balanced_arguments_and_a_complete_terminator() -> Result<(), ConditionFailure> {
     for (line, expected) in [
       (".compute(outer(inner()));", true),
       ("  .arg(\"\u{96ea}\"),  ", true),
@@ -2275,13 +2334,14 @@ struct Settings {
       ensure(
         line_is_builder_step(line) == expected,
         "builder-step admission requires one complete balanced call with only a supported terminator",
-      )?;
+      )
+      .map(drop)?;
     }
     Ok(())
   }
 
   #[test]
-  fn stanza_window_rejects_brace_only_lines() -> Result<(), TestFailure> {
+  fn stanza_window_rejects_brace_only_lines() -> Result<(), ConditionFailure> {
     // Block punctuation inside a window is not a declaration row, so the
     // window must not be admitted as a stanza.
     let window = numbered_lines(1, &["pub alpha: usize,", "pub beta: usize,", "}"]);
@@ -2289,6 +2349,7 @@ struct Settings {
       !line_window_is_declaration_stanza(&window),
       "a brace inside the window prevents declaration-stanza admission",
     )
+    .map(drop)
   }
 
   #[test]
@@ -2306,7 +2367,7 @@ charlie records the result for callers
   }
 
   #[test]
-  fn line_windows_do_not_end_on_block_opening_lines() -> Result<(), TestFailure> {
+  fn line_windows_do_not_end_on_block_opening_lines() -> Result<(), ConditionFailure> {
     let config = Config {
       line_min_lines: 3,
       ..Config::default()
@@ -2325,15 +2386,17 @@ return shifted * scale;
     ensure(
       units.lines.iter().all(|unit| unit.line_end != 3 && unit.line_start != 6),
       "no window may end on the opener line or start on the closer line",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       units.lines.iter().any(|unit| (unit.line_start, unit.line_end) == (3, 5)),
       "the signature plus its own body is still a valid window",
     )
+    .map(drop)
   }
 
   #[test]
-  fn token_windows_are_stable_across_unrelated_line_shifts() -> Result<(), TestFailure> {
+  fn token_windows_are_stable_across_unrelated_line_shifts() -> Result<(), ConditionFailure> {
     let config = Config {
       token_min_tokens: 12,
       token_min_lines: 3,
@@ -2345,7 +2408,8 @@ return shifted * scale;
     ensure(
       !original.normalized_tokens.is_empty(),
       "the original concept must produce a token window",
-    )?;
+    )
+    .map(drop)?;
     ensure(
       original.normalized_tokens.iter().all(|first| {
         moved.normalized_tokens.iter().any(|second| {
@@ -2358,6 +2422,7 @@ return shifted * scale;
       }),
       "every moved concept window retains its complete token body and identity while its source span shifts",
     )
+    .map(drop)
   }
 
   #[test]
@@ -2417,6 +2482,7 @@ command()
             .all(|dimension| !dimension.is_empty() && dimension.iter().all(|unit| unit.suppressed == expected)),
           "executable and structured token windows remain visible in both dimensions",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -2503,7 +2569,7 @@ region: us-east
   }
 
   #[test]
-  fn comment_marker_lines_do_not_blind_line_windows() -> Result<(), TestFailure> {
+  fn comment_marker_lines_do_not_blind_line_windows() -> Result<(), ConditionFailure> {
     let config = Config {
       line_min_lines: 3,
       ..Config::default()
@@ -2527,13 +2593,14 @@ let clamped = widened / four;
       ensure(
         units.lines.iter().any(|unit| unit.line_end == 4),
         "line windows after a quoted or prose comment marker must still exist",
-      )?;
+      )
+      .map(drop)?;
     }
     Ok(())
   }
 
   #[test]
-  fn strip_block_comments_tracks_comment_state_across_lines() -> Result<(), TestFailure> {
+  fn strip_block_comments_tracks_comment_state_across_lines() -> Result<(), ConditionFailure> {
     let mut in_comment = false;
     let sequence = [
       ("alpha /* gone */ beta", "alpha  beta", false),
@@ -2546,13 +2613,14 @@ let clamped = widened / four;
       ensure(
         (output.as_str(), in_comment) == (expected, state_after),
         "comment stripping preserves the visible text and tracks its continuation state",
-      )?;
+      )
+      .map(drop)?;
     }
     Ok(())
   }
 
   #[test]
-  fn strip_block_comments_keeps_quoted_and_prose_markers() -> Result<(), TestFailure> {
+  fn strip_block_comments_keeps_quoted_and_prose_markers() -> Result<(), ConditionFailure> {
     for (line, expected) in [
       ("rest.find(\"/*\")", "rest.find(\"/*\")"),
       ("let quote = '\"'; /* gone */", "let quote = '\"'; "),
@@ -2565,7 +2633,8 @@ let clamped = widened / four;
       ensure(
         (output.as_str(), in_comment) == (expected, false),
         "quoted and prose markers stay literal while actual block comments close",
-      )?;
+      )
+      .map(drop)?;
     }
     Ok(())
   }

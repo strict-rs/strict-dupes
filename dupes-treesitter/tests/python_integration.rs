@@ -20,8 +20,11 @@ mod tests {
   use dupes_treesitter::mapping::NodeMapping;
   use dupes_treesitter::normalizer::NormalizationError;
   use dupes_treesitter::normalizer::normalize_ts_node;
-  use strict_test_support::TestFailure;
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
+  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_ne;
 
   /// Capture complete function definitions and their signature and body parts.
   const FUNCTION_QUERY: &str = "
@@ -60,15 +63,11 @@ mod tests {
       tree: tree_sitter::Tree,
     },
     /// Normalization did not satisfy the expected relation.
-    #[error("{source}; left normalized tree: {left:?}; right: {right:?}")]
-    Normalized {
-      /// Complete normalized result on the left of the comparison.
-      left:   Box<NormalizedNode>,
-      /// Complete normalized result on the right of the comparison.
-      right:  Box<NormalizedNode>,
-      /// Failed semantic expectation.
-      source: TestFailure,
-    },
+    #[error(transparent)]
+    Normalized(#[from] Box<ComparisonFailure<NormalizedNode, NormalizedNode>>),
+    /// A normalized tree or its complete node count differed from the expectation.
+    #[error(transparent)]
+    Counted(#[from] Box<ComparisonFailure<CountedNode, CountedNode>>),
     /// Code-unit extraction did not satisfy its semantic contract.
     #[error("{source}; input: {input:?}; extracted units: {units:?}")]
     Units {
@@ -77,7 +76,7 @@ mod tests {
       /// Complete units returned by extraction.
       units:  Vec<CodeUnit>,
       /// Failed semantic expectation.
-      source: TestFailure,
+      source: ConditionFailure,
     },
     /// A threshold pair failed to admit and then reject the same definition.
     #[error("{source}; input: {input:?}; configurations: {configs:?}; extraction outcomes: {outcomes:?}")]
@@ -89,7 +88,7 @@ mod tests {
       /// Both complete extraction outcomes, including native failures.
       outcomes: Box<[ExtractionResult; 2]>,
       /// Failed semantic expectation.
-      source:   Box<TestFailure>,
+      source:   Box<ConditionFailure>,
     },
     /// Malformed syntax lost its native or normalized error signal.
     #[error("{source}; native tree: {tree:?}; normalized tree: {normalized:?}")]
@@ -99,12 +98,15 @@ mod tests {
       /// Complete normalized representation of that tree.
       normalized: Box<NormalizedNode>,
       /// Failed semantic expectation.
-      source:     TestFailure,
+      source:     ConditionFailure,
     },
   }
 
   /// Complete query-extraction result, retaining native setup and extraction failures.
   type ExtractionResult = Result<Vec<CodeUnit>, BridgeTestFailure>;
+
+  /// A complete normalized tree paired with its measured node population.
+  type CountedNode = (NormalizedNode, usize);
 
   /// Build a minimal Python `NodeMapping` for testing the tree-sitter normalization layer.
   ///
@@ -240,19 +242,8 @@ mod tests {
       .map_err(BridgeTestFailure::from)
   }
 
-  /// Compare complete normalized trees while retaining both on failure.
-  fn check_normalized_equal(left: NormalizedNode, right: NormalizedNode) -> Result<(), BridgeTestFailure> {
-    ensure(left == right, "normalized trees preserve the expected kinds and ordered children").map_err(|source| {
-      BridgeTestFailure::Normalized {
-        left: Box::new(left),
-        right: Box::new(right),
-        source,
-      }
-    })
-  }
-
   /// Check extraction while retaining every returned unit on assertion failure.
-  fn check_units(input: &str, check: impl FnOnce(&[CodeUnit]) -> Result<(), TestFailure>) -> Result<(), BridgeTestFailure> {
+  fn check_units(input: &str, check: impl FnOnce(&[CodeUnit]) -> Result<(), ConditionFailure>) -> Result<(), BridgeTestFailure> {
     let units = extract_functions(input, config(1, 1))?;
     check(&units).map_err(|source| BridgeTestFailure::Units {
       input: input.to_owned(),
@@ -269,13 +260,17 @@ mod tests {
   /// Assignment preserves its binding before its literal value.
   #[test]
   fn identifier_normalization() -> Result<(), BridgeTestFailure> {
-    check_normalized_equal(
+    ensure_eq(
       normalize_python_source("x = 1\n")?,
       NormalizedNode::with_children(NodeKind::Assign, vec![
         variable(0),
         NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)),
       ]),
+      "assignment preserves its binding before its complete literal value",
     )
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(BridgeTestFailure::from)
   }
 
   /// Renaming identifiers preserves the complete normalized body.
@@ -284,7 +279,14 @@ mod tests {
     let source_a = "def foo(a, b):\n    return a + b\n";
     let source_b = "def bar(x, y):\n    return x + y\n";
 
-    check_normalized_equal(normalize_python_body(source_a)?, normalize_python_body(source_b)?)
+    ensure_eq(
+      normalize_python_body(source_a)?,
+      normalize_python_body(source_b)?,
+      "renaming identifiers preserves the complete normalized body",
+    )
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(BridgeTestFailure::from)
   }
 
   /// Changing the arithmetic operation changes the normalized body.
@@ -295,21 +297,23 @@ mod tests {
 
     let left = normalize_python_body(source_add)?;
     let right = normalize_python_body(source_mul)?;
-    ensure(left != right, "different operators produce different normalized trees").map_err(|source| BridgeTestFailure::Normalized {
-      left: Box::new(left),
-      right: Box::new(right),
-      source,
-    })
+    ensure_ne(left, right, "different operators produce different normalized trees")
+      .map(drop)
+      .map_err(Box::new)
+      .map_err(BridgeTestFailure::from)
   }
 
   /// Literal normalization preserves kind while discarding value for comparison.
   #[test]
   fn literal_kind_preserved_value_erased() -> Result<(), BridgeTestFailure> {
     for source in ["42\n", "99\n"] {
-      check_normalized_equal(
+      ensure_eq(
         normalize_python_source(source)?,
         NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)),
-      )?;
+        "literal values share the complete normalized node for their kind",
+      )
+      .map(drop)
+      .map_err(Box::new)?;
     }
     Ok(())
   }
@@ -317,10 +321,14 @@ mod tests {
   /// Addition retains both operands in source order.
   #[test]
   fn binary_operator_detection() -> Result<(), BridgeTestFailure> {
-    check_normalized_equal(
+    ensure_eq(
       normalize_python_source("a + b\n")?,
       NormalizedNode::with_children(NodeKind::BinaryOp(BinOpKind::Add), vec![variable(0), variable(1)]),
+      "addition retains both complete operands in source order",
     )
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(BridgeTestFailure::from)
   }
 
   /// A conditional retains its condition and both branch bodies.
@@ -330,10 +338,14 @@ mod tests {
       variable(1),
       NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)),
     ])]);
-    check_normalized_equal(
+    ensure_eq(
       normalize_python_source("if x:\n    y = 1\nelse:\n    y = 2\n")?,
       NormalizedNode::with_children(NodeKind::If, vec![variable(0), branch.clone(), branch]),
+      "a conditional retains its condition and both complete branch bodies",
     )
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(BridgeTestFailure::from)
   }
 
   /// Query captures preserve function order, names, source paths, and definition spans.
@@ -361,6 +373,7 @@ def subtract(a, b):
           ],
         "extraction retains each definition's identity and one-based source span",
       )
+      .map(drop)
     })
   }
 
@@ -377,6 +390,7 @@ def subtract(a, b):
         matches!(&outcomes, [Ok(admitted), Ok(rejected)] if admitted.len() == 1 && rejected.is_empty()),
         "both extraction attempts succeed and only the lower floor admits the definition",
       )
+      .map(drop)
       .map_err(|source| BridgeTestFailure::Thresholds {
         input: input.to_owned(),
         configs,
@@ -419,6 +433,7 @@ def mul(a, b):
           matches!(units, [first, second] if (first.fingerprint == second.fingerprint) == expected_equal),
           "both complete captures retain their required fingerprint relation",
         )
+        .map(drop)
       })?;
     }
     Ok(())
@@ -440,6 +455,7 @@ def mul(a, b):
       root.has_error() && contains_kind(&normalized, &NodeKind::Opaque),
       "malformed source retains native parse errors and an opaque normalized subtree",
     )
+    .map(drop)
     .map_err(|failure| BridgeTestFailure::Malformed {
       tree,
       normalized: Box::new(normalized),
@@ -450,13 +466,17 @@ def mul(a, b):
   /// A nested call remains an argument with its own callee and argument.
   #[test]
   fn nested_calls() -> Result<(), BridgeTestFailure> {
-    check_normalized_equal(
+    ensure_eq(
       normalize_python_source("f(g(x))\n")?,
       NormalizedNode::with_children(NodeKind::Call, vec![
         variable(0),
         NormalizedNode::with_children(NodeKind::Call, vec![variable(1), variable(2)]),
       ]),
+      "a nested call retains its own callee and argument",
     )
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(BridgeTestFailure::from)
   }
 
   /// A no-op body retains its block and opaque statement as countable syntax.
@@ -465,21 +485,21 @@ def mul(a, b):
     let source = "def nothing():\n    pass\n";
     let body = normalize_python_body(source)?;
     let expected = NormalizedNode::with_children(NodeKind::Block, vec![NormalizedNode::leaf(NodeKind::Opaque)]);
-    ensure(
-      body == expected && count_nodes(&body) == 2,
+    let actual_count = count_nodes(&body);
+    ensure_eq(
+      (body, actual_count),
+      (expected, 2),
       "a no-op body retains its complete two-node normalized tree",
     )
-    .map_err(|failure| BridgeTestFailure::Normalized {
-      left:   Box::new(body),
-      right:  Box::new(expected),
-      source: failure,
-    })
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(BridgeTestFailure::from)
   }
 
   /// A while condition precedes its body and shares the identifier context with it.
   #[test]
   fn while_loop_normalization() -> Result<(), BridgeTestFailure> {
-    check_normalized_equal(
+    ensure_eq(
       normalize_python_source("while x:\n    y = 1\n")?,
       NormalizedNode::with_children(NodeKind::While, vec![
         variable(0),
@@ -488,13 +508,17 @@ def mul(a, b):
           NormalizedNode::leaf(NodeKind::Literal(LiteralKind::Int)),
         ])]),
       ]),
+      "a while condition precedes its body and shares its identifier context",
     )
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(BridgeTestFailure::from)
   }
 
   /// For-loop bindings, iterables, and nested calls retain their shared identities.
   #[test]
   fn for_loop_normalization() -> Result<(), BridgeTestFailure> {
-    check_normalized_equal(
+    ensure_eq(
       normalize_python_source("for x in items:\n    print(x)\n")?,
       NormalizedNode::with_children(NodeKind::ForLoop, vec![
         variable(0),
@@ -504,19 +528,27 @@ def mul(a, b):
           variable(0),
         ])]),
       ]),
+      "for-loop bindings, iterables, and nested calls retain their shared identities",
     )
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(BridgeTestFailure::from)
   }
 
   /// Direct kind mappings preserve a break statement inside the loop body.
   #[test]
   fn node_kinds_mapping_produces_correct_kind() -> Result<(), BridgeTestFailure> {
-    check_normalized_equal(
+    ensure_eq(
       normalize_python_source("for x in items:\n    break\n")?,
       NormalizedNode::with_children(NodeKind::ForLoop, vec![
         variable(0),
         variable(1),
         NormalizedNode::with_children(NodeKind::Block, vec![NormalizedNode::leaf(NodeKind::Break)]),
       ]),
+      "direct kind mappings preserve the complete break statement inside its loop",
     )
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(BridgeTestFailure::from)
   }
 }

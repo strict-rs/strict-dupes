@@ -104,7 +104,7 @@ pub(super) fn function_span(path: &Path, name: &str) -> Result<Span, FunctionFai
 
 #[cfg(test)]
 mod tests {
-  use strict_test_support::TestFailure;
+  use strict_test_support::ConditionFailure;
   use strict_test_support::ensure;
 
   use super::FunctionFailure;
@@ -118,7 +118,7 @@ mod tests {
     Function(#[from] FunctionFailure),
     /// The observed span violated the expected source boundary.
     #[error(transparent)]
-    Expectation(#[from] TestFailure),
+    Expectation(#[from] ConditionFailure),
   }
 
   #[test]
@@ -128,7 +128,8 @@ mod tests {
     ensure(
       (span.start().line, span.end().line) == (3, 7),
       "comments and literals must not alter the function span",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
@@ -140,12 +141,13 @@ mod tests {
     ensure(
       (declared.start().line, implemented.start().line) == (1, 2),
       "trait and impl functions must retain their declaration locations",
-    )?;
+    )
+    .map(drop)?;
     Ok(())
   }
 
   #[test]
-  fn rejects_absent_and_ambiguous_definitions_with_all_candidates() -> Result<(), TestFailure> {
+  fn rejects_absent_and_ambiguous_definitions_with_all_candidates() -> Result<(), ConditionFailure> {
     for (source, expected) in [
       ("fn different() {}", 0),
       ("mod a { fn selected() {} } mod b { fn selected() {} }", 2),
@@ -154,18 +156,20 @@ mod tests {
         matches!(parse_span(source, "selected"), Err(FunctionFailure::Selection { name, candidates, syntax })
         if name == "selected" && candidates.len() == expected && !syntax.items.is_empty()),
         "selection failure must retain every matching definition and the parsed source",
-      )?;
+      )
+      .map(drop)?;
     }
     Ok(())
   }
 
   #[test]
-  fn retains_invalid_source_and_native_parse_diagnostic() -> Result<(), TestFailure> {
+  fn retains_invalid_source_and_native_parse_diagnostic() -> Result<(), ConditionFailure> {
     let source = "fn selected(";
     ensure(
       matches!(parse_span(source, "selected"), Err(FunctionFailure::Parse { input, source: diagnostic })
       if input == source && diagnostic.span().start().line == 1),
       "invalid source must remain available with its parser diagnostic",
     )
+    .map(drop)
   }
 }
