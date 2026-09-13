@@ -531,19 +531,22 @@ mod tests {
       /// Assertion explaining the violated contract.
       source:  ConditionFailure,
     },
-    /// The loaded policy violated its expected behavior.
-    #[error(transparent)]
-    Expectation(#[from] ConditionFailure),
     /// A loaded setting violated its contract, retaining the complete configuration.
     #[error(transparent)]
     LoadedSetting(#[from] Box<PredicateFailure<Config>>),
   }
 
-  /// Load a dedicated configuration file through the production file loader.
-  fn load_with_dupes_toml(contents: &str) -> Result<Config, ConfigTestFailure> {
-    let workspace = TempDir::new()?;
-    write_config(&workspace, "dupes.toml", contents)?;
-    Ok(Config::load(workspace.path())?)
+  /// Load a dedicated file and retain its complete configuration if the requested check fails.
+  fn check_dedicated_config(contents: &str, context: &'static str, accepts: impl FnOnce(&Config) -> bool) -> Result<(), ConfigTestFailure> {
+    let config = {
+      let workspace = TempDir::new()?;
+      write_config(&workspace, "dupes.toml", contents)?;
+      Config::load(workspace.path())?
+    };
+    ensure_that(config, context, accepts)
+      .map(drop)
+      .map_err(Box::new)
+      .map_err(ConfigTestFailure::from)
   }
 
   /// Materialize one configuration layer at the filename used by the loader.
@@ -649,77 +652,81 @@ min_lines = 3
             "#,
     )?;
     let config = Config::load(workspace.path())?;
-    ensure(
-      [
-        config.suppression.is_enabled(RuleId::LineChainTail),
-        config.suppression.is_enabled(RuleId::TokenLowSignal),
-        config.suppression.is_enabled(RuleId::SubValuePlumbing),
-      ] == [true, false, false],
+    let checked_config = ensure_that(
+      config,
       "dedicated-file rule overrides win while retaining unrelated Cargo rule settings",
+      |observed| {
+        [
+          observed.suppression.is_enabled(RuleId::LineChainTail),
+          observed.suppression.is_enabled(RuleId::TokenLowSignal),
+          observed.suppression.is_enabled(RuleId::SubValuePlumbing),
+        ] == [true, false, false]
+      },
     )
-    .map(drop)?;
-    ensure(config.load_warnings.is_empty(), "recognized rule overrides produce no warnings").map(drop)?;
-    Ok(())
+    .map_err(Box::new)?;
+    ensure_that(checked_config, "recognized rule overrides produce no warnings", |observed| {
+      observed.load_warnings.is_empty()
+    })
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(ConfigTestFailure::from)
   }
 
   /// Unknown rules remain nonfatal while retaining the complete rejected request.
   #[test]
   fn unknown_suppress_rule_ids_warn_without_failing() -> Result<(), ConfigTestFailure> {
-    let config = load_with_dupes_toml(
+    check_dedicated_config(
       r#"
             [suppress]
             disable = ["no.such-rule"]
             enable = ["no.such-rule"]
             "#,
-    )?;
-    ensure(
-      config.load_warnings
-        == [
-          SuppressionWarning::UnknownDisabledRule {
-            id: "no.such-rule".to_owned(),
-          },
-          SuppressionWarning::UnknownEnabledRule {
-            id: "no.such-rule".to_owned(),
-          },
-        ],
       "retain both unknown suppression requests without rejecting the configuration",
+      |observed| {
+        observed.load_warnings
+          == [
+            SuppressionWarning::UnknownDisabledRule {
+              id: "no.such-rule".to_owned(),
+            },
+            SuppressionWarning::UnknownEnabledRule {
+              id: "no.such-rule".to_owned(),
+            },
+          ]
+      },
     )
-    .map(drop)
-    .map_err(|source| ConfigTestFailure::LoadExpectation {
-      outcome: Box::new(Ok(config)),
-      source,
-    })
   }
 
   /// Defaults establish the documented detector sizes, thresholds, and source policy.
   #[test]
-  fn default_config() -> Result<(), ConditionFailure> {
-    let config = Config::default();
-    ensure(
-      (config.min_nodes, config.line_min_lines, config.exclude, config.sub_function) == (10, 5, Vec::<String>::new(), false)
-        && config.similarity_threshold.total_cmp(&0.8) == Ordering::Equal,
+  fn default_config() -> Result<(), Box<PredicateFailure<Config>>> {
+    ensure_that(
+      Config::default(),
       "preserve the default detector sizes, similarity threshold, and source-selection policy",
+      |observed| {
+        (observed.min_nodes, observed.line_min_lines, observed.sub_function) == (10, 5, false)
+          && observed.exclude.is_empty()
+          && observed.similarity_threshold.total_cmp(&0.8) == Ordering::Equal
+      },
     )
     .map(drop)
+    .map_err(Box::new)
   }
 
   /// The dedicated document supplies detector settings and path exclusions.
   #[test]
   fn load_from_dupes_toml() -> Result<(), ConfigTestFailure> {
-    let config = load_with_dupes_toml(
+    check_dedicated_config(
       r#"
             min_nodes = 20
             similarity_threshold = 0.9
             exclude = ["tests"]
             "#,
-    )?;
-    ensure(
-      (config.min_nodes, &config.exclude) == (20, &vec!["tests".to_owned()])
-        && config.similarity_threshold.total_cmp(&0.9) == Ordering::Equal,
       "load detector settings and path exclusions from the dedicated configuration file",
+      |observed| {
+        (observed.min_nodes, &observed.exclude) == (20, &vec!["tests".to_owned()])
+          && observed.similarity_threshold.total_cmp(&0.9) == Ordering::Equal
+      },
     )
-    .map(drop)?;
-    Ok(())
   }
 
   /// Cargo package metadata supplies settings when the dedicated file is absent.
@@ -735,12 +742,14 @@ min_lines = 3
             ",
     )?;
     let config = Config::load(workspace.path())?;
-    ensure(
-      config.min_nodes == 15 && config.similarity_threshold.total_cmp(&0.75) == Ordering::Equal,
+    ensure_that(
+      config,
       "load package metadata when the dedicated configuration file is absent",
+      |observed| observed.min_nodes == 15 && observed.similarity_threshold.total_cmp(&0.75) == Ordering::Equal,
     )
-    .map(drop)?;
-    Ok(())
+    .map(drop)
+    .map_err(Box::new)
+    .map_err(ConfigTestFailure::from)
   }
 
   /// Dedicated settings take precedence over the same Cargo metadata fields.
@@ -981,68 +990,65 @@ min_lines = 3
   /// Exact and near group-count limits remain independent configuration fields.
   #[test]
   fn config_with_thresholds() -> Result<(), ConfigTestFailure> {
-    let config = load_with_dupes_toml("max_exact_duplicates = 0\nmax_near_duplicates = 5\n")?;
-    ensure(
-      (config.max_exact_duplicates, config.max_near_duplicates) == (Some(0), Some(5)),
+    check_dedicated_config(
+      "max_exact_duplicates = 0\nmax_near_duplicates = 5\n",
       "load exact and near group-count limits independently",
+      |observed| (observed.max_exact_duplicates, observed.max_near_duplicates) == (Some(0), Some(5)),
     )
-    .map(drop)?;
-    Ok(())
   }
 
   /// The file's test-code exclusion setting reaches the resolved configuration.
   #[test]
   fn config_with_exclude_tests() -> Result<(), ConfigTestFailure> {
-    let config = load_with_dupes_toml("exclude_tests = true\n")?;
-    ensure(config.exclude_tests, "load the explicit test-code exclusion").map(drop)?;
-    Ok(())
+    check_dedicated_config("exclude_tests = true\n", "load the explicit test-code exclusion", |observed| {
+      observed.exclude_tests
+    })
   }
 
   /// The AST source-span floor is loaded from the dedicated document.
   #[test]
   fn config_with_min_lines() -> Result<(), ConfigTestFailure> {
-    let config = load_with_dupes_toml("min_lines = 5\n")?;
-    ensure_that(config, "load the AST source-span floor", |observed| observed.min_lines == 5)
-      .map(drop)
-      .map_err(|source| ConfigTestFailure::LoadedSetting(Box::new(source)))
+    check_dedicated_config("min_lines = 5\n", "load the AST source-span floor", |observed| {
+      observed.min_lines == 5
+    })
   }
 
   /// Exact and near percentage limits preserve their configured values.
   #[test]
   fn config_with_percentage_thresholds() -> Result<(), ConfigTestFailure> {
-    let config = load_with_dupes_toml("max_exact_percent = 5.0\nmax_near_percent = 10.5\n")?;
-    ensure(
-      config
-        .max_exact_percent
-        .zip(config.max_near_percent)
-        .is_some_and(|(exact, near)| exact.total_cmp(&5.0) == Ordering::Equal && near.total_cmp(&10.5) == Ordering::Equal),
+    check_dedicated_config(
+      "max_exact_percent = 5.0\nmax_near_percent = 10.5\n",
       "preserve both configured percentage limits",
+      |observed| {
+        observed
+          .max_exact_percent
+          .zip(observed.max_near_percent)
+          .is_some_and(|(exact, near)| exact.total_cmp(&5.0) == Ordering::Equal && near.total_cmp(&10.5) == Ordering::Equal)
+      },
     )
-    .map(drop)?;
-    Ok(())
   }
 
   /// Token windows receive both the token-count and source-span floors.
   #[test]
   fn config_with_token_min_lines() -> Result<(), ConfigTestFailure> {
-    let config = load_with_dupes_toml("[token]\nmin_tokens = 25\nmin_lines = 3\n")?;
-    ensure(
-      (config.token_min_tokens, config.token_min_lines) == (25, 3),
+    check_dedicated_config(
+      "[token]\nmin_tokens = 25\nmin_lines = 3\n",
       "load both token-count and source-span floors",
+      |observed| (observed.token_min_tokens, observed.token_min_lines) == (25, 3),
     )
-    .map(drop)?;
-    Ok(())
   }
 
   /// Explicit dimension selection replaces the default enabled set.
   #[test]
-  fn enable_only_dimensions_replaces_default_dimensions() -> Result<(), ConditionFailure> {
+  fn enable_only_dimensions_replaces_default_dimensions() -> Result<(), Box<PredicateFailure<Config>>> {
     let mut config = Config::default();
     config.enable_only_dimensions([DetectionDimension::Line]);
-    ensure(
-      config.enabled_dimensions.iter().copied().eq([DetectionDimension::Line]),
+    ensure_that(
+      config,
       "enabling only line detection replaces every default dimension",
+      |observed| observed.enabled_dimensions.iter().copied().eq([DetectionDimension::Line]),
     )
     .map(drop)
+    .map_err(Box::new)
   }
 }
