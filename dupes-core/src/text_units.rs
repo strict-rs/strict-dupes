@@ -1396,12 +1396,17 @@ fn normalize_construct(
   /// A checked window scenario retaining its complete extraction evidence on failure.
   type WindowTestResult<Expected, Failure = ConditionFailure> = Result<(), Box<WindowTestFailure<Expected, Failure>>>;
 
-  /// A declaration-policy check batch retains its accepted prefix and unattempted checks.
-  type DeclarationChecksFailure = CheckBatchFailure<(bool, &'static str), ConditionFailure, IntoIter<(bool, &'static str)>>;
+  /// A window-policy check batch retains its accepted prefix and unattempted checks.
+  type WindowPolicyChecksFailure = CheckBatchFailure<(bool, &'static str), ConditionFailure, IntoIter<(bool, &'static str)>>;
 
   /// A declaration-policy comparison retains both configurations, populations, and resolution
   /// warnings.
-  type DeclarationWindowTestResult = WindowTestResult<(TextUnits, Config, Vec<SuppressionWarning>), DeclarationChecksFailure>;
+  type DeclarationWindowTestResult = WindowTestResult<(TextUnits, Config, Vec<SuppressionWarning>), WindowPolicyChecksFailure>;
+
+  /// An admission toggle retains both configurations and populations, warnings, and the expected
+  /// base rule.
+  type AdmissionWindowTestResult =
+    WindowTestResult<(TextUnits, Config, Vec<SuppressionWarning>, Option<RuleId>, TextUnits), WindowPolicyChecksFailure>;
 
   /// Run an extraction scenario without losing unprojected units or inputs when its assertion
   /// fails.
@@ -2564,6 +2569,62 @@ command()
       check_windows("sample.rs", source, config, rule, |units, &expected| {
         ensure_window_classification(&units.lines, expected)
       })?;
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn disabled_admissions_preserve_candidates_and_use_base_classification() -> AdmissionWindowTestResult {
+    for (document, admission, base_rule) in [
+      (
+        "/// The first setting.\nfirst: Option<String>,\n/// The second setting.\nsecond: Option<bool>,",
+        RuleId::LineDeclarationStanza,
+        None,
+      ),
+      (
+        ".arg(\"(\")\n.arg(\")\");",
+        RuleId::LineBuilderChainRun,
+        Some(RuleId::LineChainTail),
+      ),
+    ] {
+      let config = Config {
+        enabled_dimensions: BTreeSet::from([DetectionDimension::Line]),
+        line_min_lines: document.lines().count(),
+        ..Config::default()
+      };
+      let admitted = extract(Path::new("sample.rs"), document, &config);
+      let mut expected_units = admitted.clone();
+      for unit in &mut expected_units.lines {
+        unit.suppressed = base_rule;
+      }
+      let (suppression, warnings) = SuppressionPolicy::resolve(&[admission.as_str().to_owned()], &[]);
+      let disabled = Config {
+        suppression,
+        ..config.clone()
+      };
+      check_windows(
+        "sample.rs",
+        document,
+        disabled,
+        (admitted, config, warnings, base_rule, expected_units),
+        |units, expected| {
+          let enabled_units = &expected.0;
+          let resolution_warnings = &expected.2;
+          let expected_population = &expected.4;
+          ensure_all(vec![
+            (resolution_warnings.is_empty(), "the admission rule resolves without warnings"),
+            (
+              (enabled_units.lines.len(), units.lines.len()) == (1, 1) && enabled_units.lines.iter().all(|unit| unit.suppressed.is_none()),
+              "the enabled admission exposes one complete candidate and disabling it retains that candidate",
+            ),
+            (
+              units == expected_population,
+              "base classification can retain visibility or apply suppression while preserving every other native unit field",
+            ),
+          ])
+          .map(drop)
+        },
+      )?;
     }
     Ok(())
   }
