@@ -1304,10 +1304,12 @@ mod tests {
   use std::vec::IntoIter;
 
   use strict_test_support::CheckBatchFailure;
+  use strict_test_support::ComparisonFailure;
   use strict_test_support::ConditionFailure;
   use strict_test_support::PredicateFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_all;
+  use strict_test_support::ensure_eq;
   use strict_test_support::ensure_that;
 
   use super::*;
@@ -1462,27 +1464,21 @@ fn normalize_construct(
 
   /// Complete lexer input and token populations when an identity or span differs.
   #[derive(Debug, thiserror::Error)]
-  #[error(
-    "tokenization expectation failed: {source}; document: {document:?}; profile: {profile:?}; expected: {expected:?}; actual: {actual:?}"
-  )]
+  #[error("tokenization expectation failed: {source}; document: {document:?}; profile: {profile:?}")]
   struct TokenizationTestFailure {
     /// Original unmodified lexer input.
     document: String,
     /// Language-specific quote handling used for the input.
     profile:  QuoteProfile,
-    /// Independently specified complete tokens and spans.
-    expected: Vec<Token>,
-    /// Complete tokens returned by the lexer.
-    actual:   Vec<Token>,
-    /// Native failed expectation.
-    source:   ConditionFailure,
+    /// Native comparison retaining complete actual and expected tokens with their spans.
+    source:   ComparisonFailure<Vec<Token>, Vec<Token>>,
   }
 
   /// Compare complete token sequences while retaining the lexer inputs and outputs.
   fn check_tokens(document: &str, profile: QuoteProfile, expected: Vec<Token>) -> Result<(), Box<TokenizationTestFailure>> {
-    let actual = tokenize(document, profile);
-    ensure(
-      actual == expected,
+    ensure_eq(
+      tokenize(document, profile),
+      expected,
       "tokenization preserves raw and normalized spellings with their source spans",
     )
     .map(drop)
@@ -1490,8 +1486,6 @@ fn normalize_construct(
       Box::new(TokenizationTestFailure {
         document: document.to_owned(),
         profile,
-        expected,
-        actual,
         source,
       })
     })
@@ -2195,31 +2189,25 @@ struct Settings {
 
   /// Original segments and full expected and actual coalescing results.
   #[derive(Debug, thiserror::Error)]
-  #[error("stanza coalescing expectation failed: {source}; segments: {segments:?}; expected: {expected:?}; actual: {actual:?}")]
+  #[error("stanza coalescing expectation failed: {source}; segments: {segments:?}")]
   struct StanzaCoalescingFailure {
     /// Complete source segments with their original line numbers.
     segments: LineSegments,
-    /// Independently specified joined or separate segments.
-    expected: LineSegments,
-    /// Complete result returned by coalescing.
-    actual:   LineSegments,
-    /// Native assertion failure.
-    source:   ConditionFailure,
+    /// Native comparison retaining complete actual and expected joined or separate segments.
+    source:   ComparisonFailure<LineSegments, LineSegments>,
   }
 
   /// Compare coalescing results without dropping the source segments or rejected result.
   fn check_stanza_coalescing(segments: LineSegments, expected: LineSegments) -> Result<(), Box<StanzaCoalescingFailure>> {
-    let actual = coalesce_stanza_segments(segments.iter().map(Vec::as_slice).collect());
-    ensure(
-      actual == expected,
+    ensure_eq(
+      coalesce_stanza_segments(segments.iter().map(Vec::as_slice).collect()),
+      expected,
       "coalescing preserves every source row and only joins the expected declaration segments",
     )
     .map(drop)
     .map_err(|source| {
       Box::new(StanzaCoalescingFailure {
         segments,
-        expected,
-        actual,
         source,
       })
     })

@@ -566,9 +566,11 @@ fn is_trivial_boolean_projection(node: &NormalizedNode) -> bool {
 
 #[cfg(test)]
 mod tests {
+  use strict_test_support::ComparisonFailure;
   use strict_test_support::ConditionFailure;
   use strict_test_support::PredicateFailure;
   use strict_test_support::ensure;
+  use strict_test_support::ensure_eq;
   use strict_test_support::ensure_that;
 
   use super::SubUnit;
@@ -1125,27 +1127,21 @@ mod tests {
 
   /// Retain the complete extraction scenario when its canonical units differ.
   #[derive(Debug, thiserror::Error)]
-  #[error(
-    "sub-unit extraction expectation failed: {source}; body: {body:?}; minimum: {minimum}; expected: {expected:?}; actual: {actual:?}"
-  )]
+  #[error("sub-unit extraction expectation failed: {source}; body: {body:?}; minimum: {minimum}")]
   struct ExtractionTestFailure {
     /// Original normalized function body before canonical reindexing.
-    body:     NormalizedNode,
+    body:    NormalizedNode,
     /// Node-count floor supplied to extraction.
-    minimum:  usize,
-    /// Independently specified units, in extraction order.
-    expected: Vec<SubUnit>,
-    /// Complete extracted population and its ownership metadata.
-    actual:   Vec<SubUnit>,
-    /// Native assertion failure.
-    source:   ConditionFailure,
+    minimum: usize,
+    /// Native comparison retaining complete actual and expected units in extraction order.
+    source:  ComparisonFailure<Vec<SubUnit>, Vec<SubUnit>>,
   }
 
   /// Check complete canonical units without projecting away body or chain evidence.
   fn check_extracted_units(body: NormalizedNode, minimum: usize, expected: Vec<SubUnit>) -> Result<(), Box<ExtractionTestFailure>> {
-    let actual = extract_sub_units(&body, minimum);
-    ensure(
-      actual == expected,
+    ensure_eq(
+      extract_sub_units(&body, minimum),
+      expected,
       "extraction preserves exact canonical bodies, ordering, and chain ownership",
     )
     .map(drop)
@@ -1153,8 +1149,6 @@ mod tests {
       Box::new(ExtractionTestFailure {
         body,
         minimum,
-        expected,
-        actual,
         source,
       })
     })
