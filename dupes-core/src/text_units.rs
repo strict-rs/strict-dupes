@@ -700,10 +700,10 @@ fn classify_token_window(segment: &[Token], slice: &[Token], mode: TokenMode, po
   if token_window_is_chain_tail(slice) {
     return policy.allow(RuleId::TokenChainTail);
   }
-  if token_window_is_declaration_scaffold(slice) {
+  if token_window_is_declaration_scaffold(segment, slice) {
     return policy.allow(RuleId::TokenDeclarationScaffold);
   }
-  if token_window_is_signature_prefix(slice) {
+  if token_window_is_signature_prefix(segment, slice) {
     return policy.allow(RuleId::TokenSignaturePrefix);
   }
   if token_window_cuts_match_table_prefix(segment, slice.len()) {
@@ -818,34 +818,42 @@ fn line_is_match_table_row(line: &[Token]) -> bool {
       .any(|(left, right)| left.raw == "=" && right.raw == ">" && left.line == right.line)
 }
 
-/// Reject windows that are mostly doc comments and an unfinished signature.
+/// Recognize documented signature scaffolding and prefixes cut before the declaration.
 ///
-/// A documented multi-line `fn` signature tokenizes almost identically for
-/// unrelated functions; a window must include real body content to stand for
-/// a duplicate.
+/// The segment establishes the declaration when the window ends inside its
+/// prelude. Comments cannot establish a function. Once the window reaches
+/// the declaration, retain the existing documentation/signature dominance rule.
 #[allow(
   clippy::single_call_fn,
   reason = "Documented signature prefixes have a dedicated rule with body-content counterexamples."
 )]
-fn token_window_is_signature_prefix(slice: &[Token]) -> bool {
+fn token_window_is_signature_prefix(segment: &[Token], slice: &[Token]) -> bool {
   // Only documented declarations: the window must begin at a doc comment
   // or attribute line. Windows that begin at code (imports, impl headers,
   // undocumented signatures) describe real adjacent content.
   if !slice.first().is_some_and(|token| token.raw == "/" || token.raw == "#") {
     return false;
   }
-  if !slice.iter().any(|token| token.raw == "fn") {
+  let code_lines = window_code_lines(segment, segment.len());
+  let code: Vec<&Token> = code_lines.iter().flatten().copied().collect();
+  let Some(declaration) = declaration_tokens(&code) else {
+    return false;
+  };
+  if declaration.first().is_none_or(|token| token.raw != "fn") {
     return false;
   }
-  // Only multi-line doc/parameter scaffolding counts; functions that open
-  // their body on the signature line keep their windows.
+  let window_code_count = window_code_lines(segment, slice.len()).iter().flatten().count();
+  let declaration_start = code.len().saturating_sub(declaration.len());
+  if window_code_count <= declaration_start {
+    return true;
+  }
   slice
     .split(|token| token.raw == "{")
     .next()
     .is_some_and(|scaffold| scaffold.len() >= slice.len().div_ceil(2) && window_token_lines(scaffold).len() >= 3)
 }
 
-/// Reject windows that are only a type declaration's field scaffolding.
+/// Recognize field scaffolding and an enum's incomplete introductory variant.
 ///
 /// Visibility-qualified field rows remain declaration scaffolding. Line
 /// comments contribute to token identities but do not describe executable
@@ -854,17 +862,62 @@ fn token_window_is_signature_prefix(slice: &[Token]) -> bool {
   clippy::single_call_fn,
   reason = "Declaration classification must use its comment-free view without changing the token identities."
 )]
-fn token_window_is_declaration_scaffold(slice: &[Token]) -> bool {
-  let code_lines: Vec<Vec<&Token>> = window_token_lines(slice)
-    .into_iter()
-    .map(|line| {
-      let comment_start = line
-        .iter()
-        .zip(line.iter().skip(1))
-        .position(|(first, second)| first.raw == "/" && second.raw == "/");
-      line.iter().take(comment_start.unwrap_or(line.len())).collect()
-    })
-    .collect();
+fn token_window_is_declaration_scaffold(segment: &[Token], slice: &[Token]) -> bool {
+  let code_lines = window_code_lines(segment, slice.len());
+  let window_code: Vec<&Token> = code_lines.iter().flatten().copied().collect();
+  if declaration_tokens(&window_code).is_some_and(|tokens| tokens.first().is_some_and(|token| token.raw == "enum")) {
+    let segment_lines = window_code_lines(segment, segment.len());
+    let code: Vec<&Token> = segment_lines.iter().flatten().copied().collect();
+    let Some(&[_, name, ref header @ ..]) = declaration_tokens(&code) else {
+      return false;
+    };
+    if name.normalized != "IDENT" {
+      return false;
+    }
+    let Some(open) = header.iter().position(|token| token.raw == "{") else {
+      return false;
+    };
+    let Some((parameters, body)) = header.split_at_checked(open) else {
+      return false;
+    };
+    if parameters.iter().any(|token| token_is_runtime_behavior(token)) {
+      return false;
+    }
+    let Some(after_enum) = after_token_group(body) else {
+      return false;
+    };
+    if window_code.len() >= code.len().saturating_sub(after_enum.len()) {
+      return false;
+    }
+    let Some(variants) = body.get(1..).and_then(after_attributes) else {
+      return false;
+    };
+    let Some((variant, payload)) = variants.split_first() else {
+      return false;
+    };
+    if variant.normalized != "IDENT" {
+      return false;
+    }
+    let after_payload = if payload.first().is_some_and(|token| token.raw == "(") {
+      let Some(remaining) = after_token_group(payload) else {
+        return false;
+      };
+      let payload_len = payload.len().saturating_sub(remaining.len());
+      if payload.iter().take(payload_len).any(|token| token_is_runtime_behavior(token)) {
+        return false;
+      }
+      remaining
+    } else {
+      payload
+    };
+    let Some((separator, remaining)) = after_payload.split_first() else {
+      return false;
+    };
+    if separator.raw != "," {
+      return false;
+    }
+    return after_attributes(remaining).is_some_and(|next_variant| window_code.len() <= code.len().saturating_sub(next_variant.len()));
+  }
   let has_type_header = code_lines
     .iter()
     .flatten()
@@ -876,22 +929,109 @@ fn token_window_is_declaration_scaffold(slice: &[Token]) -> bool {
   field_lines >= 2 && !code_lines.iter().flatten().any(|token| token_is_runtime_behavior(token))
 }
 
+/// Borrow prefix code tokens using complete lines to recognize comments cut at their first slash.
+fn window_code_lines(segment: &[Token], window_len: usize) -> Vec<Vec<&Token>> {
+  window_token_lines(segment)
+    .into_iter()
+    .scan(window_len, |remaining, line| {
+      if *remaining == 0 {
+        return None;
+      }
+      let prefix_len = (*remaining).min(line.len());
+      *remaining = remaining.saturating_sub(prefix_len);
+      let comment_start = line
+        .iter()
+        .zip(line.iter().skip(1))
+        .position(|(first, second)| first.raw == "/" && second.raw == "/");
+      Some(line.iter().take(prefix_len.min(comment_start.unwrap_or(line.len()))).collect())
+    })
+    .collect()
+}
+
+/// Borrow a declaration after complete attributes, visibility, and function qualifiers.
+fn declaration_tokens<'a>(tokens: &'a [&'a Token]) -> Option<&'a [&'a Token]> {
+  let mut declaration = after_attributes(tokens).and_then(after_visibility)?;
+  while let Some((first, remaining)) = declaration.split_first()
+    && matches!(first.raw.as_str(), "async" | "const" | "unsafe" | "extern")
+  {
+    declaration = remaining;
+    if first.raw == "extern"
+      && let Some((abi, after_abi)) = declaration.split_first()
+      && abi.normalized == "STRING"
+    {
+      declaration = after_abi;
+    }
+  }
+  Some(declaration)
+}
+
+/// Borrow the tokens following complete outer attributes; incomplete attributes remain
+/// unclassified.
+fn after_attributes<'a>(mut tokens: &'a [&'a Token]) -> Option<&'a [&'a Token]> {
+  while let Some((first, remaining)) = tokens.split_first()
+    && first.raw == "#"
+  {
+    if remaining.first().is_none_or(|token| token.raw != "[") {
+      return None;
+    }
+    tokens = after_token_group(remaining)?;
+  }
+  Some(tokens)
+}
+
+/// Borrow a field or declaration after its public or restricted visibility prefix.
+fn after_visibility<'a>(tokens: &'a [&'a Token]) -> Option<&'a [&'a Token]> {
+  if let Some((first, remaining)) = tokens.split_first()
+    && first.raw == "pub"
+  {
+    if remaining.first().is_some_and(|token| token.raw == "(") {
+      after_token_group(remaining)
+    } else {
+      Some(remaining)
+    }
+  } else {
+    Some(tokens)
+  }
+}
+
+/// Borrow the suffix after a balanced token group, respecting nested delimiter kinds.
+fn after_token_group<'a>(tokens: &'a [&'a Token]) -> Option<&'a [&'a Token]> {
+  if !tokens
+    .first()
+    .is_some_and(|token| matches!(token.raw.as_str(), "(" | "[" | "{"))
+  {
+    return None;
+  }
+  let mut closing = Vec::new();
+  for (index, token) in tokens.iter().enumerate() {
+    match token.raw.as_str() {
+      "(" => closing.push(")"),
+      "[" => closing.push("]"),
+      "{" => closing.push("}"),
+      ")" | "]" | "}" => {
+        if closing.pop() != Some(token.raw.as_str()) {
+          return None;
+        }
+        if closing.is_empty() {
+          return tokens.get(index.checked_add(1)?..);
+        }
+      }
+      _ => {}
+    }
+  }
+  None
+}
+
 /// `name: Type,` declaration rows, optionally prefixed by Rust visibility.
 #[allow(
   clippy::single_call_fn,
   reason = "Field-row recognition owns visibility parsing independently of the surrounding declaration classifier."
 )]
 fn line_is_field_like(line: &[&Token]) -> bool {
-  let mut tokens = line.iter().copied().peekable();
-  if tokens.next_if(|token| token.raw == "pub").is_some()
-    && tokens.next_if(|token| token.raw == "(").is_some()
-    && !tokens.any(|token| token.raw == ")")
-  {
+  let Some(&[name, colon, ref remaining @ ..]) = after_visibility(line) else {
     return false;
-  }
-  tokens.next().is_some_and(|token| token.normalized == "IDENT")
-    && tokens.next().is_some_and(|token| token.raw == ":")
-    && tokens.last().is_some_and(|token| token.raw == ",")
+  };
+  name.normalized == "IDENT" && colon.raw == ":" && remaining.last().is_some_and(|token| token.raw == ",")
 }
 
 /// Tokens that indicate executable behavior rather than declaration shape.
@@ -1371,6 +1511,40 @@ fn normalize_construct(
 ) -> NormalizedNode {
 ";
 
+  /// A complete documented function whose first eight lines stop inside an outer attribute.
+  const DOCUMENTED_FUNCTION: &str = "\
+/// Decode one input while retaining its original evidence.
+///
+/// # Errors
+///
+/// Returns the native input failure for callers.
+#[allow(
+    clippy::single_call_fn,
+    reason = \"The operation owns its parsing boundary.\"
+)]
+pub(crate) fn decode(input: &[u8]) -> usize {
+    let size = input.len();
+    if size == 0 { 1 } else { size }
+}
+";
+
+  /// A native-error introduction followed by a distinct variant carrying complete evidence.
+  const DOCUMENTED_ENUM: &str = "\
+/// Preserve native failures and the operation's complete evidence.
+#[derive(Debug, thiserror::Error)]
+pub enum OperationFailure {
+    /// The native operation failed before producing its result.
+    #[error(transparent)]
+    Native(#[from] io::Error),
+    /// The completed operation did not satisfy its contract.
+    #[error(\"operation evidence: {input:?}; {source}\")]
+    Evidence {
+        input: Vec<u8>,
+        source: ConditionFailure,
+    },
+}
+";
+
   /// Source, extraction configuration, and complete windows retained when a behavioral expectation
   /// fails.
   #[derive(Debug, thiserror::Error)]
@@ -1402,6 +1576,12 @@ fn normalize_construct(
   /// A declaration-policy comparison retains both configurations, populations, and resolution
   /// warnings.
   type DeclarationWindowTestResult = WindowTestResult<(TextUnits, Config, Vec<SuppressionWarning>), WindowPolicyChecksFailure>;
+
+  /// A prefix-policy comparison retains both complete populations and the rule-resolution outcome.
+  type PrefixWindowTestResult = WindowTestResult<
+    (TextUnits, Config, Vec<SuppressionWarning>, RuleId, [TextUnits; 2]),
+    Box<ComparisonFailure<([TextUnits; 2], Vec<SuppressionWarning>), ([TextUnits; 2], Vec<SuppressionWarning>)>>,
+  >;
 
   /// An admission toggle retains both configurations and populations, warnings, and the expected
   /// base rule.
@@ -1932,6 +2112,159 @@ fn beta(items: &[u32]) -> Vec<u32> {
       "pub struct State {\n    pub(crate first: u8,\n    pub second: u16,\n}",
     ] {
       check_declaration_windows(source, None)?;
+    }
+    Ok(())
+  }
+
+  /// Prelude classification uses the following declaration and stops before later enum variants.
+  #[test]
+  fn introductory_windows_stop_before_second_enum_variants() -> WindowTestResult<Option<RuleId>> {
+    for (document, min_lines, expected) in [
+      (DOCUMENTED_FUNCTION, 3, Some(RuleId::TokenSignaturePrefix)),
+      (DOCUMENTED_FUNCTION, 8, Some(RuleId::TokenSignaturePrefix)),
+      (DOCUMENTED_FUNCTION, 10, Some(RuleId::TokenSignaturePrefix)),
+      (DOCUMENTED_ENUM, 4, Some(RuleId::TokenDeclarationScaffold)),
+      (DOCUMENTED_ENUM, 8, Some(RuleId::TokenDeclarationScaffold)),
+      (DOCUMENTED_ENUM, 9, None),
+      (DOCUMENTED_ENUM, 13, None),
+      (
+        "/// Preserve the operation state.\nenum State {\n    Pending,\n    /// The operation has finished.\n    Ready,\n}",
+        4,
+        Some(RuleId::TokenDeclarationScaffold),
+      ),
+      (
+        "/// Preserve the operation state.\nenum State<T> {\n    Pending(T),\n    /// The completed operation retains its result.\n    \
+         Ready(T),\n}",
+        4,
+        Some(RuleId::TokenDeclarationScaffold),
+      ),
+      (
+        "/// Discriminants define the serialized operation state.\nenum State {\n    Pending = 1,\n    Ready = 2,\n}",
+        3,
+        None,
+      ),
+      (
+        "/// Complete evidence belongs to this variant.\nenum State {\n    Evidence {\n        input: Vec<u8>,\n        source: \
+         NativeError,\n    },\n    Complete,\n}",
+        5,
+        None,
+      ),
+    ] {
+      let config = Config {
+        token_min_lines: min_lines,
+        ..declaration_window_config(document, SuppressionPolicy::default())
+      };
+      check_windows("prefix.rs", document, config, expected, |units, &rule| {
+        ensure_window_classification(&units.normalized_tokens, rule)?;
+        ensure_window_classification(&units.raw_tokens, rule)
+      })?;
+    }
+    Ok(())
+  }
+
+  /// Toggling either introductory rule changes only the retained candidates' classification tags.
+  #[test]
+  fn introductory_classification_retains_complete_detection_evidence() -> PrefixWindowTestResult {
+    for (document, rule) in [
+      (DOCUMENTED_FUNCTION, RuleId::TokenSignaturePrefix),
+      (DOCUMENTED_ENUM, RuleId::TokenDeclarationScaffold),
+    ] {
+      let (disabled, warnings) = SuppressionPolicy::resolve(&[rule.as_str().to_owned()], &[]);
+      let disabled_config = Config {
+        token_min_lines: 8,
+        ..declaration_window_config(document, disabled)
+      };
+      let visible = extract(Path::new("prefix.rs"), document, &disabled_config);
+      let mut classified = visible.clone();
+      for unit in classified.normalized_tokens.iter_mut().chain(&mut classified.raw_tokens) {
+        unit.suppressed = Some(rule);
+      }
+      let mut unsuppressed = visible.clone();
+      for unit in unsuppressed.normalized_tokens.iter_mut().chain(&mut unsuppressed.raw_tokens) {
+        unit.suppressed = None;
+      }
+      let config = Config {
+        suppression: SuppressionPolicy::default(),
+        ..disabled_config.clone()
+      };
+      check_windows(
+        "prefix.rs",
+        document,
+        config,
+        (visible, disabled_config, warnings, rule, [classified, unsuppressed]),
+        |tagged, expected| {
+          ensure_eq(
+            ([tagged.clone(), expected.0.clone()], expected.2.clone()),
+            (expected.4.clone(), Vec::new()),
+            "classification preserves every token, fingerprint, normalized tree, source location, identity, and other candidate field",
+          )
+          .map(drop)
+          .map_err(Box::new)
+        },
+      )?;
+    }
+    Ok(())
+  }
+
+  /// Function qualifiers and nested attribute delimiters keep the same prefix boundary.
+  #[test]
+  fn documented_function_prefixes_preserve_qualifiers_and_nested_attributes() -> WindowTestResult<Option<RuleId>> {
+    for qualifier in ["", "async ", "const ", "unsafe ", "extern ", "unsafe extern \"C\" "] {
+      let document = format!(
+        "/// Preserve the typed function contract.\n#[annotate(nested([\"}}\", \"fn\"]))]\npub(in crate::owner) {qualifier}fn \
+         evaluate(input: u8) -> u8 {{\n    input + 1\n}}"
+      );
+      let config = Config {
+        token_min_lines: 2,
+        ..declaration_window_config(&document, SuppressionPolicy::default())
+      };
+      check_windows(
+        "qualified.rs",
+        &document,
+        config,
+        Some(RuleId::TokenSignaturePrefix),
+        |units, &rule| {
+          ensure_window_classification(&units.normalized_tokens, rule)?;
+          ensure_window_classification(&units.raw_tokens, rule)
+        },
+      )?;
+    }
+    Ok(())
+  }
+
+  /// Typed variant data and computation remain visible even when documentation precedes them.
+  #[test]
+  fn enum_classification_preserves_complete_variants_and_computed_discriminants() -> WindowTestResult<Option<RuleId>> {
+    for document in [
+      "/// Operation state for callers.\n#[derive(Debug)]\nenum State {\n    Pending(u8),\n    Ready(u16),\n}",
+      "/// Operation state for callers.\nenum State {\n    Pending = 1,\n    Ready = 2,\n}",
+      "/// Operation state for callers.\nenum State {\n    Pending {\n        first: u8,\n        second: u16,\n    },\n    Ready,\n}",
+      "/// fn and enum are documentation words.\nfn construct() -> usize {\n    enum Local { First, Second }\n    let value = 2;\n    \
+       value + 1\n}",
+    ] {
+      check_declaration_windows(document, None)?;
+    }
+    Ok(())
+  }
+
+  /// Only an established declaration may classify its preceding documentation or attributes.
+  #[test]
+  fn introductory_classification_requires_balanced_declaration_context() -> WindowTestResult<Option<RuleId>> {
+    for document in [
+      "/// A fn is mentioned but no declaration follows.\n/// Values for callers remain documented.\n/// Preserve the full report.",
+      "/// Attribute metadata must remain complete.\n#[annotate([value)]\npub fn execute() {\n    consume(value);\n}",
+      "/// An enum introduction requires its complete containing declaration.\nenum State {\n    Native(Error),\n    /// The remainder \
+       has not been observed.",
+      "/// Nested delimiters must agree before classifying a variant.\nenum State {\n    Native([Error)),\n    Other,\n}",
+    ] {
+      let config = Config {
+        token_min_lines: 3,
+        ..declaration_window_config(document, SuppressionPolicy::default())
+      };
+      check_windows("incomplete.rs", document, config, None, |units, &rule| {
+        ensure_window_classification(&units.normalized_tokens, rule)?;
+        ensure_window_classification(&units.raw_tokens, rule)
+      })?;
     }
     Ok(())
   }
