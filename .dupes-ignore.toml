@@ -1,0 +1,203 @@
+[[ignore]]
+fingerprint = "d069ab5df3e34bc4"
+reason = "Frozen detector-coverage fixtures intentionally repeat syntax to pin detection, suppression, and per-dimension regression outcomes."
+members = [
+    "chain_y (cargo-dupes/tests/fixtures/detector_coverage/src/overrides_b.rs:27-37)",
+    "chain_x (cargo-dupes/tests/fixtures/detector_coverage/src/overrides_a.rs:39-49)",
+]
+member_fingerprints = ["d385d8f6abcf867c"]
+
+[[ignore]]
+fingerprint = "8e531089a72151ad"
+reason = "Frozen detector-coverage fixtures intentionally repeat syntax to pin detection, suppression, and per-dimension regression outcomes."
+members = [
+    "normalized token window (cargo-dupes/tests/fixtures/detector_coverage/src/shapes.rs:63-70)",
+    "normalized token window (cargo-dupes/tests/fixtures/detector_coverage/src/shapes.rs:72-79)",
+]
+member_fingerprints = ["952482248cffe438"]
+
+[[ignore]]
+fingerprint = "caa5d17622151538"
+reason = "Committed sub-function fixtures intentionally duplicate branch and loop syntax to exercise nested duplicate detection."
+members = [
+    "normalized token window (cargo-dupes/tests/fixtures/sub_function_dupes/src/lib.rs:65-72)",
+    "normalized token window (cargo-dupes/tests/fixtures/sub_function_dupes/src/lib.rs:75-82)",
+]
+member_fingerprints = ["cfb80607195a19f9"]
+
+[[ignore]]
+fingerprint = "cc24bc13077655d2"
+reason = "Embedded parser fixtures independently exercise standalone if-branch extraction and loop-body extraction through the shared parser helper."
+members = [
+    "normalized token window (dupes-rust/src/parser.rs:1115-1128)",
+    "normalized token window (dupes-rust/src/parser.rs:1175-1193)",
+]
+member_fingerprints = [
+    "46c30d72767e1866",
+    "49b92ad3ba7305db",
+]
+
+[[ignore]]
+fingerprint = "74c7058ad3fc6322"
+reason = "Frozen detector-coverage fixtures intentionally repeat syntax to pin detection, suppression, and per-dimension regression outcomes."
+members = [
+    "normalized token window (cargo-dupes/tests/fixtures/detector_coverage/src/shapes.rs:181-191)",
+    "normalized token window (cargo-dupes/tests/fixtures/detector_coverage/src/shapes.rs:203-212)",
+]
+member_fingerprints = [
+    "7b80bdd5b2c8c4ae",
+    "ff7251d5f4d12ec8",
+]
+
+[[ignore]]
+fingerprint = "bd58a339a31f7efe"
+reason = "Embedded source fixtures exercise Rust lifetime tokenization and comment-marker handling; retain their independent source inputs."
+members = [
+    "normalized token window (dupes-core/src/text_units.rs:1695-1702)",
+    "normalized token window (dupes-core/src/text_units.rs:2718-2725)",
+]
+member_fingerprints = [
+    "532045cd293f400e",
+    "a9e661cc98691a60",
+]
+
+[[ignore]]
+fingerprint = "49a3311912a0295b"
+reason = "Valid and malformed registry-document fixtures exercise listing evidence and decode failures through the existing command owner."
+members = [
+    "normalized token window (dupes-core/src/cli.rs:2055-2062)",
+    "normalized token window (dupes-core/src/cli.rs:2125-2132)",
+]
+member_fingerprints = [
+    "4d48ce4014cbd872",
+    "a3c875c48b9b40ae",
+]
+
+[[ignore]]
+fingerprint = "1d3915f22b9c29fd"
+reason = "Typed NodeMapping fixtures independently configure generic normalization and bridge behavior, including deliberate omissions; retain their overlap with the production Python mapping."
+members = [
+    "line window (dupes-treesitter/src/normalizer.rs:620-631)",
+    "line window (dupes-treesitter/tests/python_integration.rs:118-129)",
+]
+member_fingerprints = ["948952615a2b8def"]
+
+[[ignore]]
+fingerprint = "f1730c231d66b256"
+reason = "Frozen detector-coverage fixtures intentionally repeat syntax to pin detection, suppression, and per-dimension regression outcomes."
+members = [
+    "line window (cargo-dupes/tests/fixtures/detector_coverage/src/decl_a.rs:14-24)",
+    "line window (cargo-dupes/tests/fixtures/detector_coverage/src/decl_b.rs:12-22)",
+]
+member_fingerprints = ["d38be65713a73e9e"]
+
+[[ignore]]
+fingerprint = "908d6c42725f3ce0"
+reason = "Frozen detector-coverage fixtures intentionally repeat syntax to pin detection, suppression, and per-dimension regression outcomes."
+members = [
+    "line window (cargo-dupes/tests/fixtures/detector_coverage/src/decl_a.rs:18-28)",
+    "line window (cargo-dupes/tests/fixtures/detector_coverage/src/decl_b.rs:16-26)",
+]
+member_fingerprints = ["e0d4d76295062445"]
+
+[[ignore]]
+fingerprint = "dfac8e57a6015401"
+reason = "Frozen detector-coverage fixtures intentionally repeat syntax to pin detection, suppression, and per-dimension regression outcomes."
+members = [
+    "line window (cargo-dupes/tests/fixtures/detector_coverage/src/decl_a.rs:22-32)",
+    "line window (cargo-dupes/tests/fixtures/detector_coverage/src/decl_b.rs:20-30)",
+]
+member_fingerprints = ["01e6ee7b55b78a82"]
+
+[[ignore]]
+fingerprint = "27c5a7d55dc3f9b8"
+reason = "Frozen detector-coverage fixtures intentionally repeat syntax to pin detection, suppression, and per-dimension regression outcomes."
+members = [
+    "line window (cargo-dupes/tests/fixtures/detector_coverage/src/decl_a.rs:26-35)",
+    "line window (cargo-dupes/tests/fixtures/detector_coverage/src/decl_b.rs:24-33)",
+]
+member_fingerprints = ["4d1f255a5e92f2bd"]
+
+[[ignore]]
+fingerprint = "94de73adca717883"
+reason = "Typed NodeMapping fixtures independently configure generic normalization and bridge behavior, including deliberate omissions; retain their overlap with the production Python mapping."
+members = [
+    "line window (dupes-treesitter/src/normalizer.rs:641-650)",
+    "line window (dupes-treesitter/tests/python_integration.rs:150-159)",
+]
+member_fingerprints = ["50df55e671ccfa7e"]
+
+[[ignore]]
+fingerprint = "ddf977a69606a8e0"
+reason = "Typed NodeMapping fixtures independently configure generic normalization and bridge behavior, including deliberate omissions; retain their overlap with the production Python mapping."
+members = [
+    "line window (dupes-python/src/lib.rs:202-210)",
+    "line window (dupes-treesitter/src/normalizer.rs:639-647)",
+    "line window (dupes-treesitter/tests/python_integration.rs:148-156)",
+]
+member_fingerprints = ["b1aca1e0e2f6e1c7"]
+
+[[ignore]]
+fingerprint = "17f620c85228d98b"
+reason = "Typed NodeMapping fixtures independently configure generic normalization and bridge behavior, including deliberate omissions; retain their overlap with the production Python mapping."
+members = [
+    "line window (dupes-python/src/lib.rs:200-208)",
+    "line window (dupes-treesitter/tests/python_integration.rs:146-154)",
+]
+member_fingerprints = ["05218c0a765fe16f"]
+
+[[ignore]]
+fingerprint = "0bf453fa27ed52d3"
+reason = "Embedded Rust source fixtures independently exercise parser extraction and core analysis; their intentional input overlap must remain detectable."
+members = [
+    "line window (dupes-rust/src/parser.rs:874-882)",
+    "line window (dupes-rust/tests/core_with_syn_tests.rs:165-173)",
+]
+member_fingerprints = ["1164a4f843b50c13"]
+
+[[ignore]]
+fingerprint = "a905b5f3808b9fef"
+reason = "Committed test-code fixtures intentionally repeat production and test bodies to verify test-code selection and duplicate detection."
+members = [
+    "line window (cargo-dupes/tests/fixtures/test_code/src/lib.rs:2-9)",
+    "line window (cargo-dupes/tests/fixtures/test_code/src/lib.rs:12-19)",
+    "line window (cargo-dupes/tests/fixtures/test_code/src/lib.rs:24-31)",
+]
+member_fingerprints = ["1cb1a4067f93c68b"]
+
+[[ignore]]
+fingerprint = "e584b26eb48915eb"
+reason = "Typed NodeMapping fixtures independently configure generic normalization and bridge behavior, including deliberate omissions; retain their overlap with the production Python mapping."
+members = [
+    "line window (dupes-python/src/lib.rs:145-152)",
+    "line window (dupes-treesitter/src/normalizer.rs:619-626)",
+    "line window (dupes-treesitter/tests/python_integration.rs:117-124)",
+]
+member_fingerprints = ["6c944910c60f11c3"]
+
+[[ignore]]
+fingerprint = "541cc751a8db0d3c"
+reason = "Committed exact- and near-duplicate fixture projects retain their shared input function so each detection scenario remains independently reproducible."
+members = [
+    "line window (cargo-dupes/tests/fixtures/exact_dupes/src/lib.rs:2-9)",
+    "line window (cargo-dupes/tests/fixtures/near_dupes/src/lib.rs:2-9)",
+]
+member_fingerprints = ["ec3eeb04a7785613"]
+
+[[ignore]]
+fingerprint = "0925bbb9087a2875"
+reason = "Committed mixed-input and embedded core-analysis fixtures retain their intentionally duplicated source programs for independent detector regression scenarios."
+members = [
+    "line window (cargo-dupes/tests/fixtures/mixed/src/lib.rs:13-20)",
+    "line window (dupes-rust/tests/core_with_syn_tests.rs:452-459)",
+]
+member_fingerprints = ["f3a7c0d7e3446d46"]
+
+[[ignore]]
+fingerprint = "363e5a31ff08c9da"
+reason = "Configuration-loading and suppression-policy tests independently specify complete expected unknown-rule warning variants and their order."
+members = [
+    "line window (dupes-core/src/config.rs:687-694)",
+    "line window (dupes-core/src/suppression.rs:523-530)",
+]
+member_fingerprints = ["b2f67d03f7eea01f"]

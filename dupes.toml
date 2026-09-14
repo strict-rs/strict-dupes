@@ -1,18 +1,21 @@
 # Duplication policy for the installed `template cq` workflow.
 #
-# Read from the repo root by `template-cargo`.
+# Read from the repo root by `cargo dupes`, invoked through `template cq`.
 # Config precedence: CLI flags > this file > Cargo.toml metadata.
 #
-# The node and line floors ignore only short syntax fragments. Every duplicate
-# group above those floors must be removed at its owning abstraction; this
-# repository does not carry fingerprint exclusions for production or test code.
+# The node and line floors ignore only short syntax fragments. Intentional
+# fixture duplicates, including typed test configurations, remain detectable
+# and are registered in .dupes-ignore.toml with their regression purpose.
+# Validate those allowances with `cargo dupes cleanup --dry-run`; investigate
+# stale entries instead of rewriting fixtures or silently deleting allowances.
+# Other duplicate groups must be resolved at their owning abstraction.
 
 similarity_threshold = 0.9    # near-duplicate sensitivity (0.0..1.0)
 min_nodes            = 40     # ignore small AST fragments
 min_lines            = 8      # ignore short blocks
 exclude              = ["target"]
-max_exact_duplicates = 0      # zero exact copy-paste
-max_near_duplicates  = 0      # zero near-duplicate groups at/above similarity_threshold
+max_exact_duplicates = 0      # zero unregistered exact duplicate groups
+max_near_duplicates  = 0      # zero unregistered near-duplicate groups
 
 [token]
 min_lines = 8                 # window-grain floor matches the documented min_lines

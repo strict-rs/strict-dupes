@@ -1,5 +1,5 @@
-//! Self-corpus consolidation gate: duplication sites consolidated at the
-//! source must never re-group on the workspace's own code.
+//! Self-corpus regression gates: consolidated source must not re-group,
+//! and registered fixture duplicates must remain detectable.
 //!
 //! The pinned command excludes `refactor/` and both CLI fixture trees so the
 //! corpus is the product code itself. The dupes-treesitter
@@ -10,6 +10,10 @@
 //! window") and the JSON member surface does not include the parent, so the
 //! fn-interior sites are pinned by line span against the current source; the
 //! top-level units (the override helpers, closures) are pinned by name.
+//!
+//! Allowance validation uses the full corpus and configured check defaults,
+//! including fixture projects. Stale-entry diagnostics fail the test without
+//! rewriting either fixtures or the registry.
 
 mod source_spans;
 
@@ -62,6 +66,17 @@ enum CorpusFailure {
   /// The host's source-line index cannot be represented in the report's numeric format.
   #[error(transparent)]
   Line(#[from] TryFromIntError),
+}
+
+/// Every registered fixture duplicate remains live under the repository's check configuration.
+#[test]
+fn fixture_allowances_remain_live() -> Result<(), CliTestFailure> {
+  let root = workspace_root()?;
+  run_for_path(cargo_dupes, &root, &["cleanup", "--dry-run"])?
+    .try_success()?
+    .try_stdout("No stale entries found.\n")
+    .map(drop)
+    .map_err(CliTestFailure::from)
 }
 
 #[test]

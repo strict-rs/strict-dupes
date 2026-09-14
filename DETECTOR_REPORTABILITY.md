@@ -207,13 +207,15 @@ Deferred analogue: Python attribute-name preservation (see Future Work).
 Two self-corpus classes are deliberately reported and must never be hidden by a global suppression rule. Registering them is per-project judgment, and the detector must keep reporting them on corpora that do not register them:
 
 - **The sentinel-returns group** (`return NormalizedNode::leaf(NodeKind::Opaque)` at the distinct exits of `normalize_ts_node`): its normalized shape is the protected two-child-return class (`return Some(x)`), so any rule hiding it would corrupt this contract, and sentinel returns at distinct pipeline exits cannot be consolidated into one site.
-- **The NodeMapping builder-chain parity groups** (`python_mapping()` in `dupes-python/src/lib.rs`, the test mappings in `dupes-treesitter/src/normalizer.rs`, `dupes-treesitter/tests/python_integration.rs`, and the `mapping.rs` builder test): each layer deliberately restates the chain so its expectations stay independent of the others.
+- **The NodeMapping builder-chain parity groups** (`python_mapping()` in `dupes-python/src/lib.rs`, the test mappings in `dupes-treesitter/src/normalizer.rs`, `dupes-treesitter/tests/python_integration.rs`, and the `mapping.rs` builder test): production owns the Python configuration; the tests supply typed fixtures for generic normalization, bridge integration, and builder behavior. Those configurations include deliberate differences, such as an unmapped operator used to exercise fallback behavior. Preserve independently specified expected values and scenario-specific inputs; repeated builder calls alone do not establish duplicated implementation ownership. The intentional fixture overlap belongs in this repository's validated allowance registry.
 
 ## Registry Framing
 
 The suppression rule registry (this document) is global detector policy. `.dupes-ignore.toml` is a per-project end-user facility: applied only after live groups exist, filtered from both populations, counted in stats (`Ignored (registry): N groups`), never shown, and never consulted during detection. The `ignore`/`ignored`/`cleanup` commands, drift-resilient entry matching, and the migration procedure are shipped product behavior, covered by fixture-local CLI tests.
 
-This repository does not carry a `.dupes-ignore.toml` registry. Every self-corpus finding above the configured analysis floors must be resolved at its owning abstraction; no production or test duplicate is admitted by fingerprint.
+This repository uses `.dupes-ignore.toml` for intentional fixture duplicates, including committed sample projects, embedded parser inputs, expected typed values, and `NodeMapping` test configurations. Preserve the fixtures and register their detected groups through `cargo dupes ignore <FINGERPRINT> --reason <REASON>`, which records member identities and locations. Each reason states the regression behavior or independent test scenario that requires the fixture. Keep all fixtures in detection; do not replace allowances with directory exclusions, broader suppression rules, threshold increases, or source rewrites made only to remove their findings. Findings outside the authorized fixture classes remain subject to the zero-duplicate gate and are resolved at their owning abstraction.
+
+Allowances are regression expectations: validate them against the full repository corpus with `cargo dupes cleanup --dry-run`, using the same configured dimensions and thresholds as `cargo dupes check`. A stale allowance must produce a diagnostic and be investigated as a changed fixture or detector contract; never delete or replace it automatically to make validation pass. The existing pre-ignore liveness sets include visible and suppressed findings, and `AnalysisResult::ignored_groups` retains the complete groups removed from the visible report. Allowance validation complements the fixture tests' expected membership, classification, and result assertions.
 
 ## Shapes Not To Suppress Globally
 
@@ -249,7 +251,7 @@ Before adding a new rule, require all of the following:
 - Pipeline semantics: `dupes-core/src/lib.rs` tests (partition policy, mixed-group visibility, chain coverage release-on-no-match, liveness across both populations, ignore interplay with suppressed groups).
 - Emission: `dupes-rust/src/parser.rs` tests prove every top-level unit and closure is emitted (no extraction gates), with dual chain emission linking branches to their owning chains.
 - End-to-end pins: `cargo-dupes/tests/detector_coverage/tests.rs` over the frozen `tests/fixtures/detector_coverage/` project — stats totals, per-dimension visible groups, named membership, and the exact `suppressed_by_rule` map; every numeric value is a measured actual.
-- Self-corpus gate: `cargo-dupes/tests/self_corpus/tests.rs` (`consolidated_sites_stay_consolidated`).
+- Self-corpus gates: `cargo-dupes/tests/self_corpus/tests.rs` checks that `consolidated_sites_stay_consolidated` and that `fixture_allowances_remain_live`; the latter runs the full-corpus `cleanup --dry-run` contract and rejects stale-entry diagnostics.
 
 ## Required Tests For Detector Changes
 
