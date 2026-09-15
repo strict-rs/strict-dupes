@@ -4,7 +4,7 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/earthlings-dev/cargo-dupes"
 authors = ["Matjaz Domen Pecan <matjaz.pecan@gmail.com>", "Takumi Shimada <hello@takumi.earth"]
-rust-version = "1.97"
+rust-version = "1.98"
 categories = ["development-tools"]
 publish = false
 license-file = "LICENSE"
@@ -44,7 +44,7 @@ resolver = "3"
 serde = { version = "1", features = ["derive"] }
 walkdir = "2"
 tempfile = "3"
-tree-sitter = "0.26"
+tree-sitter = "0.27"
 tree-sitter-python = "0.25"
 blake3 = "1"
 globset = "0.4"
@@ -60,7 +60,7 @@ dupes-python = { path = "dupes-python", version = "0.3.0" }
 dupes-rust = { path = "dupes-rust", version = "0.3.0" }
 
 # CLI
-bpaf = {  version = "0.10", features = [ "autocomplete", "batteries", "dull-color", "docgen" ], default-features = false, git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync"}
+bpaf = { version = "0.10", features = [ "autocomplete", "batteries", "dull-color", "docgen" ], default-features = false, git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync"}
 
 # Errors — derive Display / Error / From for the workspace's typed error enums.
 thiserror = { version = "2", git = "https://github.com/strict-rs/strict-thiserror.git", branch = "upgrade"}
@@ -102,14 +102,14 @@ anstyle = "1"
 # code"); stask is fully synchronous, so the await-holding hazard never applies.
 parking_lot = "0.12"
 
-tracing            = { version = "0.1.44", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
-tracing-subscriber = { version = "0.3.23", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
+tracing            = { version = "0.4.0", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
+tracing-subscriber = { version = "0.4.0", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
 
 template-core = { version = "0.3.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
 template-stask = { version = "0.3.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
-trybuild = {  version = "1", git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict"}
+trybuild = { version = "1", git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict"}
 snapbox = { version = "1.2", features = ["diff"], default-features = false }
-proptest = {  version = "2", features = ["std", "strict-test"], default-features = false, git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict"}
+proptest = { version = "2", features = ["std", "strict-test"], default-features = false, git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict"}
 toml_edit = "0.25"
 
 # ─── Release profile: small, fast, abort-on-panic ──────────────────────────
@@ -534,3 +534,12 @@ blanket_clippy_restriction_lints         = "allow"   # we intentionally enable r
 
 [patch.crates-io]
 "thiserror" = {  version = "2.1.0", git = "https://github.com/strict-rs/strict-thiserror.git", branch = "upgrade" }
+
+[patch."https://github.com/earthlings-dev/cargo-dupes.git"]
+cargo-dupes = { path = "cargo-dupes" }
+code-dupes = { path = "code-dupes" }
+dupes-cli-test-support = { path = "dupes-cli-test-support" }
+dupes-core = { path = "dupes-core" }
+dupes-python = { path = "dupes-python" }
+dupes-rust = { path = "dupes-rust" }
+dupes-treesitter = { path = "dupes-treesitter" }

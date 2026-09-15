@@ -81,7 +81,7 @@ pub fn normalize_ts_node(
 
   // 1. Kinds that normalize to Opaque: parse errors, configured skips (a safety net when called
   //    directly), and configured opaque kinds.
-  if kind == "ERROR" || kind == "MISSING" || mapping.skip_kinds.contains(kind) || mapping.opaque_kinds.contains(kind) {
+  if node.is_error() || node.is_missing() || mapping.skip_kinds.contains(kind) || mapping.opaque_kinds.contains(kind) {
     return Ok(NormalizedNode::leaf(NodeKind::Opaque));
   }
 
@@ -980,6 +980,36 @@ mod tests {
       normalized: Box::new(normalized),
       source: failure,
     })
+  }
+
+  /// Recovery-inserted identifiers stay opaque and do not allocate variable placeholders.
+  #[test]
+  fn missing_identifiers_do_not_become_placeholders() -> Result<(), NormalizerTestFailure> {
+    for (source, expected_missing, expected, next_index) in [
+      ("if :\n    pass\n", true, NormalizedNode::leaf(NodeKind::Opaque), 0),
+      ("if ready:\n    pass\n", false, variable(0), 1),
+    ] {
+      let tree = parse(source)?;
+      let identifier = first_stmt(&tree)?
+        .child_by_field_name("condition")
+        .ok_or_else(|| NormalizerTestFailure::MissingNode {
+          tree:      tree.clone(),
+          selection: "the conditional identifier",
+        })?;
+      let mut context = NormalizationContext::new();
+      let outcome = normalize_ts_node(&identifier, source.as_bytes(), &test_mapping(), &mut context);
+      check_attempt(tree.clone(), context, outcome, |observed, placeholders| {
+        ensure(
+          identifier.kind() == "identifier"
+            && identifier.is_missing() == expected_missing
+            && matches!(*observed, Ok(ref normalized) if *normalized == expected)
+            && placeholders.placeholder("after", PlaceholderKind::Variable) == next_index,
+          "native missing identifiers remain opaque without allocating placeholders, while real identifiers retain normal mapping",
+        )
+        .map(drop)
+      })?;
+    }
+    Ok(())
   }
 
   /// A block retains all statements under one shared placeholder context.

@@ -97,12 +97,9 @@ struct DefinitionCapture<'tree> {
   parameters: Option<tree_sitter::Node<'tree>>,
 }
 
-/// Locate one named capture while preserving its native tree lifetime.
-fn captured_node<'tree>(captures: &[tree_sitter::QueryCapture<'tree>], index: Option<u32>) -> Option<tree_sitter::Node<'tree>> {
-  captures
-    .iter()
-    .find(|capture| Some(capture.index) == index)
-    .map(|capture| capture.node)
+/// Select the first node for a configured capture while preserving its native tree lifetime.
+fn captured_node<'tree>(query_match: &tree_sitter::QueryMatch<'_, 'tree>, index: Option<u32>) -> Option<tree_sitter::Node<'tree>> {
+  query_match.nodes_for_capture_index(index?).next()
 }
 
 /// Extract code units using a compiled query and its language-specific mapping.
@@ -196,10 +193,10 @@ where
     let mut units = Vec::new();
 
     while let Some(query_match) = matches.next() {
-      let definition_node = captured_node(query_match.captures, definition_index);
-      let name_node = captured_node(query_match.captures, name_index);
-      let body_node = captured_node(query_match.captures, body_index);
-      let parameters_node = captured_node(query_match.captures, parameters_index);
+      let definition_node = captured_node(query_match, definition_index);
+      let name_node = captured_node(query_match, name_index);
+      let body_node = captured_node(query_match, body_index);
+      let parameters_node = captured_node(query_match, parameters_index);
 
       // We need at least a definition and body to create a code unit
       let Some(definition) = definition_node else { continue };

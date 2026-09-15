@@ -8,13 +8,20 @@
       "name": "rust-template-core",
       "source": {
         "source": "local",
-        "path": "./.agents/plugins/rust-template-core"
+        "path": ".agents/plugins/rust-template-core"
       },
       "policy": {
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"
       },
       "category": "Productivity"
+    },
+    {
+      "name": "strict-adoption",
+      "source": {
+        "source": "local",
+        "path": ".agents/plugins/strict-adoption"
+      }
     }
   ]
 }

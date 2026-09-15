@@ -1,11 +1,11 @@
 [package]
 name = "code-dupes"
 version.workspace = true
-edition.workspace = true
+edition = { workspace = true }
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-rust-version.workspace = true
+rust-version = { workspace = true }
 description = "A multi-language CLI tool that detects duplicate and near-duplicate code blocks using AST normalization"
 readme.workspace = true
 keywords = ["duplicates", "code-quality", "lint", "ast"]
@@ -25,7 +25,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 strict-test-support = { workspace = true }
 assert_cmd = { workspace = true }
-dupes-cli-test-support = { path = "../dupes-cli-test-support" }
+dupes-cli-test-support = { path = "../dupes-cli-test-support" , version = "0.3.0" }
 predicates = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
