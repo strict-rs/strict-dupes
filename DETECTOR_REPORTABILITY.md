@@ -42,12 +42,14 @@ Defined in `dupes-core/src/suppression.rs`. All rules are enabled by default. To
 | `sub.message-only-macro` | Unit | Suppress | sub_ast | branch that only writes a message (print/println/eprint/eprintln/write/writeln) |
 | `sub.value-plumbing` | Unit | Suppress | sub_ast | call or method chain that only shuttles simple values, including single-call dispatch returns |
 | `sub.covered-by-chain` | Unit | Suppress | sub_ast | if-branch whose owning if-chain grouped as a whole |
+| `token.comment-only` | Unit | Suppress | token_normalized, token_raw | windows containing only complete `//` comment lines outside quoted literals |
 | `token.import-scaffold` | Unit | Suppress | token_normalized, token_raw | import/module scaffolding windows |
 | `token.chain-tail` | Unit | Suppress | token_normalized, token_raw | detached fluent-chain fragments |
 | `token.signature-prefix` | Unit | Suppress | token_normalized, token_raw | documentation/attribute prefixes before a function and windows dominated by documented signature scaffolding |
 | `token.declaration-scaffold` | Unit | Suppress | token_normalized, token_raw | type field scaffolding and incomplete enum introductions |
 | `token.match-table-prefix` | Unit | Suppress | token_normalized, token_raw | windows cut part-way through simple match-arm tables |
 | `token.low-signal` | Unit | Suppress | token_normalized, token_raw | the meaningful/unique/behavior scoring fall-through |
+| `line.comment-only` | Unit | Suppress | line | windows containing only complete `//` comment lines outside quoted literals |
 | `line.import-scaffold` | Unit | Suppress | line | import/module scaffolding windows |
 | `line.chain-tail` | Unit | Suppress | line | detached fluent-chain fragments |
 | `line.declaration-signature-prefix` | Unit | Suppress | line | declaration-side `fn` signature prefixes (terminating `;`) |
@@ -70,7 +72,7 @@ Admission rules are named carve-outs that turn an otherwise-suppressed window in
 
 Blank lines are hard concept boundaries for line windows, with one structural exception: adjacent blank-separated segments coalesce when the gap is exactly one blank line, both sides are declaration-stanza segments, and the first segment has not closed its declaration with a lone `}`. A declaration-stanza segment has the structural anatomy of a declaration block, evaluated in order: a comment/attribute prelude, at most one type-header row (`struct X {` and friends), uniform stanza rows, and at most one trailing lone `}`. Prelude-only segments (comment banners, bare attributes) and lone braces never qualify; `use`/`mod` rows and brace-only lines are never stanza rows. Documentation and attributes remain stanza rows when their text contains words such as `for`, `return`, or `fn`; executable rows still prevent coalescing.
 
-Windows over a coalesced block are admitted when every line is stanza-shaped (doc comment, attribute, or structured `key: value` row), at least two lines are structured rows, and the window carries at least four unique terms. Windows containing the type header or the closing brace are not stanza-shaped and fall through to base classification, so coalescing adjacent blocks can never stitch windows across two types.
+Windows over a coalesced block are admitted when every line is stanza-shaped (doc comment, attribute, or structured `key: value` row), at least two lines are structured rows, and the window carries at least four unique terms. Comment-only classification takes precedence: URL colons inside a license header cannot establish declaration fields. Windows containing the type header or the closing brace are not stanza-shaped and fall through to base classification, so coalescing adjacent blocks can never stitch windows across two types.
 
 This is the recovery channel for cross-file clap-style CLI structs and blank-spread derive field tables — real copy-paste even though no line carries behavior.
 
@@ -84,11 +86,19 @@ Line normalization strips `/* ... */` spans with comment state tracked across li
 
 ## Token Lexing Profiles
 
+### Comment-Only Classification
+
+`token.comment-only` and `line.comment-only` classify windows whose entire source span consists of complete `//` comment lines. This classification precedes syntax-shape admissions and scoring, so license prose containing URLs or words such as `for`, `if`, and `return` cannot become executable duplication. A separate source-context view traverses quoted literals, Rust raw-string delimiters, character literals, lifetimes, and nested block comments; comment markers inside literal contents remain content. A line containing executable code before a trailing comment does not qualify. Windows spanning comments and executable lines remain subject to the existing code classifiers.
+
+Classification leaves all extracted tokens, line bodies, source spans, and fingerprints intact, including token windows cut at the first slash of a comment marker. Disabling either rule exposes those same candidates, and `--show-suppressed` retains classified duplicate groups. Block-comment extraction and other language comment syntaxes retain their existing behavior. These rules do not rewrite tokenization or exclude files by license text or path.
+
+### Quote Handling
+
 Token windows are anchored: each blank-line-separated segment yields exactly one window (the shortest prefix meeting the token and line minimums), a deterministic function of the segment content alone, so identical duplicated segments always produce identical windows and edits elsewhere in the file cannot re-cut them.
 
 That stability holds only if segmentation itself is stable, which makes quote lexing load-bearing. The tokenizer selects a quote profile by file extension: the default pairs `"`, `'`, and `` ` `` naively; **Rust sources lex `'` as a quoted token only for char-literal shapes that close on the same line (`'X'`, `'\n'`, `'\u{10FFFF}'`) and treat every other tick — lifetimes, loop labels, prose apostrophes in comments — as punctuation.** Without the Rust profile, one unpaired apostrophe opens a phantom multi-line "string" running to the next apostrophe anywhere in the file, bridging blank lines and silently removing whole spans — easily an entire test module — from token segmentation, with the blindness re-dealt by every edit that changes tick parity. Pinned by `lifetime_ticks_do_not_blind_token_windows` and `comment_apostrophes_do_not_bridge_token_segments`.
 
-Known naive remainders, accepted and documented rather than silently relied on: Rust raw strings (`r#"…"#`) pair at the first interior `"`; Python triple quotes lex as an empty string plus a quote-to-quote span (approximately right for apostrophe-free docstrings); comments are tokenized like code, so a doc-comment-led window can pair on comment shape alone (normalized comment words are uniform `IDENT`s).
+Known naive remainders, accepted and documented rather than silently relied on: Rust raw strings (`r#"…"#`) pair at the first interior `"`; Python triple quotes lex as an empty string plus a quote-to-quote span (approximately right for apostrophe-free docstrings). Comments remain in token identities, so mixed comment/code windows can still pair on normalized comment vocabulary; wholly comment-only windows receive the dedicated classification above.
 
 ## Valid Suppressions
 
@@ -187,6 +197,8 @@ When consecutive `if` statements form a chain, the chain is emitted as one unit 
 ### Token/Line Scaffolding (`*.import-scaffold`, `*.chain-tail`, `*.signature-prefix`, `token.declaration-scaffold`, `token.match-table-prefix`, `*.low-signal`)
 
 These shapes carry over the pre-registry detector's semantics: suppress import/module blocks, detached chain tails, doc/attr signature prefixes (line windows keep implementation-side prefixes whose lookahead opens a `{` body and suppress declaration-side prefixes terminating in `;`), type-declaration scaffolding token windows, cut match-table prefixes, and the scoring fall-throughs. Do not suppress implementation-side signature parity, complete callback-bearing chains in token windows, complete match tables, or windows with real body content.
+
+For Rust, `token.import-scaffold` and `line.import-scaffold` use complete source declarations to classify attributed and visibility-qualified imports, grouped paths, aliases, globs, external crate imports, external modules, and the boundaries of balanced inline modules. Attribute assignments and glob punctuation have declaration meaning inside these forms. A module's attributes, visibility, name, and braces are scaffolding; its body tokens retain independent classification. Every code token on a classified source line must belong to an import or a validated module boundary; windows reaching calls, initializers, implementation bodies, or unbalanced declarations remain eligible. Quoted continuations, attribute input, and macro input cannot establish imports. Classification changes only tags: window bodies, boundaries, fingerprints, rule disabling, and pre-ignore liveness remain intact. Other language profiles retain their existing import classification.
 
 `token.declaration-scaffold` recognizes private fields, `pub` fields, and restricted visibility such as `pub(crate)` or `pub(in crate::module)`. Its classification view omits `//` line-comment contents, including trailing field comments, so documentation words such as `for` or `fn` neither establish a type header nor count as executable behavior. Declaration recognition precedes signature-prefix classification so comment text cannot redirect a field table to the function-signature rule. Original comment tokens, window boundaries, and fingerprints remain unchanged in both token dimensions; disabling the rule exposes the same candidates. Executable code surrounding a declaration, computed field types, and incomplete visibility prefixes remain eligible. This refinement does not change block-comment or quoted-token lexing.
 
@@ -288,4 +300,4 @@ Use a visible self-corpus report (`--sub-function --show-suppressed -v` with the
 - Near-duplicate extension for the line/token_raw dimensions (deferred, no demonstrated loss; smallest slice if pursued: near-matching over merged line concept groups).
 - Python attribute-name preservation, the analogue of method-name preservation (deferred; Python emits `Call` + `FieldAccess`, so the false-positive class does not currently reproduce there).
 - Python quote profile: triple-quoted strings and a same-line rule for `'…'` literals (deferred; the naive pairing is approximately right for common Python and changing it churns Python window fingerprints without a demonstrated loss).
-- Comment-aware token windows: skipping or down-weighting comment tokens would stop doc-comment-led windows from pairing on comment shape.
+- Mixed comment/code token windows: refine classification without changing retained token identities or hiding duplicated executable content.

@@ -4,6 +4,9 @@
 //! token windows. Structural line windows support stanza coalescing; both grains
 //! retain their suppression and admission tags.
 
+mod comments;
+mod imports;
+
 use std::iter::Peekable;
 use std::path::Path;
 use std::str::Chars;
@@ -38,13 +41,45 @@ pub struct TextUnits {
 )]
 pub fn extract(path: &Path, source: &str, config: &Config) -> TextUnits {
   let tokens = tokenize(source, QuoteProfile::for_path(path));
-  let normalized_tokens = token_windows_if_enabled(config, path, &tokens, TokenMode::Normalized);
-  let raw_tokens = token_windows_if_enabled(config, path, &tokens, TokenMode::Raw);
-  let lines = if config.dimension_enabled(DetectionDimension::Line) {
+  let mut normalized_tokens = token_windows_if_enabled(config, path, &tokens, TokenMode::Normalized);
+  let mut raw_tokens = token_windows_if_enabled(config, path, &tokens, TokenMode::Raw);
+  let mut lines = if config.dimension_enabled(DetectionDimension::Line) {
     line_windows(path, source, config.line_min_lines, &config.suppression)
   } else {
     Vec::new()
   };
+  // Lexical comment classification takes precedence over shape scoring, which
+  // can mistake prose keywords and URL colons for code or declaration fields.
+  // Keep the original candidates, token bodies, spans, and fingerprints intact.
+  let profile = QuoteProfile::for_path(path);
+  let source_lines = comments::classify(source, profile);
+  let import_lines = profile.rust_ticks.then(|| imports::lines(&tokens));
+  for (units, comment_rule, import_rule) in [
+    (&mut normalized_tokens, RuleId::TokenCommentOnly, RuleId::TokenImportScaffold),
+    (&mut raw_tokens, RuleId::TokenCommentOnly, RuleId::TokenImportScaffold),
+    (&mut lines, RuleId::LineCommentOnly, RuleId::LineImportScaffold),
+  ] {
+    for unit in units {
+      if (unit.line_start..=unit.line_end).all(|line| source_lines.comments.contains(&line)) {
+        unit.suppressed = config.suppression.allow(comment_rule);
+        continue;
+      }
+      let Some(ref imports) = import_lines else {
+        continue;
+      };
+      let range = unit.line_start..=unit.line_end;
+      let only_imports = range.clone().any(|line| imports.contains(&line))
+        && range
+          .clone()
+          .all(|line| imports.contains(&line) || source_lines.comments.contains(&line))
+        && range.clone().all(|line| !source_lines.quoted_continuations.contains(&line));
+      unit.suppressed = if only_imports {
+        config.suppression.allow(import_rule)
+      } else {
+        unit.suppressed.filter(|&rule| rule != import_rule)
+      };
+    }
+  }
   TextUnits {
     normalized_tokens,
     raw_tokens,
@@ -1545,6 +1580,18 @@ pub enum OperationFailure {
 }
 ";
 
+  /// License-shaped prose contains URL colons and keywords that can resemble code or fields.
+  const COMMENT_HEADER: &str = concat!(
+    "// Copyright: example contributors\n",
+    "// Licensed for use with this project.\n",
+    "// License: https://example.test/license\n",
+    "// You may obtain a copy for your records.\n",
+    "// Distributed without warranties or guarantees.\n",
+    "// See the license for conditions and limitations.\n",
+    "// Keep this notice in source distributions.\n",
+    "// Preserve the attribution for every recipient.\n",
+  );
+
   /// Source, extraction configuration, and complete windows retained when a behavioral expectation
   /// fails.
   #[derive(Debug, thiserror::Error)]
@@ -1973,6 +2020,145 @@ fn beta(items: &[u32]) -> Vec<u32> {
     Ok(())
   }
 
+  /// Complete retained populations when a comment-only rule is enabled or disabled.
+  type CommentPolicyObservation = (Config, TextUnits, Config, TextUnits, Vec<SuppressionWarning>);
+
+  #[test]
+  fn comment_only_rules_preserve_candidate_identity_and_can_be_disabled() -> Result<(), Box<PredicateFailure<CommentPolicyObservation>>> {
+    let config = Config {
+      token_min_tokens: 1,
+      token_min_lines: 8,
+      line_min_lines: 8,
+      ..Config::default()
+    };
+    let (policy, warnings) = SuppressionPolicy::resolve(&["token.comment-only".to_owned(), "line.comment-only".to_owned()], &[]);
+    let disabled_config = Config {
+      suppression: policy,
+      ..config.clone()
+    };
+    let tagged_windows = extract(Path::new("license.rs"), COMMENT_HEADER, &config);
+    let visible_windows = extract(Path::new("license.rs"), COMMENT_HEADER, &disabled_config);
+    ensure_that(
+      (config, tagged_windows, disabled_config, visible_windows, warnings),
+      "comment classification changes only the tags, even when a token window ends at the first slash",
+      |observed| {
+        let tagged = &observed.1;
+        let visible = &observed.3;
+        let mut without_tags = tagged.clone();
+        for unit in without_tags
+          .normalized_tokens
+          .iter_mut()
+          .chain(&mut without_tags.raw_tokens)
+          .chain(&mut without_tags.lines)
+        {
+          unit.suppressed = None;
+        }
+        observed.4.is_empty()
+          && (tagged.normalized_tokens.len(), tagged.raw_tokens.len(), tagged.lines.len()) == (1, 1, 1)
+          && tagged
+            .normalized_tokens
+            .iter()
+            .chain(&tagged.raw_tokens)
+            .all(|unit| unit.suppressed == Some(RuleId::TokenCommentOnly))
+          && tagged.lines.iter().all(|unit| unit.suppressed == Some(RuleId::LineCommentOnly))
+          && without_tags == *visible
+      },
+    )
+    .map_err(Box::new)
+    .map(drop)
+  }
+
+  /// Complete source and windows for quoted-content and executable counterexamples.
+  type CommentCounterexamples = (Config, Vec<(String, TextUnits)>);
+
+  #[test]
+  fn comment_only_rules_preserve_quoted_content_and_executable_windows() -> Result<(), Box<PredicateFailure<CommentCounterexamples>>> {
+    let config = Config {
+      token_min_tokens: 1,
+      token_min_lines: 8,
+      line_min_lines: 8,
+      ..Config::default()
+    };
+    let cases = [
+      format!("let text = \"\n{COMMENT_HEADER}\";"),
+      format!("let text = r##\"an interior quote: \"\n{COMMENT_HEADER}\"##;"),
+      format!("{COMMENT_HEADER}let result = source + offset;\nreturn result * scale;"),
+    ];
+    let observations = cases
+      .into_iter()
+      .map(|source| {
+        let units = extract(Path::new("content.rs"), &source, &config);
+        (source, units)
+      })
+      .collect();
+    ensure_that(
+      (config, observations),
+      "literal contents and code remain visible beneath or inside comment-shaped text",
+      |observed: &CommentCounterexamples| {
+        observed.1.iter().all(|case| {
+          let units = &case.1;
+          units.lines.iter().any(|unit| unit.suppressed.is_none())
+            && units
+              .lines
+              .iter()
+              .filter(|unit| unit.line_end > 8)
+              .all(|unit| unit.suppressed != Some(RuleId::LineCommentOnly))
+        })
+      },
+    )
+    .map_err(Box::new)
+    .map(drop)
+  }
+
+  #[test]
+  fn executable_segments_after_license_headers_retain_duplicate_fingerprints() -> Result<(), Box<PredicateFailure<CommentCounterexamples>>>
+  {
+    let config = Config {
+      token_min_tokens: 12,
+      token_min_lines: 3,
+      line_min_lines: 3,
+      ..Config::default()
+    };
+    let sources = [COMPUTATION_BLOCK.to_owned(), format!("{COMMENT_HEADER}\n{COMPUTATION_BLOCK}")];
+    let observations = sources
+      .into_iter()
+      .map(|source| {
+        let units = extract(Path::new("computation.rs"), &source, &config);
+        (source, units)
+      })
+      .collect();
+    ensure_that(
+      (config, observations),
+      "headers do not hide the executable segment or alter its duplicate identity",
+      |observed: &CommentCounterexamples| {
+        let &[(_, ref original), (_, ref prefixed)] = observed.1.as_slice() else {
+          return false;
+        };
+        let offset = COMMENT_HEADER.lines().count().saturating_add(1);
+        preserves_visible_windows(&original.normalized_tokens, &prefixed.normalized_tokens, offset)
+          && preserves_visible_windows(&original.raw_tokens, &prefixed.raw_tokens, offset)
+          && preserves_visible_windows(&original.lines, &prefixed.lines, offset)
+      },
+    )
+    .map_err(Box::new)
+    .map(drop)
+  }
+
+  /// Require each visible executable window to retain its body, fingerprint, and shifted source
+  /// span.
+  fn preserves_visible_windows(before: &[CodeUnit], after: &[CodeUnit], offset: usize) -> bool {
+    before.iter().any(|unit| unit.suppressed.is_none())
+      && before.iter().filter(|unit| unit.suppressed.is_none()).all(|unit| {
+        after.iter().any(|candidate| {
+          candidate.suppressed.is_none()
+            && candidate.fingerprint == unit.fingerprint
+            && candidate.body == unit.body
+            && candidate.line_start == unit.line_start.saturating_add(offset)
+            && candidate.line_end == unit.line_end.saturating_add(offset)
+        })
+      })
+  }
+
   /// Raw vocabulary can carry signal even when identifier normalization removes its distinctions.
   #[test]
   fn raw_token_signal_requires_five_distinct_meaningful_values() -> WindowTestResult<Option<RuleId>> {
@@ -2120,7 +2306,7 @@ fn beta(items: &[u32]) -> Vec<u32> {
   #[test]
   fn introductory_windows_stop_before_second_enum_variants() -> WindowTestResult<Option<RuleId>> {
     for (document, min_lines, expected) in [
-      (DOCUMENTED_FUNCTION, 3, Some(RuleId::TokenSignaturePrefix)),
+      (DOCUMENTED_FUNCTION, 3, Some(RuleId::TokenCommentOnly)),
       (DOCUMENTED_FUNCTION, 8, Some(RuleId::TokenSignaturePrefix)),
       (DOCUMENTED_FUNCTION, 10, Some(RuleId::TokenSignaturePrefix)),
       (DOCUMENTED_ENUM, 4, Some(RuleId::TokenDeclarationScaffold)),
@@ -2250,18 +2436,30 @@ fn beta(items: &[u32]) -> Vec<u32> {
   /// Only an established declaration may classify its preceding documentation or attributes.
   #[test]
   fn introductory_classification_requires_balanced_declaration_context() -> WindowTestResult<Option<RuleId>> {
-    for document in [
-      "/// A fn is mentioned but no declaration follows.\n/// Values for callers remain documented.\n/// Preserve the full report.",
-      "/// Attribute metadata must remain complete.\n#[annotate([value)]\npub fn execute() {\n    consume(value);\n}",
-      "/// An enum introduction requires its complete containing declaration.\nenum State {\n    Native(Error),\n    /// The remainder \
-       has not been observed.",
-      "/// Nested delimiters must agree before classifying a variant.\nenum State {\n    Native([Error)),\n    Other,\n}",
+    for (document, expected) in [
+      (
+        "/// A fn is mentioned but no declaration follows.\n/// Values for callers remain documented.\n/// Preserve the full report.",
+        Some(RuleId::TokenCommentOnly),
+      ),
+      (
+        "/// Attribute metadata must remain complete.\n#[annotate([value)]\npub fn execute() {\n    consume(value);\n}",
+        None,
+      ),
+      (
+        "/// An enum introduction requires its complete containing declaration.\nenum State {\n    Native(Error),\n    /// The remainder \
+         has not been observed.",
+        None,
+      ),
+      (
+        "/// Nested delimiters must agree before classifying a variant.\nenum State {\n    Native([Error)),\n    Other,\n}",
+        None,
+      ),
     ] {
       let config = Config {
         token_min_lines: 3,
         ..declaration_window_config(document, SuppressionPolicy::default())
       };
-      check_windows("incomplete.rs", document, config, None, |units, &rule| {
+      check_windows("incomplete.rs", document, config, expected, |units, &rule| {
         ensure_window_classification(&units.normalized_tokens, rule)?;
         ensure_window_classification(&units.raw_tokens, rule)
       })?;

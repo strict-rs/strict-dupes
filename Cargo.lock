@@ -119,7 +119,7 @@ dependencies = [
 [[package]]
 name = "bpaf"
 version = "0.10.0"
-source = "git+https://github.com/strict-rs/strict-bpaf.git?branch=sync#1fb155397b185ce5e5159ab97805b73373c5eb06"
+source = "git+https://github.com/strict-rs/strict-bpaf.git?branch=async#9f224aa43e6f2b63baa2f8b001c515809281da70"
 
 [[package]]
 name = "bstr"
@@ -152,7 +152,7 @@ dependencies = [
  "proc-macro2",
  "serde_json",
  "strict-test-support",
- "syn 3.0.5",
+ "syn 3.0.6",
  "tempfile",
  "thiserror",
 ]
@@ -165,9 +165,9 @@ checksum = "7b02b629252fe8ef6460461409564e2c21d0c8e77e0944f3d189ff06c4e932ad"
 
 [[package]]
 name = "cc"
-version = "1.4.6"
+version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3eb0f42d6c360dc3f8a821f6bf2fdea7f72bfd36b3076eb0e6d1e9e0752fff4"
+checksum = "54413ede23c2daf518f35156dfde027feb2374004d63bd497f983c8db9c0e313"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -175,14 +175,14 @@ dependencies = [
 
 [[package]]
 name = "cfg-if"
-version = "1.0.4"
+version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "chrono"
 version = "0.4.45"
-source = "git+https://github.com/strict-rs/strict-chrono.git?branch=upgrade#992592b02cc849d4d7b2632735d842c8a3e7f890"
+source = "git+https://github.com/strict-rs/strict-chrono.git?branch=upgrade#d8b60cc1c1fd3f5dd7b1c415c7ba8774cd520d73"
 dependencies = [
  "iana-time-zone",
  "num-traits",
@@ -220,7 +220,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -367,7 +367,7 @@ dependencies = [
  "proc-macro2",
  "serde_json",
  "strict-test-support",
- "syn 3.0.5",
+ "syn 3.0.6",
  "tempfile",
  "thiserror",
 ]
@@ -420,9 +420,9 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.12"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
+checksum = "ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b"
 
 [[package]]
 name = "float-cmp"
@@ -619,7 +619,7 @@ dependencies = [
  "quote",
  "regex-automata",
  "regex-syntax",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -808,7 +808,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rowan"
 version = "0.17.0"
-source = "git+https://github.com/strict-rs/strict-rowan.git?branch=strict#4b1bf90a3640d6bb6ef5c9503f24ad09a113fe9e"
+source = "git+https://github.com/strict-rs/strict-rowan.git?branch=strict#0a54b033856acc1594afb9eb64baad04dd5f1664"
 dependencies = [
  "countme",
  "ecow",
@@ -827,9 +827,9 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
 dependencies = [
  "bitflags",
  "errno",
@@ -886,7 +886,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -948,7 +948,7 @@ checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
 [[package]]
 name = "strict-standard"
 version = "0.1.0"
-source = "git+https://github.com/earthlings-dev/strict-standard-rs.git?branch=main#a6117471e4564d1b6b6f04cc9339880d9cfedfc7"
+source = "git+https://github.com/earthlings-dev/strict-standard-rs.git?branch=main#69d5d33b9d8ad8122bde8d5dce419190895ce493"
 dependencies = [
  "chrono",
  "rustix",
@@ -960,7 +960,7 @@ dependencies = [
 [[package]]
 name = "strict-test-support"
 version = "0.1.1"
-source = "git+https://github.com/earthlings-dev/strict-test-support-rs.git?branch=main#c4619c83b861ad8878a2a5a70e6adbb6513ac180"
+source = "git+https://github.com/earthlings-dev/strict-test-support-rs.git?branch=main#c929ece9357787c6f3d0d112799742b5c615168a"
 dependencies = [
  "thiserror",
 ]
@@ -968,7 +968,7 @@ dependencies = [
 [[package]]
 name = "strict-windows"
 version = "0.1.0"
-source = "git+https://github.com/earthlings-dev/strict-standard-rs.git?branch=main#a6117471e4564d1b6b6f04cc9339880d9cfedfc7"
+source = "git+https://github.com/earthlings-dev/strict-standard-rs.git?branch=main#69d5d33b9d8ad8122bde8d5dce419190895ce493"
 dependencies = [
  "thiserror",
  "windows-sys 0.100.0",
@@ -993,9 +993,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.5"
+version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1005,7 +1005,7 @@ dependencies = [
 [[package]]
 name = "taplo"
 version = "0.16.0"
-source = "git+https://github.com/strict-rs/strict-taplo.git?branch=strict#637d3c8638a140502e760eb52e4fa6fce69b4a2e"
+source = "git+https://github.com/strict-rs/strict-taplo.git?branch=strict#4c0a926466e6186cf48fbd45ebbab87fa1b4699c"
 dependencies = [
  "globset",
  "itertools",
@@ -1033,7 +1033,7 @@ dependencies = [
 [[package]]
 name = "template-core"
 version = "0.3.2"
-source = "git+https://github.com/earthlings-dev/template-rs.git?branch=main#c7dd98f119f48308b18bcc3b22c6aa1b14a07f77"
+source = "git+https://github.com/earthlings-dev/template-rs.git?branch=main#cbd3b4a163d464183f817e4f998b81208f762061"
 dependencies = [
  "anstyle",
  "bpaf",
@@ -1051,7 +1051,7 @@ dependencies = [
 [[package]]
 name = "template-stask"
 version = "0.3.2"
-source = "git+https://github.com/earthlings-dev/template-rs.git?branch=main#c7dd98f119f48308b18bcc3b22c6aa1b14a07f77"
+source = "git+https://github.com/earthlings-dev/template-rs.git?branch=main#cbd3b4a163d464183f817e4f998b81208f762061"
 dependencies = [
  "template-core",
  "thiserror",
@@ -1072,7 +1072,7 @@ checksum = "f18aa187839b2bdb1ad2fa35ead8c4c2976b64e4363c386d45ac0f7ee85c9233"
 [[package]]
 name = "thiserror"
 version = "2.1.0"
-source = "git+https://github.com/strict-rs/strict-thiserror.git?branch=upgrade#aaa9a863b1d966d13f6ebd4d42e78c91d75fe7e6"
+source = "git+https://github.com/strict-rs/strict-thiserror.git?branch=strict#9e358aae9f19694539f77b8228cdf77a35e7cd9e"
 dependencies = [
  "thiserror-impl",
 ]
@@ -1080,11 +1080,11 @@ dependencies = [
 [[package]]
 name = "thiserror-impl"
 version = "2.1.0"
-source = "git+https://github.com/strict-rs/strict-thiserror.git?branch=upgrade#aaa9a863b1d966d13f6ebd4d42e78c91d75fe7e6"
+source = "git+https://github.com/strict-rs/strict-thiserror.git?branch=strict#9e358aae9f19694539f77b8228cdf77a35e7cd9e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1199,9 +1199,9 @@ checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 
 [[package]]
 name = "unicode-ident"
-version = "1.0.24"
+version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
 name = "utf8parse"
@@ -1260,7 +1260,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
  "wasm-bindgen-shared",
 ]
 
@@ -1326,7 +1326,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 [[package]]
 name = "windows-link"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs.git?branch=master#f1aad530e0d560fee4bd1ae87fc0cd8433ce822a"
+source = "git+https://github.com/microsoft/windows-rs.git?branch=master#a38689a8b29520db84e3d398e4389d48f18e6346"
 
 [[package]]
 name = "windows-result"
@@ -1358,7 +1358,7 @@ dependencies = [
 [[package]]
 name = "windows-sys"
 version = "0.100.0"
-source = "git+https://github.com/microsoft/windows-rs.git?branch=master#f1aad530e0d560fee4bd1ae87fc0cd8433ce822a"
+source = "git+https://github.com/microsoft/windows-rs.git?branch=master#a38689a8b29520db84e3d398e4389d48f18e6346"
 dependencies = [
  "windows-link 0.100.0",
 ]

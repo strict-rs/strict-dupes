@@ -60,10 +60,10 @@ dupes-python = { path = "dupes-python", version = "0.3.0" }
 dupes-rust = { path = "dupes-rust", version = "0.3.0" }
 
 # CLI
-bpaf = { version = "0.10", features = [ "autocomplete", "batteries", "dull-color", "docgen" ], default-features = false, git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync"}
+bpaf = { version = "0.10", features = [ "autocomplete", "batteries", "dull-color", "docgen" ], default-features = false, git = "https://github.com/strict-rs/strict-bpaf.git", branch = "async"}
 
 # Errors — derive Display / Error / From for the workspace's typed error enums.
-thiserror = { version = "2", git = "https://github.com/strict-rs/strict-thiserror.git", branch = "upgrade"}
+thiserror = { version = "2", git = "https://github.com/strict-rs/strict-thiserror.git", branch = "strict"}
 
 # Panic-free test vocabulary, consumed as an external git crate, tracking the
 # crate's main branch. The version requirement (kept in sync with the crate's own
@@ -533,7 +533,7 @@ blanket_clippy_restriction_lints         = "allow"   # we intentionally enable r
 
 
 [patch.crates-io]
-"thiserror" = {  version = "2.1.0", git = "https://github.com/strict-rs/strict-thiserror.git", branch = "upgrade" }
+"thiserror" = {  version = "2.1.0", git = "https://github.com/strict-rs/strict-thiserror.git", branch = "strict" }
 
 [patch."https://github.com/earthlings-dev/cargo-dupes.git"]
 cargo-dupes = { path = "cargo-dupes" }

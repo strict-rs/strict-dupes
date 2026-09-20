@@ -69,7 +69,7 @@ fn stats_pins() -> Result<(), CliTestFailure> {
     ensure_eq(json_count(stats, "sub_exact_groups")?, 2, "sub_exact_groups").map(drop)?;
     ensure_eq(
       json_count(stats, "token_normalized_exact_groups")?,
-      2,
+      1,
       "token_normalized_exact_groups",
     )
     .map(drop)?;
@@ -79,7 +79,7 @@ fn stats_pins() -> Result<(), CliTestFailure> {
       "token_normalized_near_groups",
     )
     .map(drop)?;
-    ensure_eq(json_count(stats, "token_raw_exact_groups")?, 1, "token_raw_exact_groups").map(drop)?;
+    ensure(stats.get("token_raw_exact_groups").is_none(), "no visible raw-token exact groups").map(drop)?;
     // The Dense pair, the Renderer trio, the CliA/CliB stanza windows, and
     // at least one SpreadA/SpreadB table group admitted by the structural
     // stanza coalescer; the builder-run pair sits under group.covered-by-ast
@@ -94,8 +94,10 @@ fn stats_pins() -> Result<(), CliTestFailure> {
     // eight declaration-scaffold tags without changing visible groups.
     // Six low-signal windows that crossed completed declaration boundaries
     // are no longer extracted.
-    ensure_eq(json_count(stats, "suppressed_unit_count")?, 102, "suppressed_unit_count").map(drop)?;
-    ensure_eq(json_count(stats, "suppressed_group_count")?, 27, "suppressed_group_count").map(drop)?;
+    // Complete import blocks classify in both token modes as well as lines:
+    // four token windows and their two groups remain available as suppressed.
+    ensure_eq(json_count(stats, "suppressed_unit_count")?, 106, "suppressed_unit_count").map(drop)?;
+    ensure_eq(json_count(stats, "suppressed_group_count")?, 29, "suppressed_group_count").map(drop)?;
     Ok(())
   })
 }
@@ -135,6 +137,7 @@ fn suppressed_rule_attribution_pins() -> Result<(), CliTestFailure> {
       ("sub.message-only-macro", 2),
       ("sub.value-plumbing", 10),
       ("token.declaration-scaffold", 8),
+      ("token.import-scaffold", 4),
       ("token.match-table-prefix", 2),
       // Includes the four chain_x/chain_y fn-head windows that the Rust
       // quote profile keeps segmented (both token modes, both files).
@@ -191,7 +194,7 @@ fn show_suppressed_exposes_tagged_groups() -> Result<(), CliTestFailure> {
 fn text_report_renders_suppression_surface() -> Result<(), CliTestFailure> {
   assert_stdout_contains(
     run_for_fixture(cargo_dupes, FIXTURE, &["--sub-function", "stats"])?.try_success()?,
-    &["Suppressed: 102 units, 27 groups (--show-suppressed to list)"],
+    &["Suppressed: 106 units, 29 groups (--show-suppressed to list)"],
   )?
   .try_stdout(contains("Suppressed by rule:").not())
   .map(drop)?;
@@ -548,10 +551,9 @@ fn impl_signature_parity_stays_visible() -> Result<(), CliTestFailure> {
 
 #[test]
 fn import_scaffolding_line_windows_stay_invisible() -> Result<(), CliTestFailure> {
-  // The shared decl_a/decl_b header + import block surfaces as token
-  // windows today (pinned via stats), but the line dimension keeps
-  // rejecting import scaffolds: no line window may start in the import
-  // block region (lines 1-7).
+  // The shared decl_a/decl_b header and import block is scaffolding in
+  // both token modes (pinned via stats) and lines. No visible line window
+  // may start in the import block region (lines 1-7).
   check_json(fixture_json(cargo_dupes, FIXTURE, REPORT_ARGS)?, |report| {
     for suffix in ["decl_a.rs", "decl_b.rs"] {
       for (start, _) in line_member_spans(report, suffix)? {

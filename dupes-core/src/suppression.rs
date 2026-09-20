@@ -38,6 +38,8 @@ pub enum RuleId {
   SubValuePlumbing,
   /// `sub.covered-by-chain`: if-branch whose whole chain grouped.
   SubCoveredByChain,
+  /// `token.comment-only`: window containing only complete line comments.
+  TokenCommentOnly,
   /// `token.import-scaffold`: window over import/module scaffolding.
   TokenImportScaffold,
   /// `token.chain-tail`: window dominated by detached chain tails.
@@ -50,6 +52,8 @@ pub enum RuleId {
   TokenMatchTablePrefix,
   /// `token.low-signal`: window without enough meaningful content.
   TokenLowSignal,
+  /// `line.comment-only`: window containing only complete line comments.
+  LineCommentOnly,
   /// `line.import-scaffold`: window over import/module scaffolding.
   LineImportScaffold,
   /// `line.chain-tail`: window dominated by detached chain tails.
@@ -183,6 +187,13 @@ pub static RULES: &[SuppressionRule] = &[
     description: "if-branch whose owning if-chain grouped as a whole",
   },
   SuppressionRule {
+    id:          RuleId::TokenCommentOnly,
+    level:       RuleLevel::Unit,
+    action:      RuleAction::Suppress,
+    dimensions:  TOKEN_DIMENSIONS,
+    description: "token window containing only complete line comments outside quoted literals",
+  },
+  SuppressionRule {
     id:          RuleId::TokenImportScaffold,
     level:       RuleLevel::Unit,
     action:      RuleAction::Suppress,
@@ -223,6 +234,13 @@ pub static RULES: &[SuppressionRule] = &[
     action:      RuleAction::Suppress,
     dimensions:  TOKEN_DIMENSIONS,
     description: "token window without enough meaningful or unique content",
+  },
+  SuppressionRule {
+    id:          RuleId::LineCommentOnly,
+    level:       RuleLevel::Unit,
+    action:      RuleAction::Suppress,
+    dimensions:  &[DetectionDimension::Line],
+    description: "line window containing only complete line comments outside quoted literals",
   },
   SuppressionRule {
     id:          RuleId::LineImportScaffold,
@@ -297,12 +315,14 @@ impl RuleId {
       Self::SubMessageOnlyMacro => "sub.message-only-macro",
       Self::SubValuePlumbing => "sub.value-plumbing",
       Self::SubCoveredByChain => "sub.covered-by-chain",
+      Self::TokenCommentOnly => "token.comment-only",
       Self::TokenImportScaffold => "token.import-scaffold",
       Self::TokenChainTail => "token.chain-tail",
       Self::TokenSignaturePrefix => "token.signature-prefix",
       Self::TokenDeclarationScaffold => "token.declaration-scaffold",
       Self::TokenMatchTablePrefix => "token.match-table-prefix",
       Self::TokenLowSignal => "token.low-signal",
+      Self::LineCommentOnly => "line.comment-only",
       Self::LineImportScaffold => "line.import-scaffold",
       Self::LineChainTail => "line.chain-tail",
       Self::LineDeclarationSignaturePrefix => "line.declaration-signature-prefix",
