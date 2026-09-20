@@ -1,4 +1,4 @@
-//! Complete Rust import declarations used only for window classification.
+//! Rust declaration context used only for window classification.
 
 use std::collections::BTreeSet;
 
@@ -8,7 +8,16 @@ use super::after_token_group;
 use super::after_visibility;
 use super::window_code_lines;
 
-/// Find source lines covered entirely by imports and balanced module boundaries.
+/// Lexical declaration context outside attribute and macro input.
+#[derive(Debug, Default)]
+pub(super) struct Declarations {
+  /// Lines covered entirely by imports and balanced module boundaries.
+  pub(super) imports: BTreeSet<usize>,
+  /// Lines containing a struct keyword in source declaration context.
+  pub(super) structs: BTreeSet<usize>,
+}
+
+/// Find imports, module boundaries, and struct headers in source declaration context.
 ///
 /// Attributes, visibility, grouped paths, aliases, and globs belong to their
 /// declaration. A line containing any additional code remains unclassified.
@@ -17,12 +26,19 @@ use super::window_code_lines;
   clippy::single_call_fn,
   reason = "Complete import spans provide source context independently of candidate window cuts."
 )]
-pub(super) fn lines(tokens: &[Token]) -> BTreeSet<usize> {
+pub(super) fn classify(tokens: &[Token]) -> Declarations {
   let code_lines = window_code_lines(tokens, tokens.len());
   let code: Vec<&Token> = code_lines.iter().flatten().copied().collect();
   let mut covered = BTreeSet::new();
+  let mut structs = BTreeSet::new();
   let mut remaining = code.as_slice();
   while let Some((first, next)) = remaining.split_first() {
+    if let Some(declaration) = after_attributes(remaining).and_then(after_visibility)
+      && let Some(keyword) = declaration.first()
+      && keyword.raw == "struct"
+    {
+      structs.extend([keyword.line]);
+    }
     if let Some(tail) = after_import(remaining) {
       covered.extend(code.len().saturating_sub(remaining.len())..code.len().saturating_sub(tail.len()));
       remaining = tail;
@@ -51,7 +67,7 @@ pub(super) fn lines(tokens: &[Token]) -> BTreeSet<usize> {
     }
   }
   let mut offset = 0_usize;
-  code_lines
+  let imports = code_lines
     .into_iter()
     .filter_map(|line| {
       let start = offset;
@@ -59,7 +75,11 @@ pub(super) fn lines(tokens: &[Token]) -> BTreeSet<usize> {
       let first = line.first()?;
       (start..offset).all(|index| covered.contains(&index)).then_some(first.line)
     })
-    .collect()
+    .collect();
+  Declarations {
+    imports,
+    structs,
+  }
 }
 
 /// Source suffixes starting at a module body and immediately after its closing brace.

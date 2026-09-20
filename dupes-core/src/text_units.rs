@@ -40,9 +40,15 @@ pub struct TextUnits {
   reason = "This public boundary composes all text dimensions for the analysis pipeline."
 )]
 pub fn extract(path: &Path, source: &str, config: &Config) -> TextUnits {
-  let tokens = tokenize(source, QuoteProfile::for_path(path));
-  let mut normalized_tokens = token_windows_if_enabled(config, path, &tokens, TokenMode::Normalized);
-  let mut raw_tokens = token_windows_if_enabled(config, path, &tokens, TokenMode::Raw);
+  let profile = QuoteProfile::for_path(path);
+  let tokens = tokenize(source, profile);
+  let source_lines = comments::classify(source, profile);
+  let mut declarations = profile.rust_ticks.then(|| imports::classify(&tokens));
+  if let Some(ref mut context) = declarations {
+    context.structs.retain(|line| !source_lines.quoted_continuations.contains(line));
+  }
+  let mut normalized_tokens = token_windows_if_enabled(config, path, &tokens, TokenMode::Normalized, declarations.as_ref());
+  let mut raw_tokens = token_windows_if_enabled(config, path, &tokens, TokenMode::Raw, declarations.as_ref());
   let mut lines = if config.dimension_enabled(DetectionDimension::Line) {
     line_windows(path, source, config.line_min_lines, &config.suppression)
   } else {
@@ -51,9 +57,6 @@ pub fn extract(path: &Path, source: &str, config: &Config) -> TextUnits {
   // Lexical comment classification takes precedence over shape scoring, which
   // can mistake prose keywords and URL colons for code or declaration fields.
   // Keep the original candidates, token bodies, spans, and fingerprints intact.
-  let profile = QuoteProfile::for_path(path);
-  let source_lines = comments::classify(source, profile);
-  let import_lines = profile.rust_ticks.then(|| imports::lines(&tokens));
   for (units, comment_rule, import_rule) in [
     (&mut normalized_tokens, RuleId::TokenCommentOnly, RuleId::TokenImportScaffold),
     (&mut raw_tokens, RuleId::TokenCommentOnly, RuleId::TokenImportScaffold),
@@ -64,9 +67,10 @@ pub fn extract(path: &Path, source: &str, config: &Config) -> TextUnits {
         unit.suppressed = config.suppression.allow(comment_rule);
         continue;
       }
-      let Some(ref imports) = import_lines else {
+      let Some(ref context) = declarations else {
         continue;
       };
+      let imports = &context.imports;
       let range = unit.line_start..=unit.line_end;
       let only_imports = range.clone().any(|line| imports.contains(&line))
         && range
@@ -351,14 +355,20 @@ fn is_keyword(token: &str) -> bool {
 }
 
 /// Build token windows for one mode, or nothing when its dimension is off.
-fn token_windows_if_enabled(config: &Config, path: &Path, tokens: &[Token], mode: TokenMode) -> Vec<CodeUnit> {
+fn token_windows_if_enabled(
+  config: &Config,
+  path: &Path,
+  tokens: &[Token],
+  mode: TokenMode,
+  declarations: Option<&imports::Declarations>,
+) -> Vec<CodeUnit> {
   let dimension = match mode {
     TokenMode::Normalized => DetectionDimension::TokenNormalized,
     TokenMode::Raw => DetectionDimension::TokenRaw,
   };
   if config.dimension_enabled(dimension) {
     token_windows(
-      path, tokens, config.token_min_tokens, config.token_min_lines, mode, &config.suppression,
+      path, tokens, config.token_min_tokens, config.token_min_lines, mode, &config.suppression, declarations,
     )
   } else {
     Vec::new()
@@ -384,6 +394,7 @@ fn token_windows(
   min_lines: usize,
   mode: TokenMode,
   policy: &SuppressionPolicy,
+  declarations: Option<&imports::Declarations>,
 ) -> Vec<CodeUnit> {
   if min_tokens == 0 || tokens.len() < min_tokens {
     return Vec::new();
@@ -395,7 +406,7 @@ fn token_windows(
     };
     let line_start = slice.first().map_or(1, |token| token.line);
     let line_end = slice.last().map_or(1, |token| token.end_line);
-    let suppressed = classify_token_window(segment, slice, mode, policy);
+    let suppressed = classify_token_window(segment, slice, mode, policy, declarations);
     let values: Vec<String> = slice
       .iter()
       .map(|token| match mode {
@@ -728,14 +739,22 @@ fn quote_span_closes_on_line(mut chars: impl Iterator<Item = char>, quote: char)
   clippy::single_call_fn,
   reason = "Rule ordering and attribution belong to the token classifier rather than window construction."
 )]
-fn classify_token_window(segment: &[Token], slice: &[Token], mode: TokenMode, policy: &SuppressionPolicy) -> Option<RuleId> {
+fn classify_token_window(
+  segment: &[Token],
+  slice: &[Token],
+  mode: TokenMode,
+  policy: &SuppressionPolicy,
+  declarations: Option<&imports::Declarations>,
+) -> Option<RuleId> {
   if token_window_is_import_or_module_scaffold(slice) {
     return policy.allow(RuleId::TokenImportScaffold);
   }
   if token_window_is_chain_tail(slice) {
     return policy.allow(RuleId::TokenChainTail);
   }
-  if token_window_is_declaration_scaffold(segment, slice) {
+  if token_window_is_declaration_scaffold(segment, slice)
+    || declarations.is_some_and(|context| token_window_is_struct_introduction(segment, slice.len(), context))
+  {
     return policy.allow(RuleId::TokenDeclarationScaffold);
   }
   if token_window_is_signature_prefix(segment, slice) {
@@ -962,6 +981,60 @@ fn token_window_is_declaration_scaffold(segment: &[Token], slice: &[Token]) -> b
   }
   let field_lines = code_lines.iter().filter(|line| line_is_field_like(line)).count();
   field_lines >= 2 && !code_lines.iter().flatten().any(|token| token_is_runtime_behavior(token))
+}
+
+/// Recognize a prefix ending before a second field in a balanced struct with a plain path first
+/// field type. More complex type syntax remains eligible rather than guessing at its semantics.
+#[allow(
+  clippy::single_call_fn,
+  reason = "The first-field boundary distinguishes an incomplete introduction from a complete declaration table."
+)]
+fn token_window_is_struct_introduction(segment: &[Token], window_len: usize, declarations: &imports::Declarations) -> bool {
+  let code_lines = window_code_lines(segment, segment.len());
+  let code: Vec<&Token> = code_lines.iter().flatten().copied().collect();
+  let Some(&[keyword, name, ref header @ ..]) = declaration_tokens(&code) else {
+    return false;
+  };
+  if keyword.raw != "struct" || name.normalized != "IDENT" || !declarations.structs.contains(&keyword.line) {
+    return false;
+  }
+  let Some(open) = header.iter().position(|token| token.raw == "{") else {
+    return false;
+  };
+  let Some((parameters, body)) = header.split_at_checked(open) else {
+    return false;
+  };
+  if parameters.iter().any(|token| token_is_runtime_behavior(token)) || after_token_group(body).is_none() {
+    return false;
+  }
+  let Some(fields) = body.get(1..).and_then(after_attributes).and_then(after_visibility) else {
+    return false;
+  };
+  let &[field, colon, field_type, ref suffix @ ..] = fields else {
+    return false;
+  };
+  if field.normalized != "IDENT" || colon.raw != ":" || field_type.normalized != "IDENT" {
+    return false;
+  }
+  let mut remaining = suffix;
+  while let &[first, second, component, ref tail @ ..] = remaining
+    && first.raw == ":"
+    && second.raw == ":"
+    && component.normalized == "IDENT"
+  {
+    remaining = tail;
+  }
+  let Some((separator, rest)) = remaining.split_first() else {
+    return false;
+  };
+  if separator.raw != "," {
+    return false;
+  }
+  let Some(next_field) = after_attributes(rest) else {
+    return false;
+  };
+  let window_code_count = window_code_lines(segment, window_len).iter().flatten().count();
+  window_code_count <= code.len().saturating_sub(next_field.len())
 }
 
 /// Borrow prefix code tokens using complete lines to recognize comments cut at their first slash.
@@ -1577,6 +1650,20 @@ pub enum OperationFailure {
         input: Vec<u8>,
         source: ConditionFailure,
     },
+}
+";
+
+  /// An attributed struct introduction whose first field precedes the rest of its state.
+  const DOCUMENTED_STRUCT: &str = "\
+/// An adapter retains its source and transformation.
+///
+/// Construction does not execute the transformation.
+#[must_use = \"adapters do nothing unless evaluated\"]
+pub struct Adapter<S, F> {
+    /// The source passed to the adapter.
+    pub(super) source: S,
+    /// The transformation applied to source values.
+    transform: F,
 }
 ";
 
@@ -2215,6 +2302,18 @@ fn beta(items: &[u32]) -> Vec<u32> {
     }
   }
 
+  /// Check both token dimensions at a selected prefix while retaining every input and candidate.
+  fn check_token_prefix(path: &str, document: &str, min_lines: usize, expected: Option<RuleId>) -> WindowTestResult<Option<RuleId>> {
+    let config = Config {
+      token_min_lines: min_lines,
+      ..declaration_window_config(document, SuppressionPolicy::default())
+    };
+    check_windows(path, document, config, expected, |units, &rule| {
+      ensure_window_classification(&units.normalized_tokens, rule)?;
+      ensure_window_classification(&units.raw_tokens, rule)
+    })
+  }
+
   #[test]
   fn declaration_windows_recognize_visibility_and_ignore_comment_behavior_words() -> WindowTestResult<Option<RuleId>> {
     for visibility in ["", "pub ", "pub(crate) ", "pub(super) ", "pub(in crate::owner) "] {
@@ -2336,14 +2435,70 @@ fn beta(items: &[u32]) -> Vec<u32> {
         None,
       ),
     ] {
-      let config = Config {
-        token_min_lines: min_lines,
-        ..declaration_window_config(document, SuppressionPolicy::default())
-      };
-      check_windows("prefix.rs", document, config, expected, |units, &rule| {
-        ensure_window_classification(&units.normalized_tokens, rule)?;
-        ensure_window_classification(&units.raw_tokens, rule)
-      })?;
+      check_token_prefix("prefix.rs", document, min_lines, expected)?;
+    }
+    Ok(())
+  }
+
+  /// A first-field prefix does not establish duplication of the complete struct declaration.
+  #[test]
+  fn struct_introductions_stop_before_a_second_field() -> WindowTestResult<Option<RuleId>> {
+    for (min_lines, expected) in [
+      (4, Some(RuleId::TokenDeclarationScaffold)),
+      (8, Some(RuleId::TokenDeclarationScaffold)),
+      (9, None),
+      (10, None),
+    ] {
+      check_token_prefix("adapter.rs", DOCUMENTED_STRUCT, min_lines, expected)?;
+    }
+    Ok(())
+  }
+
+  /// Visibility and path spelling do not turn a plain field introduction into computation.
+  #[test]
+  fn struct_introductions_preserve_visibility_and_qualified_field_types() -> WindowTestResult<Option<RuleId>> {
+    for visibility in ["", "pub ", "pub(crate) ", "pub(in crate::owner) "] {
+      for field_type in ["S", "crate::inputs::Source"] {
+        let document = format!(
+          "/// A source adapter.\n#[must_use = \"evaluate the adapter\"]\n{visibility}struct Adapter<S> {{\n    #[cfg(feature = \
+           \"source\")]\n    {visibility}source: {field_type},\n    /// Retain the rest of the state.\n    state: S,\n}}"
+        );
+        check_token_prefix("adapter.rs", &document, 6, Some(RuleId::TokenDeclarationScaffold))?;
+      }
+    }
+    Ok(())
+  }
+
+  /// Computation and unobserved or malformed fields cannot establish an introductory declaration.
+  #[test]
+  fn struct_introductions_require_balanced_plain_field_context() -> WindowTestResult<Option<RuleId>> {
+    for field_type in ["[u8; compute()]", "[u8; 2 + 3]", "generated!()", "S::", "S = initialize()"] {
+      let document = format!(
+        "/// A source adapter.\n#[must_use = \"evaluate the adapter\"]\nstruct Adapter {{\n    source: {field_type},\n    /// Retain the \
+         rest of the state.\n    state: State,\n}}"
+      );
+      check_token_prefix("adapter.rs", &document, 5, None)?;
+    }
+    for document in [
+      "#[must_use = \"evaluate the adapter\"]\nstruct Adapter {\n    source: Source,\n    state: State,",
+      "#[must_use = \"evaluate the adapter\"]\nstruct Adapter {\n    source: Source,\n    state: State],\n}",
+      "#[must_use = \"evaluate the adapter\"]\nstruct Adapter {\n    pub(crate source: Source,\n    state: State,\n}",
+    ] {
+      check_declaration_windows(document, None)?;
+    }
+    Ok(())
+  }
+
+  /// A blank line inside literal, attribute, or macro data must not invent source declarations.
+  #[test]
+  fn struct_introductions_preserve_embedded_program_windows() -> WindowTestResult<Option<RuleId>> {
+    for document in [
+      format!("quote! {{\n\n{DOCUMENTED_STRUCT}}}"),
+      format!("macro_rules! adapter {{ () => {{\n\n{DOCUMENTED_STRUCT}}} }}"),
+      format!("#[input(\n\n{DOCUMENTED_STRUCT})]\nfn generate() {{ compute(); }}"),
+      format!("let program = r##\"interior quote: \"\n\n{DOCUMENTED_STRUCT}\"##;"),
+    ] {
+      check_token_prefix("embedded.rs", &document, 8, None)?;
     }
     Ok(())
   }
@@ -2354,6 +2509,7 @@ fn beta(items: &[u32]) -> Vec<u32> {
     for (document, rule) in [
       (DOCUMENTED_FUNCTION, RuleId::TokenSignaturePrefix),
       (DOCUMENTED_ENUM, RuleId::TokenDeclarationScaffold),
+      (DOCUMENTED_STRUCT, RuleId::TokenDeclarationScaffold),
     ] {
       let (disabled, warnings) = SuppressionPolicy::resolve(&[rule.as_str().to_owned()], &[]);
       let disabled_config = Config {
@@ -2400,20 +2556,7 @@ fn beta(items: &[u32]) -> Vec<u32> {
         "/// Preserve the typed function contract.\n#[annotate(nested([\"}}\", \"fn\"]))]\npub(in crate::owner) {qualifier}fn \
          evaluate(input: u8) -> u8 {{\n    input + 1\n}}"
       );
-      let config = Config {
-        token_min_lines: 2,
-        ..declaration_window_config(&document, SuppressionPolicy::default())
-      };
-      check_windows(
-        "qualified.rs",
-        &document,
-        config,
-        Some(RuleId::TokenSignaturePrefix),
-        |units, &rule| {
-          ensure_window_classification(&units.normalized_tokens, rule)?;
-          ensure_window_classification(&units.raw_tokens, rule)
-        },
-      )?;
+      check_token_prefix("qualified.rs", &document, 2, Some(RuleId::TokenSignaturePrefix))?;
     }
     Ok(())
   }
@@ -2455,14 +2598,7 @@ fn beta(items: &[u32]) -> Vec<u32> {
         None,
       ),
     ] {
-      let config = Config {
-        token_min_lines: 3,
-        ..declaration_window_config(document, SuppressionPolicy::default())
-      };
-      check_windows("incomplete.rs", document, config, expected, |units, &rule| {
-        ensure_window_classification(&units.normalized_tokens, rule)?;
-        ensure_window_classification(&units.raw_tokens, rule)
-      })?;
+      check_token_prefix("incomplete.rs", document, 3, expected)?;
     }
     Ok(())
   }
